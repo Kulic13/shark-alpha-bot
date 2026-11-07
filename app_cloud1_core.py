@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import time
+import operator
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone, timedelta
@@ -16,6 +17,11 @@ st.set_page_config(page_title="Shark Alpha Core (Cloud 1)", layout="centered")
 # =========================================================================
 VAULT_FILE = "vault_state_backup.json"
 BINANCE_FAPI = "https://binance.com"
+
+get_open = operator.itemgetter(1)
+get_high = operator.itemgetter(2)
+get_low = operator.itemgetter(3)
+get_close = operator.itemgetter(4)
 
 @st.cache_resource
 def init_supabase() -> Client:
@@ -35,7 +41,7 @@ def load_vault() -> dict:
             "4": {"status": "WAITING", "symbol": None, "mandate_until": 0}
         },
         "last_pd_scan": 0,
-        "pending_supabase_sync": []
+        "pending_supabase_sync": list()
     }
     if os.path.exists(VAULT_FILE):
         try:
@@ -61,7 +67,7 @@ def safe_supabase_upsert(table: str, data: dict, vault: dict):
 def flush_pending_sync(vault: dict):
     if not vault["pending_supabase_sync"]:
         return
-    remaining = []
+    remaining = list()
     for item in vault["pending_supabase_sync"]:
         try:
             if item["op"] == "upsert":
@@ -92,7 +98,7 @@ def get_ai_card(symbol: str) -> dict:
     try:
         res = supabase.table("ai_learning_matrix").select("*").eq("symbol", symbol).execute()
         if res.data:
-            return res.data[0]
+            return next(iter(res.data))
         supabase.table("ai_learning_matrix").insert(default_card).execute()
     except Exception:
         pass
@@ -153,7 +159,7 @@ def get_24h_metrics() -> dict:
 async def evaluate_candidates(client: httpx.AsyncClient, tickers: dict, fundings: dict, excluded_symbols: set, excluded_sectors: set, min_vol: float, max_vol: float, is_pd_mode: bool = False):
     sectors_map = get_sectors_map()
     metrics_24h = get_24h_metrics()
-    candidates = []
+    candidates = list()
 
     for sym, t in tickers.items():
         if sym == "BTCUSDT" or sym in excluded_symbols:
@@ -169,7 +175,6 @@ async def evaluate_candidates(client: httpx.AsyncClient, tickers: dict, fundings
         if price <= 0:
             continue
 
-        # Order Flow Delta (OFD) z 24h Taker Buy Volume vs Taker Sell Volume
         total_base_vol = float(t.get("volume", 0))
         taker_buy_base = float(t.get("takerBuyBaseVolume", total_base_vol * 0.5))
         taker_sell_base = max(1e-9, total_base_vol - taker_buy_base)
@@ -179,46 +184,39 @@ async def evaluate_candidates(client: httpx.AsyncClient, tickers: dict, fundings
         funding_rate = float(f_data.get("lastFundingRate", 0.0))
         price_change_pct = float(t["priceChangePercent"])
 
-        # Získanie 15m sviečky pre overenie divergencie
         k_res = await client.get(f"{BINANCE_FAPI}/fapi/v1/klines", params={"symbol": sym, "interval": "15m", "limit": 20})
         klines = k_res.json()
         if len(klines) < 15:
             continue
 
-        last_open = float(klines[-1][1])
-        last_close = float(klines[-1][4])
+        last_candle = klines[-1]
+        last_open = float(get_open(last_candle))
+        last_close = float(get_close(last_candle))
         is_15m_green = last_close > last_open
 
-        # Špeciálna logika pre Okno 4: Šampión C (Pump & Dump Lovec)
         if is_pd_mode:
             oi_res = await client.get(f"{BINANCE_FAPI}/fapi/v1/openInterest", params={"symbol": sym})
             oi_curr = float(oi_res.json().get("openInterest", 0)) * price
             oi_avg = metrics_24h.get(sym, {}).get("oi_avg_24h", oi_curr)
             oi_ratio = oi_curr / max(1.0, oi_avg)
 
-            # Fáza 1: Tichá pred-pumpová akumulácia alebo štart pumpy (LONG)
             if oi_ratio > 1.80 and ofd > 1.60 and is_15m_green:
                 sas_score = oi_ratio * ofd * 100
                 candidates.append({"symbol": sym, "direction": "LONG", "score": sas_score, "is_funding_trap": False, "is_pd": True, "sector": sec, "ofd": ofd, "klines": klines})
-            # Fáza 2: Vyčerpanie pumpy -> Dump lov (SHORT)
             elif price_change_pct > 15.0 and funding_rate > 0.0020 and ofd < 0.80 and not is_15m_green:
                 sas_score = abs(price_change_pct) * (1 / max(0.1, ofd)) * 50
                 candidates.append({"symbol": sym, "direction": "SHORT", "score": sas_score, "is_funding_trap": True, "is_pd": True, "sector": sec, "ofd": ofd, "klines": klines})
             continue
 
-        # Štandardná logika + Shark Trap Exploiter pre Šampióna A a B
         direction = None
         is_trap = False
 
-        # Reverzná pasca na Longárov (High Positive Funding + červená 15m sviečka + predajný OFD)
         if funding_rate > 0.0020 and not is_15m_green and ofd < 0.90:
             direction = "SHORT"
             is_trap = True
-        # Reverzná pasca na Shortárov (High Negative Funding + zelená 15m sviečka + nákupný OFD > 1.15)
         elif funding_rate < -0.0050 and is_15m_green and ofd > 1.15:
             direction = "LONG"
             is_trap = True
-        # Klasický trendový momentum signál
         elif ofd > 1.30 and is_15m_green:
             direction = "LONG"
         elif ofd < 0.70 and not is_15m_green:
@@ -237,10 +235,10 @@ async def evaluate_candidates(client: httpx.AsyncClient, tickers: dict, fundings
 # =========================================================================
 def calculate_natr_14(klines: list) -> float:
     df = pd.DataFrame(klines, columns=["ts", "o", "h", "l", "c", "v", "ct", "qv", "tr", "tb", "tq", "ig"])
-    for col in ["h", "l", "c"]:
+    for col in ("h", "l", "c"):
         df[col] = df[col].astype(float)
     prev_c = df["c"].shift(1)
-    tr = pd.concat([df["h"] - df["l"], (df["h"] - prev_c).abs(), (df["l"] - prev_c).abs()], axis=1).max(axis=1)
+    tr = pd.concat((df["h"] - df["l"], (df["h"] - prev_c).abs(), (df["l"] - prev_c).abs()), axis=1).max(axis=1)
     atr_14 = tr.rolling(14).mean().iloc[-1]
     last_close = df["c"].iloc[-1]
     return float((atr_14 / last_close) * 100.0)
@@ -250,13 +248,13 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
     direction = cand["direction"]
     is_pd = cand["is_pd"]
     klines = cand["klines"]
-    price = float(klines[-1][4])
+    last_candle = klines[-1]
+    price = float(get_close(last_candle))
     natr = calculate_natr_14(klines)
 
-    # 1. Volatilitný štít trhového režimu (NATR 14)
     max_natr = 9.0 if is_pd else 5.5
     if natr > max_natr or natr < 0.3:
-        return None  # Hard Block -> uvoľní okno a okamžite hľadá náhradu
+        return None
 
     if natr <= 3.0 and not is_pd:
         regime = "FUTURES"
@@ -268,7 +266,6 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
         regime = "SPOT"
         leverage = 1
 
-    # 2. 35 % Fractional Kellyho kritérium
     card = get_ai_card(sym)
     if cand["is_funding_trap"]:
         wr = card["funding_reversal_wr"] / 100.0
@@ -283,24 +280,21 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
     q = 1.0 - wr
     full_kelly = (wr * b - q) / max(0.1, b)
     if full_kelly <= 0:
-        return None  # Negative Expectancy Lock
+        return None
 
     frac_kelly = full_kelly * 0.35
     max_risk_pct = 0.01 if is_pd else 0.02
     margin_usd = min(balance * frac_kelly, balance * max_risk_pct)
 
-    # Poistka minimálnej objednávky Binance (5 USDT notional)
     if (margin_usd * leverage) < 5.2:
-        return None  # Insufficient Kelly Volume -> reštart skenera
+        return None
 
     dir_mult = 1.0 if direction == "LONG" else -1.0
     sl_mod = card["sl_modifier"]
     tp_mod = card["tp_modifier"]
-    fee_buffer = 0.001  # 0.1 % rezerva na poplatky
+    fee_buffer = 0.001
 
-    # 3. Asymetrický 4-bodový Grid (30/10/30/30) a opravený tvrdý SL (2.5x NATR)
     if is_pd:
-        # Single-Shot bez DCA pre Pump & Dump
         dca1 = dca2 = dca3 = 0.0
         sl_pct = (natr * 1.8 * sl_mod) / 100.0
         tp1 = price * (1.0 + dir_mult * ((natr * 1.0) / 100.0 + fee_buffer))
@@ -315,9 +309,9 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
 
     sl_price = price * (1.0 - dir_mult * sl_pct)
 
-    # 4. TP3: 20x Likvidačný lov s MMR (0.004) a 0.5% slippage odskokom
-    highs = [float(k[2]) for k in klines[-20:]]
-    lows = [float(k[3]) for k in klines[-20:]]
+    recent_klines = klines[-20:]
+    highs = [float(get_high(k)) for k in recent_klines]
+    lows = [float(get_low(k)) for k in recent_klines]
     mmr = 0.004
     if direction == "LONG":
         liq_short_20x = max(highs) * (1.0 + (1.0 / 20.0) - mmr)
@@ -362,7 +356,6 @@ async def run_core_cycle():
     async with httpx.AsyncClient(http2=True, timeout=10.0) as client:
         tickers, fundings = await fetch_market_snapshot(client)
 
-        # 1. Manažment otvorených pozícií vo všetkých 4 oknách (Sekundový dohľad)
         for win_key, pos in vault["windows"].items():
             win_id = int(win_key)
             if pos["status"] != "ACTIVE":
@@ -382,7 +375,6 @@ async def run_core_cycle():
             dir_mult = 1.0 if is_long else -1.0
             natr = pos["natr"]
 
-            # Live Order Flow Shield (Útek pred horiacim vlakom pri DCA 3)
             if not pos["is_pd"] and not pos["dca3_filled"]:
                 near_dca3 = (is_long and curr_price <= pos["dca3_price"]) or (not is_long and curr_price >= pos["dca3_price"])
                 toxic_of = (is_long and ofd < 0.40) or (not is_long and ofd > 1.60)
@@ -390,9 +382,8 @@ async def run_core_cycle():
                     close_position(pos, curr_price, "EARLY_ORDERFLOW_ESCAPE", vault)
                     continue
 
-            # DCA Grid Exekúcia a prepočet váženého priemeru
             if not pos["is_pd"]:
-                for idx, pct in [(1, 0.10), (2, 0.30), (3, 0.30)]:
+                for idx, pct in ((1, 0.10), (2, 0.30), (3, 0.30)):
                     if not pos[f"dca{idx}_filled"]:
                         dca_p = pos[f"dca{idx}_price"]
                         if (is_long and curr_price <= dca_p) or (not is_long and curr_price >= dca_p):
@@ -402,28 +393,23 @@ async def run_core_cycle():
                             pos["entry_price"] = ((old_qty * pos["entry_price"]) + (new_qty * dca_p)) / (old_qty + new_qty)
                             pos["active_margin"] += added_m
                             pos[f"dca{idx}_filled"] = True
-                            # Shift TP1 a TP2 podľa novej priemernej ceny
                             pos["tp1_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.0 * natr) / 100.0 + 0.001))
                             pos["tp2_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.8 * natr) / 100.0))
 
-            # Aktivácia Trailing Stop Lossu po dosiahnutí TP1 + poplatky
             if not pos["tsl_active"]:
                 if (is_long and curr_price >= pos["tp1_price"]) or (not is_long and curr_price <= pos["tp1_price"]):
                     pos["tsl_active"] = True
                     pos["tp1_hit"] = True
                     pos["extreme_price"] = curr_price
-                    # Tvrdý zámok TSL minimálne na Break-Even + poplatky
                     be_lock = pos["entry_price"] * (1.0 + dir_mult * 0.0015)
                     pos["sl_tsl_price"] = be_lock
 
-            # Dynamický posun TSL & Pre-Execution Radar na TP3
             if pos["tsl_active"]:
                 if is_long and curr_price > pos["extreme_price"]:
                     pos["extreme_price"] = curr_price
                 elif not is_long and curr_price < pos["extreme_price"]:
                     pos["extreme_price"] = curr_price
 
-                # Pre-Execution Radar zóna (0.25x NATR pred TP3)
                 radar_dist = pos["tp3_price"] * ((0.25 * natr) / 100.0)
                 in_radar = (is_long and curr_price >= pos["tp3_price"] - radar_dist) or (not is_long and curr_price <= pos["tp3_price"] + radar_dist)
 
@@ -433,7 +419,6 @@ async def run_core_cycle():
                         close_position(pos, curr_price, "TP3_LIQUIDATION_HIT", vault)
                         continue
                     elif strong_pump:
-                        # Order Flow Driven TSL (Zrkadlový vzorec pre Long vs Short)
                         tsl_w_pct = (natr / max(0.2, ofd)) if is_long else (natr * ofd)
                         new_tsl = curr_price * (1.0 - dir_mult * (tsl_w_pct / 100.0))
                         if (is_long and new_tsl > pos["sl_tsl_price"]) or (not is_long and new_tsl < pos["sl_tsl_price"]):
@@ -444,14 +429,12 @@ async def run_core_cycle():
                     if (is_long and new_tsl > pos["sl_tsl_price"]) or (not is_long and new_tsl < pos["sl_tsl_price"]):
                         pos["sl_tsl_price"] = new_tsl
 
-            # Kontrola zásahu SL alebo TSL
             hit_sl_tsl = (is_long and curr_price <= pos["sl_tsl_price"]) or (not is_long and curr_price >= pos["sl_tsl_price"])
             if hit_sl_tsl:
                 reason = "TRAILING_SL_PROFIT" if pos["tsl_active"] else "HARD_SL_HIT"
                 close_position(pos, curr_price, reason, vault)
                 continue
 
-            # Aktualizácia Live PnL do Supabase pre Kokpit 2
             pnl_pct = ((curr_price - pos["entry_price"]) / pos["entry_price"]) * dir_mult * pos["leverage"] * 100.0
             pnl_usd = pos["active_margin"] * (pnl_pct / 100.0)
             safe_supabase_upsert("active_positions", {
@@ -464,22 +447,20 @@ async def run_core_cycle():
                 "mandate_expires_at": pos["mandate_expires_at"], "updated_at": now_dt.isoformat()
             }, vault)
 
-        # 2. Spúšťanie Skenera (Blok 3) pre voľné okná (Hard Execution Lock rešpektovaný)
-        is_30m_tick = (now_dt.minute in) and (now_dt.second < 10)
+        is_30m_tick = (now_dt.minute in (0, 30)) and (now_dt.second < 10)
         active_syms = {p["symbol"] for p in vault["windows"].values() if p["status"] == "ACTIVE" and p["symbol"]}
         sectors_map = get_sectors_map()
         active_secs = {sectors_map.get(s, "UNKNOWN") for s in active_syms}
 
-        # Okno 1: Makrokotva BTC
         if vault["windows"]["1"]["status"] == "WAITING" and is_30m_tick:
             k_btc = await client.get(f"{BINANCE_FAPI}/fapi/v1/klines", params={"symbol": "BTCUSDT", "interval": "15m", "limit": 20})
             btc_klines = k_btc.json()
-            btc_dir = "LONG" if float(btc_klines[-1][4]) > float(btc_klines[-1][1]) else "SHORT"
+            last_btc = btc_klines[-1]
+            btc_dir = "LONG" if float(get_close(last_btc)) > float(get_open(last_btc)) else "SHORT"
             setup = build_trade_setup({"symbol": "BTCUSDT", "direction": btc_dir, "is_pd": False, "is_funding_trap": False, "klines": btc_klines}, vault["balance"], 1)
             if setup:
                 vault["windows"]["1"] = setup
 
-        # Okno 2 (Šampión A >= 10M) a Okno 3 (Šampión B 5M-9M)
         if (vault["windows"]["2"]["status"] == "WAITING" or vault["windows"]["3"]["status"] == "WAITING") and is_30m_tick:
             if vault["windows"]["2"]["status"] == "WAITING":
                 cands_a = await evaluate_candidates(client, tickers, fundings, active_syms, active_secs, 10_000_000, 1e12, False)
@@ -500,7 +481,6 @@ async def run_core_cycle():
                         active_syms.add(c["symbol"])
                         break
 
-        # Okno 4: Šampión C (Pump & Dump Lovec 1M - 4.9M, 5-minútový Smart Polling)
         if vault["windows"]["4"]["status"] == "WAITING" and (now_ts - vault["last_pd_scan"] >= 300):
             vault["last_pd_scan"] = now_ts
             cands_c = await evaluate_candidates(client, tickers, fundings, active_syms, active_secs, 1_000_000, 4_900_000, True)
@@ -520,3 +500,20 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
 
     is_win = pnl_usd > 0
     r_mult = pnl_usd / max(0.01, pos["margin_usd"])
+    update_ai_learning(pos["symbol"], pos["direction"], pos["regime"], pos["is_funding_trap"], is_win, r_mult, vault)
+
+    hist_row = {
+        "window_id": pos["window_id"], "symbol": pos["symbol"], "direction": pos["direction"],
+        "regime": pos["regime"], "leverage": pos["leverage"], "entry_price": pos["entry_price"],
+        "exit_price": exit_price, "margin_usd": pos["active_margin"], "pnl_usd": round(pnl_usd, 4),
+        "pnl_percent": round(pnl_pct, 2), "exit_reason": reason, "current_balance": vault["balance"]
+    }
+    try:
+        supabase.table("trade_history").insert(hist_row).execute()
+    except Exception:
+        vault["pending_supabase_sync"].append({"table": "trade_history", "op": "insert", "data": hist_row})
+
+    win_id = pos["window_id"]
+    vault["windows"][str(win_id)] = {"status": "WAITING", "symbol": "BTCUSDT" if win_id == 1 else None, "mandate_until": 0}
+    safe_supabase_upsert("active_positions", {
+        "window_id": win_id, "status": "WAITING", "symbol": None, "entry_price": 0.0,
