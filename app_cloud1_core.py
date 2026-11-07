@@ -517,3 +517,18 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
     vault["windows"][str(win_id)] = {"status": "WAITING", "symbol": "BTCUSDT" if win_id == 1 else None, "mandate_until": 0}
     safe_supabase_upsert("active_positions", {
         "window_id": win_id, "status": "WAITING", "symbol": None, "entry_price": 0.0,
+                "tp1_price": 0.0, "tp2_price": 0.0, "tp3_price": 0.0, "sl_tsl_price": 0.0,
+        "pnl_usd": 0.0, "pnl_percent": 0.0, "updated_at": datetime.now(timezone.utc).isoformat()
+    }, vault)
+    save_vault(vault)
+
+# Spustenie nepretržitého jadra
+st.title("🦈 Shark Alpha Core (Cloud 1 - Active Engine)")
+vault_state = load_vault()
+st.metric("Live Fiktívny Kapitál", f"${vault_state['balance']:.2f} USD")
+st.json(vault_state["windows"])
+
+asyncio.run(run_core_cycle())
+time.sleep(2)
+st.rerun()
+
