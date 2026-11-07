@@ -1,0 +1,6 @@
+streamlit
+httpx[http2]
+numpy
+pandas
+plotly
+supabase
