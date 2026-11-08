@@ -1,6 +1,4 @@
-import os
 
-os.makedirs("generated", exist_ok=True)
 
 full_code = '''import streamlit as st
 import httpx
