@@ -258,8 +258,7 @@ async def evaluate_candidates(
                     oi_avg = metrics_24h.get(sym, {}).get("oi_avg_24h", oi_curr)
                     oi_ratio = oi_curr / max(1.0, oi_avg)
 
-                    if oi_ratio > 1.80 and ofd > 1.60 and is_15m_green:
-sas_score = oi_ratio * ofd * 100
+                    if oi_ratio > 1.80 and ofd > 1.60 and is_15m_green: sas_score = oi_ratio * ofd * 100
 return {"symbol": sym, "direction": "LONG", "score": sas_score, "is_funding_trap": False, "is_pd": True, "sector": sec, "ofd": ofd, "klines": klines}
 elif price_change_pct > 15.0 and funding_rate > 0.0020 and ofd < 0.80 and not is_15m_green:
 sas_score = abs(price_change_pct) * (1 / max(0.1, ofd)) * 50
