@@ -16,7 +16,7 @@ st.set_page_config(page_title="Shark Alpha Core (Cloud 1)", layout="centered")
 # BLOK 1: INFRAŠTRUKTÚRA, CLOUD TREZOR (SUPABASE) & ZÁLOŽNÁ CACHE
 # =========================================================================
 VAULT_FILE = "vault_state_backup.json"
-BINANCE_FAPI = "https://fapi.binance.com"
+OKX_API = "https://www.okx.com"
 
 get_open = operator.itemgetter(1)
 get_high = operator.itemgetter(2)
@@ -25,11 +25,22 @@ get_close = operator.itemgetter(4)
 
 @st.cache_resource
 def init_supabase() -> Client:
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
+    url = st.secrets["SUPABASE_URL"].strip().rstrip("/")
+    key = st.secrets["SUPABASE_KEY"].strip()
     return create_client(url, key)
 
 supabase = init_supabase()
+
+def to_okx_inst(symbol: str) -> str:
+    if symbol.endswith("USDT"):
+        base = symbol[:-4]
+        return f"{base}-USDT-SWAP"
+    return symbol
+
+def from_okx_inst(inst_id: str) -> str:
+    if inst_id.endswith("-USDT-SWAP"):
+        return inst_id.replace("-USDT-SWAP", "USDT")
+    return inst_id
 
 def get_default_vault() -> dict:
     return {
@@ -42,7 +53,7 @@ def get_default_vault() -> dict:
         },
         "last_pd_scan": 0,
         "last_30m_slot": "",
-        "pending_supabase_sync": []
+        "pending_supabase_sync": list()
     }
 
 def load_vault() -> dict:
@@ -53,7 +64,7 @@ def load_vault() -> dict:
             if "last_30m_slot" not in state:
                 state["last_30m_slot"] = ""
             if "pending_supabase_sync" not in state:
-                state["pending_supabase_sync"] = []
+                state["pending_supabase_sync"] = list()
             return state
     except Exception as e:
         st.warning(f"Upozornenie: Čítanie trezoru zo Supabase zlyhalo ({e}), skúšam lokálnu zálohu.")
@@ -94,7 +105,7 @@ def safe_supabase_upsert(table: str, data: dict, vault: dict):
 def flush_pending_sync(vault: dict):
     if not vault.get("pending_supabase_sync"):
         return
-    remaining = []
+    remaining = list()
     for item in vault["pending_supabase_sync"]:
         try:
             if item["op"] == "upsert":
@@ -158,40 +169,114 @@ def update_ai_learning(symbol: str, direction: str, regime: str, is_funding_trap
     safe_supabase_upsert("ai_learning_matrix", card, vault)
 
 # =========================================================================
-# BLOK 3: 4-OKNOVÝ SAS SKENER, FUNDING PASCE, ORDER FLOW & P&D RADAR
+# BLOK 3: 4-OKNOVÝ SAS SKENER, FUNDING PASCE, ORDER FLOW & P&D RADAR (OKX)
 # =========================================================================
-async def fetch_market_snapshot(client: httpx.AsyncClient):
-    t_res, f_res = await asyncio.gather(
-        client.get(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"),
-        client.get(f"{BINANCE_FAPI}/fapi/v1/premiumIndex")
-    )
-    if t_res.status_code == 451 or f_res.status_code == 451:
-        raise RuntimeError("Binance API vrátilo HTTP 451 (Geoblokácia US servera Streamlit Cloudu).")
-    t_res.raise_for_status()
-    f_res.raise_for_status()
+def compute_ofd_from_klines(klines: list) -> float:
+    recent = klines[-6:] if len(klines) >= 6 else klines
+    buy_vol = 0.0
+    sell_vol = 0.0
+    for k in recent:
+        o = float(get_open(k))
+        h = float(get_high(k))
+        l = float(get_low(k))
+        c = float(get_close(k))
+        v = float(k[5])
+        rng = max(1e-12, h - l)
+        buy_ratio = np.clip((c - l) / rng, 0.05, 0.95)
+        if c > o:
+            buy_ratio = min(0.95, buy_ratio * 1.15)
+        elif c < o:
+            buy_ratio = max(0.05, buy_ratio * 0.85)
+        buy_vol += v * buy_ratio
+        sell_vol += v * (1.0 - buy_ratio)
+    return float(buy_vol / max(1e-9, sell_vol))
 
-    tickers = {x["symbol"]: x for x in t_res.json() if x["symbol"].endswith("USDT")}
-    fundings = {x["symbol"]: x for x in f_res.json() if x["symbol"].endswith("USDT")}
-    return tickers, fundings
+async def fetch_okx_klines(client: httpx.AsyncClient, symbol: str, bar: str = "15m", limit: int = 20) -> list:
+    inst_id = to_okx_inst(symbol)
+    res = await client.get(f"{OKX_API}/api/v5/market/candles", params={"instId": inst_id, "bar": bar, "limit": str(limit)})
+    if res.status_code != 200:
+        return list()
+    payload = res.json()
+    if payload.get("code") != "0" or not payload.get("data"):
+        return list()
+    # OKX vracia sviečky od najnovšej po najstaršiu -> otočíme na chronologické poradie
+    raw_candles = list(reversed(payload["data"]))
+    klines = list()
+    for c in raw_candles:
+        # Normalizácia na formát [ts, o, h, l, c, vol, volCcy]
+        klines.append([
+            int(c[0]),
+            float(c[1]),
+            float(c[2]),
+            float(c[3]),
+            float(c[4]),
+            float(c[5]),
+            float(c[7]) if len(c) > 7 else float(c[5]) * float(c[4])
+        ])
+    return klines
+
+async def fetch_market_snapshot(client: httpx.AsyncClient):
+    t_res, oi_res = await asyncio.gather(
+        client.get(f"{OKX_API}/api/v5/market/tickers", params={"instType": "SWAP"}),
+        client.get(f"{OKX_API}/api/v5/public/open-interest", params={"instType": "SWAP"})
+    )
+    t_res.raise_for_status()
+    oi_res.raise_for_status()
+
+    t_json = t_res.json()
+    oi_json = oi_res.json()
+    if t_json.get("code") != "0":
+        raise RuntimeError(f"OKX Tickers API chyba: {t_json.get('msg')}")
+
+    tickers = dict()
+    for item in t_json.get("data", list()):
+        inst_id = item.get("instId", "")
+        if not inst_id.endswith("-USDT-SWAP"):
+            continue
+        sym = from_okx_inst(inst_id)
+        last_p = float(item.get("last", 0) or 0)
+        open_24h = float(item.get("open24h", last_p) or last_p)
+        vol_ccy_24h = float(item.get("volCcy24h", 0) or 0)
+        # Na OKX pri SWAP kontraktoch volCcy24h je v base mene (napr. BTC), prepočet na USDT objem:
+        quote_vol = vol_ccy_24h * last_p
+        pct_change = ((last_p - open_24h) / max(1e-9, open_24h)) * 100.0
+
+        tickers[sym] = {
+            "symbol": sym,
+            "instId": inst_id,
+            "lastPrice": str(last_p),
+            "quoteVolume": str(quote_vol),
+            "volume": str(vol_ccy_24h),
+            "priceChangePercent": str(pct_change)
+        }
+
+    oi_map = dict()
+    for item in oi_json.get("data", list()):
+        inst_id = item.get("instId", "")
+        if inst_id.endswith("-USDT-SWAP"):
+            sym = from_okx_inst(inst_id)
+            oi_map[sym] = float(item.get("oiCcy", 0) or 0)
+
+    return tickers, oi_map
 
 def get_sectors_map() -> dict:
     try:
         res = supabase.table("coin_sectors").select("*").execute()
         return {r["symbol"]: r["sector"] for r in res.data}
     except Exception:
-        return {}
+        return dict()
 
 def get_24h_metrics() -> dict:
     try:
         res = supabase.table("market_metrics_24h").select("*").execute()
         return {r["symbol"]: r for r in res.data}
     except Exception:
-        return {}
+        return dict()
 
 async def evaluate_candidates(
     client: httpx.AsyncClient,
     tickers: dict,
-    fundings: dict,
+    oi_map: dict,
     excluded_symbols: set,
     excluded_sectors: set,
     min_vol: float,
@@ -200,7 +285,7 @@ async def evaluate_candidates(
 ):
     sectors_map = get_sectors_map()
     metrics_24h = get_24h_metrics()
-    pre_filtered = []
+    pre_filtered = list()
 
     for sym, t in tickers.items():
         if sym == "BTCUSDT" or sym in excluded_symbols:
@@ -216,40 +301,41 @@ async def evaluate_candidates(
         if price <= 0:
             continue
 
-        total_base_vol = float(t.get("volume", 0))
-        taker_buy_base = float(t.get("takerBuyBaseVolume", total_base_vol * 0.5))
-        taker_sell_base = max(1e-9, total_base_vol - taker_buy_base)
-        ofd = taker_buy_base / taker_sell_base
-
-        f_data = fundings.get(sym, {})
-        funding_rate = float(f_data.get("lastFundingRate", 0.0))
         price_change_pct = float(t["priceChangePercent"])
+        pre_filtered.append((sym, vol, sec, price, price_change_pct))
 
-        pre_filtered.append((sym, vol, sec, price, ofd, funding_rate, price_change_pct))
+    # Zoradíme podľa absolútnej 24h zmeny ceny, aby sme prioritne analyzovali najaktívnejšie trhy (max 35 na okno)
+    pre_filtered.sort(key=lambda x: abs(x[4]), reverse=True)
+    pre_filtered = pre_filtered[:35]
 
-    sem = asyncio.Semaphore(10)
+    sem = asyncio.Semaphore(8)
 
     async def process_symbol(item):
-        sym, vol, sec, price, ofd, funding_rate, price_change_pct = item
+        sym, vol, sec, price, price_change_pct = item
         async with sem:
             try:
-                k_res = await client.get(f"{BINANCE_FAPI}/fapi/v1/klines", params={"symbol": sym, "interval": "15m", "limit": 20})
-                if k_res.status_code != 200:
-                    return None
-                klines = k_res.json()
+                inst_id = to_okx_inst(sym)
+                klines, f_res = await asyncio.gather(
+                    fetch_okx_klines(client, sym, "15m", 20),
+                    client.get(f"{OKX_API}/api/v5/public/funding-rate", params={"instId": inst_id})
+                )
                 if len(klines) < 15:
                     return None
 
+                funding_rate = 0.0
+                if f_res.status_code == 200:
+                    f_json = f_res.json()
+                    if f_json.get("code") == "0" and f_json.get("data"):
+                        funding_rate = float(f_json["data"][0].get("fundingRate", 0.0) or 0.0)
+
+                ofd = compute_ofd_from_klines(klines)
                 last_candle = klines[-1]
                 last_open = float(get_open(last_candle))
                 last_close = float(get_close(last_candle))
                 is_15m_green = last_close > last_open
 
                 if is_pd_mode:
-                    oi_res = await client.get(f"{BINANCE_FAPI}/fapi/v1/openInterest", params={"symbol": sym})
-                    if oi_res.status_code != 200:
-                        return None
-                    oi_curr = float(oi_res.json().get("openInterest", 0)) * price
+                    oi_curr = oi_map.get(sym, 0.0) * price
                     oi_avg = metrics_24h.get(sym, {}).get("oi_avg_24h", oi_curr)
                     oi_ratio = oi_curr / max(1.0, oi_avg)
 
@@ -292,7 +378,7 @@ async def evaluate_candidates(
 # BLOK 4: INTEGROVANÝ RISK ENGINE, KELLY, NATR ŠTÍT & ORDER FLOW TSL
 # =========================================================================
 def calculate_natr_14(klines: list) -> float:
-    df = pd.DataFrame(klines, columns=["ts", "o", "h", "l", "c", "v", "ct", "qv", "tr", "tb", "tq", "ig"])
+    df = pd.DataFrame(klines, columns=["ts", "o", "h", "l", "c", "v", "qv"])
     for col in ("h", "l", "c"):
         df[col] = df[col].astype(float)
     prev_c = df["c"].shift(1)
@@ -411,8 +497,8 @@ async def run_core_cycle(vault: dict):
     now_ts = time.time()
     now_dt = datetime.now(timezone.utc)
 
-    async with httpx.AsyncClient(http2=True, timeout=10.0) as client:
-        tickers, fundings = await fetch_market_snapshot(client)
+    async with httpx.AsyncClient(http2=True, timeout=12.0) as client:
+        tickers, oi_map = await fetch_market_snapshot(client)
 
         for win_key, pos in vault["windows"].items():
             win_id = int(win_key)
@@ -424,10 +510,8 @@ async def run_core_cycle(vault: dict):
                 continue
 
             curr_price = float(tickers[sym]["lastPrice"])
-            t_data = tickers[sym]
-            tot_v = float(t_data.get("volume", 1.0))
-            tb_v = float(t_data.get("takerBuyBaseVolume", tot_v * 0.5))
-            ofd = tb_v / max(1e-9, tot_v - tb_v)
+            live_klines = await fetch_okx_klines(client, sym, "15m", 10)
+            ofd = compute_ofd_from_klines(live_klines) if live_klines else 1.0
 
             is_long = pos["direction"] == "LONG"
             dir_mult = 1.0 if is_long else -1.0
@@ -517,9 +601,8 @@ async def run_core_cycle(vault: dict):
             vault["last_30m_slot"] = current_30m_slot
 
             if vault["windows"]["1"]["status"] == "WAITING":
-                k_btc = await client.get(f"{BINANCE_FAPI}/fapi/v1/klines", params={"symbol": "BTCUSDT", "interval": "15m", "limit": 20})
-                if k_btc.status_code == 200:
-                    btc_klines = k_btc.json()
+                btc_klines = await fetch_okx_klines(client, "BTCUSDT", "15m", 20)
+                if len(btc_klines) >= 15:
                     last_btc = btc_klines[-1]
                     btc_dir = "LONG" if float(get_close(last_btc)) > float(get_open(last_btc)) else "SHORT"
                     setup = build_trade_setup({"symbol": "BTCUSDT", "direction": btc_dir, "is_pd": False, "is_funding_trap": False, "klines": btc_klines}, vault["balance"], 1)
@@ -528,7 +611,7 @@ async def run_core_cycle(vault: dict):
                         active_syms.add("BTCUSDT")
 
             if vault["windows"]["2"]["status"] == "WAITING":
-                cands_a = await evaluate_candidates(client, tickers, fundings, active_syms, active_secs, 10_000_000, 1e12, False)
+                cands_a = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 10_000_000, 1e12, False)
                 for c in cands_a:
                     setup = build_trade_setup(c, vault["balance"], 2)
                     if setup:
@@ -538,7 +621,7 @@ async def run_core_cycle(vault: dict):
                         break
 
             if vault["windows"]["3"]["status"] == "WAITING":
-                cands_b = await evaluate_candidates(client, tickers, fundings, active_syms, active_secs, 5_000_000, 9_999_999, False)
+                cands_b = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 5_000_000, 9_999_999, False)
                 for c in cands_b:
                     setup = build_trade_setup(c, vault["balance"], 3)
                     if setup:
@@ -548,7 +631,7 @@ async def run_core_cycle(vault: dict):
 
         if vault["windows"]["4"]["status"] == "WAITING" and (now_ts - vault.get("last_pd_scan", 0) >= 300):
             vault["last_pd_scan"] = now_ts
-            cands_c = await evaluate_candidates(client, tickers, fundings, active_syms, active_secs, 1_000_000, 4_999_999, True)
+            cands_c = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 1_000_000, 4_999_999, True)
             for c in cands_c:
                 setup = build_trade_setup(c, vault["balance"], 4)
                 if setup:
@@ -590,7 +673,7 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
 # =========================================================================
 # SPUSTENIE NEPRETRŽITÉHO JADRA
 # =========================================================================
-st.title("🦈 Shark Alpha Core (Cloud 1 - Active Engine)")
+st.title("🦈 Shark Alpha Core (Cloud 1 - OKX Engine)")
 vault_state = load_vault()
 
 col1, col2 = st.columns(2)
