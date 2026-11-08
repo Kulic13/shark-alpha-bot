@@ -181,7 +181,9 @@ with top_col1:
         curr_bal = safe_float(history_df["current_balance"].iloc[-1], 100.0)
         total_pnl = curr_bal - 100.0
         win_trades = len(history_df[history_df["pnl_usd"] > 0])
-        wr_total = (win_trades / len(history_df)) * 100.0 if len(history_df) > 0 else 0.0
+        fail_trades = len(history_df[history_df["pnl_usd"] <= 0])
+        total_trades = len(history_df)
+        wr_total = (win_trades / total_trades) * 100.0 if total_trades > 0 else 0.0
 
         # Nerealizované PnL – IBA aktívne pozície
         unrealized = sum(
@@ -192,7 +194,8 @@ with top_col1:
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Aktuálny Kapitál", f"${curr_bal:.2f}", f"{total_pnl:+.2f} USD")
-        m2.metric("Celková Úspešnosť", f"{wr_total:.1f} %", f"{len(history_df)} obchodov")
+        m2.metric("Celková Úspešnosť", f"{wr_total:.1f} %", f"{total_trades} obchodov")
+        m2.caption(f"✅ Win: **{win_trades}**  |  ❌ Fail: **{fail_trades}**")
         m3.metric("Nerealizované PnL", f"${unrealized:+.2f}")
 
         # Equity krivka – preferujeme closed_at, potom updated_at, inak id
