@@ -1,4 +1,8 @@
-import streamlit as st
+import os
+
+os.makedirs("generated", exist_ok=True)
+
+full_code = '''import streamlit as st
 import httpx
 import asyncio
 import json
@@ -266,6 +270,7 @@ async def fetch_okx_funding(client: httpx.AsyncClient, symbol: str) -> float:
     except Exception:
         pass
     return 0.0
+
 # =========================================================================
 # BLOK 3B: ANTI-BLIND EXEKÚCIA, ANTI-EXTREME ŠTÍT, BTC VETO & SKENER
 # =========================================================================
@@ -760,28 +765,38 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
     if is_pd:
         dca1 = dca2 = dca3 = 0.0
         sl_pct = (natr * 1.8 * sl_mod) / 100.0
-        tp1 = price * (1.0 + dir_mult * ((natr * 1.0) / 100.0 + cost_rate))
-        tp2 = tp1 * (1.0 + dir_mult * (0.01 + cost_rate))
+        tp1 = price * (1.0 + dir_mult * ((natr * 1.0 * tp_mod) / 100.0 + cost_rate))
+        tp2 = price * (1.0 + dir_mult * ((natr * 1.8 * tp_mod) / 100.0 + cost_rate))
     else:
         dca1 = price * (1.0 - dir_mult * ((0.5 * natr) / 100.0))
         dca2 = price * (1.0 - dir_mult * ((1.2 * natr) / 100.0))
         dca3 = price * (1.0 - dir_mult * ((2.0 * natr) / 100.0))
-        sl_pct = (2.5 * natr * sl_mod) / 100.0
+
+        # Finančná poistka: Hard SL musí byť vždy za DCA3 (min. 2.25 * natr),
+        # inak by nízky sl_modifier zavrel obchod pred vyplnením DCA3
+        raw_sl_mult = max(2.25, 2.5 * sl_mod)
+        sl_pct = (raw_sl_mult * natr) / 100.0
+
         tp1 = price * (1.0 + dir_mult * ((1.0 * natr * tp_mod) / 100.0 + cost_rate))
         tp2 = price * (1.0 + dir_mult * ((1.8 * natr * tp_mod) / 100.0 + cost_rate))
 
     sl_price = price * (1.0 - dir_mult * sl_pct)
 
+    # Výpočet likvidačnej zóny 20x páky (TP3) s garantovanou monotónnosťou
     recent_klines = klines[-20:]
     highs = [float(get_high(k)) for k in recent_klines]
     lows = [float(get_low(k)) for k in recent_klines]
     mmr = 0.004
+    min_tp3_gap = (0.5 * natr) / 100.0
+
     if direction == "LONG":
         liq_short_20x = max(highs) * (1.0 + (1.0 / 20.0) - mmr)
-        tp3 = liq_short_20x * 0.995
+        raw_tp3 = liq_short_20x * 0.995
+        tp3 = max(raw_tp3, tp2 * (1.0 + min_tp3_gap))
     else:
         liq_long_20x = min(lows) * (1.0 - (1.0 / 20.0) + mmr)
-        tp3 = liq_long_20x * 1.005
+        raw_tp3 = liq_long_20x * 1.005
+        tp3 = min(raw_tp3, tp2 * (1.0 - min_tp3_gap))
 
     return {
         "window_id": window_id,
@@ -794,6 +809,7 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
         "is_funding_trap": cand["is_funding_trap"],
         "natr": natr,
         "cost_rate": cost_rate,
+        "tp_mod": tp_mod,
         "margin_usd": margin_usd,
         "active_margin": margin_usd if is_pd else margin_usd * 0.30,
         "entry_price": price,
@@ -807,7 +823,7 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
         "tsl_active": False,
         "extreme_price": price,
         "mandate_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
-}
+    }
 
 # =========================================================================
 # HLAVNÁ AUTONÓMNA SLUČKA JADRA (CLOUD 1 - OKX)
@@ -847,6 +863,7 @@ async def run_core_cycle(vault: dict):
 
             if not pos["is_pd"]:
                 cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
+                tp_mod = pos.get("tp_mod", 1.0)
                 for idx, pct in ((1, 0.10), (2, 0.30), (3, 0.30)):
                     if not pos[f"dca{idx}_filled"]:
                         dca_p = pos[f"dca{idx}_price"]
@@ -857,19 +874,40 @@ async def run_core_cycle(vault: dict):
                             pos["entry_price"] = ((old_qty * pos["entry_price"]) + (new_qty * dca_p)) / (old_qty + new_qty)
                             pos["active_margin"] += added_m
                             pos[f"dca{idx}_filled"] = True
-                            pos["tp1_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.0 * natr) / 100.0 + cost_rate))
-                            pos["tp2_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.8 * natr) / 100.0 + cost_rate))
 
-            if not pos["tsl_active"]:
+                            # Matematicky zjednotený prepočet TP1 a TP2 vrátane tp_mod
+                            pos["tp1_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.0 * natr * tp_mod) / 100.0 + cost_rate))
+                            pos["tp2_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.8 * natr * tp_mod) / 100.0 + cost_rate))
+
+                            # Zabezpečenie monotónnosti TP3 aj po posune TP2
+                            min_tp3_gap = (0.5 * natr) / 100.0
+                            if is_long:
+                                pos["tp3_price"] = max(pos["tp3_price"], pos["tp2_price"] * (1.0 + min_tp3_gap))
+                            else:
+                                pos["tp3_price"] = min(pos["tp3_price"], pos["tp2_price"] * (1.0 - min_tp3_gap))
+
+            # =================================================================
+            # DVOJSTUPŇOVÝ TSL ENGINE (Fáza 1: TP1 -> BE, Fáza 2: TP2 -> Trail)
+            # =================================================================
+            # Fáza 1: Dosiahnutie TP1 -> Uzamknutie čistého Break-Even + rezerva
+            if not pos.get("tp1_hit", False):
                 if (is_long and curr_price >= pos["tp1_price"]) or (not is_long and curr_price <= pos["tp1_price"]):
-                    pos["tsl_active"] = True
                     pos["tp1_hit"] = True
+                    pos["tsl_active"] = True
                     pos["extreme_price"] = curr_price
                     cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
                     be_lock = pos["entry_price"] * (1.0 + dir_mult * (cost_rate + 0.0010))
-                    pos["sl_tsl_price"] = be_lock
+                    if (is_long and be_lock > pos["sl_tsl_price"]) or (not is_long and be_lock < pos["sl_tsl_price"]):
+                        pos["sl_tsl_price"] = be_lock
 
-            if pos["tsl_active"]:
+            # Fáza 2: Dosiahnutie TP2 -> Aktivácia dynamického Trailingu
+            if pos.get("tp1_hit", False) and not pos.get("tp2_hit", False):
+                if (is_long and curr_price >= pos["tp2_price"]) or (not is_long and curr_price <= pos["tp2_price"]):
+                    pos["tp2_hit"] = True
+                    pos["extreme_price"] = curr_price
+
+            # Fáza 3: Aktívny posun Trailing SL (až po potvrdení TP2)
+            if pos.get("tp2_hit", False):
                 if is_long and curr_price > pos["extreme_price"]:
                     pos["extreme_price"] = curr_price
                 elif not is_long and curr_price < pos["extreme_price"]:
@@ -885,7 +923,8 @@ async def run_core_cycle(vault: dict):
                         continue
                     elif strong_pump:
                         tsl_w_pct = (natr / max(0.2, ofd)) if is_long else (natr * ofd)
-                        new_tsl = curr_price * (1.0 - dir_mult * (tsl_w_pct / 100.0))
+                        # Výpočet z extreme_price (skutočného vrcholu), nie z aktuálnej ceny
+                        new_tsl = pos["extreme_price"] * (1.0 - dir_mult * (tsl_w_pct / 100.0))
                         if (is_long and new_tsl > pos["sl_tsl_price"]) or (not is_long and new_tsl < pos["sl_tsl_price"]):
                             pos["sl_tsl_price"] = new_tsl
                 else:
@@ -1050,3 +1089,13 @@ except Exception as e:
 st.json(vault_state["windows"])
 time.sleep(5)
 st.rerun()
+'''
+
+output_path = "generated/shark_alpha_core_v2.txt"
+with open(output_path, "w", encoding="utf-8") as f:
+    f.write(full_code)
+
+with open(output_path, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+
+print(f"Saved {len(lines)} lines to {output_path}")
