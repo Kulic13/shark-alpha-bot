@@ -668,7 +668,7 @@ async def process_symbol(item):
                         "sector": sec,
                         "ofd": ofd,
                         "klines": klines,
-                        "exec_price": exec_price
+                "exec_price": exec_price
                     }
             except Exception:
                 return None
