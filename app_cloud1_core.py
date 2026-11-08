@@ -379,6 +379,79 @@ async def verify_execution_confirmation(
     except Exception:
         return False, 0.0
 
+
+async def verify_execution_confirmation_btc(
+    client: httpx.AsyncClient,
+    symbol: str,
+    direction: str,
+    klines_15m: list,
+    ofd: float,
+    cache: dict
+) -> tuple[bool, float]:
+    """Uvoľnená verzia pre BTC – volume filter 1.05x namiesto 1.10x (BTC má stabilnejší volume)."""
+    if len(klines_15m) < 12:
+        return False, 0.0
+
+    vols = [float(get_vol(k)) for k in klines_15m[-11:]]
+    avg_prev_vol = float(np.mean(vols[:-1])) if len(vols) > 1 else 0.0
+    curr_vol = vols[-1]
+    # Uvoľnené pre BTC (1.05 namiesto 1.10)
+    if avg_prev_vol > 0 and (curr_vol / avg_prev_vol) < 1.05:
+        return False, 0.0
+
+    klines_1h = await fetch_okx_klines(client, symbol, "1H", 25, cache)
+    if len(klines_1h) >= 21:
+        closes_1h = pd.Series([float(get_close(k)) for k in klines_1h])
+        ema21_1h = float(closes_1h.ewm(span=21, adjust=False).mean().iloc[-1])
+        last_1h_close = float(closes_1h.iloc[-1])
+        if direction == "LONG" and last_1h_close < ema21_1h and ofd < 1.50:
+            return False, 0.0
+        if direction == "SHORT" and last_1h_close > ema21_1h and ofd > 0.65:
+            return False, 0.0
+
+    inst_id = to_okx_inst_id(symbol)
+    try:
+        ob_res = await client.get(
+            f"{OKX_API}/api/v5/market/books",
+            params={"instId": inst_id, "sz": "5"}
+        )
+        if ob_res.status_code != 200:
+            return False, 0.0
+        ob_json = ob_res.json()
+        if ob_json.get("code") != "0" or not ob_json.get("data"):
+            return False, 0.0
+
+        book = ob_json["data"][0]
+        asks = book.get("asks", [])
+        bids = book.get("bids", [])
+        if not asks or not bids:
+            return False, 0.0
+
+        best_ask = float(asks[0][0])
+        best_bid = float(bids[0][0])
+        if best_bid <= 0 or best_ask <= 0:
+            return False, 0.0
+
+        spread_pct = ((best_ask - best_bid) / best_bid) * 100.0
+        # BTC má veľmi úzky spread – necháme 0.18
+        if spread_pct > 0.18:
+            return False, 0.0
+
+        bid_depth = sum(float(b[1]) for b in bids[:5])
+        ask_depth = sum(float(a[1]) for a in asks[:5])
+        obi = bid_depth / max(1e-9, ask_depth)
+
+        if direction == "LONG" and obi < 0.85:
+            return False, 0.0
+        if direction == "SHORT" and obi > 1.18:
+            return False, 0.0
+
+        exec_price = best_ask if direction == "LONG" else best_bid
+        return True, exec_price
+    except Exception:
+        return False, 0.0
+
+
 def compute_ofd_from_klines(klines: list) -> float:
     if not klines:
         return 1.0
@@ -1018,21 +1091,45 @@ async def run_core_cycle(vault: dict):
             sectors_map = get_sectors_map()
             active_secs = {sectors_map.get(s, "UNKNOWN") for s in active_syms}
 
+            # ===== BTC WINDOW 1 – OPRAVENÁ LOGIKA (OFD + funding rovnako ako altcoiny) =====
             if vault["windows"]["1"]["status"] == "WAITING" and len(btc_klines) >= 20:
                 last_btc = btc_klines[-1]
-                btc_dir = "LONG" if float(get_close(last_btc)) > float(get_open(last_btc)) else "SHORT"
+                is_15m_green = float(get_close(last_btc)) > float(get_open(last_btc))
                 btc_ofd = compute_ofd_from_klines(btc_klines)
-                if check_anti_extreme_shield(btc_klines, btc_dir, is_pd=False):
-                    ok_exec, exec_price = await verify_execution_confirmation(
-                        client, "BTCUSDT", btc_dir, btc_klines, btc_ofd, False, klines_cache
+
+                direction = None
+                is_trap = False
+
+                # Rovnaká logika smeru ako v evaluate_candidates
+                if not is_15m_green and btc_ofd < 0.90:
+                    funding_rate = await fetch_okx_funding(client, "BTCUSDT")
+                    if funding_rate > 0.0020:
+                        direction = "SHORT"
+                        is_trap = True
+                if direction is None and is_15m_green and btc_ofd > 1.15:
+                    funding_rate = await fetch_okx_funding(client, "BTCUSDT")
+                    if funding_rate < -0.0050:
+                        direction = "LONG"
+                        is_trap = True
+
+                if direction is None:
+                    if btc_ofd > 1.30 and is_15m_green:
+                        direction = "LONG"
+                    elif btc_ofd < 0.70 and not is_15m_green:
+                        direction = "SHORT"
+
+                if direction and check_anti_extreme_shield(btc_klines, direction, is_pd=False):
+                    # Pre BTC používame uvoľnenú verziu (volume 1.05x)
+                    ok_exec, exec_price = await verify_execution_confirmation_btc(
+                        client, "BTCUSDT", direction, btc_klines, btc_ofd, klines_cache
                     )
                     if ok_exec:
                         setup = build_trade_setup(
                             {
                                 "symbol": "BTCUSDT",
-                                "direction": btc_dir,
+                                "direction": direction,
                                 "is_pd": False,
-                                "is_funding_trap": False,
+                                "is_funding_trap": is_trap,
                                 "klines": btc_klines,
                                 "exec_price": exec_price
                             },
