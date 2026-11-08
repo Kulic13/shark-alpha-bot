@@ -556,7 +556,7 @@ async def evaluate_candidates(
 
     sem = asyncio.Semaphore(10)
 
-async def process_symbol(item):
+    async def process_symbol(item):
         sym, vol, sec, price, price_change_pct = item
         async with sem:
             try:
@@ -668,7 +668,7 @@ async def process_symbol(item):
                         "sector": sec,
                         "ofd": ofd,
                         "klines": klines,
-                "exec_price": exec_price
+                        "exec_price": exec_price
                     }
             except Exception:
                 return None
@@ -808,8 +808,7 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
         "extreme_price": price,
         "mandate_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
 }
-    ### Časť B: Hlavná autonómna slučka (`run_core_cycle`), zatváranie pozícií a UI
-```python
+
 # =========================================================================
 # HLAVNÁ AUTONÓMNA SLUČKA JADRA (CLOUD 1 - OKX)
 # =========================================================================
@@ -993,42 +992,41 @@ async def run_core_cycle(vault: dict):
                         break
 
     save_vault(vault)
-    def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
-win_id = pos["window_id"]
-dir_mult = 1.0 if pos["direction"] == "LONG" else -1.0
-cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
-gross_pnl_pct = ((exit_price - pos["entry_price"]) / pos["entry_price"]) * dir_mult * pos["leverage"] * 100.0
-net_pnl_pct = gross_pnl_pct - (cost_rate * pos["leverage"] * 100.0)
-pnl_usd = pos["active_margin"] * (net_pnl_pct / 100.0)
-vault["balance"] = round(vault["balance"] + pnl_usd, 4)
-is_win = pnl_usd > 0
-r_mult = pnl_usd / max(0.01, pos["margin_usd"])
-update_ai_learning(pos["symbol"], pos["direction"], pos["regime"], pos["is_funding_trap"], is_win, r_mult, vault)
-hist_row = {
-"window_id": win_id, "symbol": pos["symbol"], "direction": pos["direction"],
-"regime": pos["regime"], "leverage": pos["leverage"], "entry_price": pos["entry_price"],
-"exit_price": exit_price, "margin_usd": pos["active_margin"], "pnl_usd": round(pnl_usd, 4),
-"pnl_percent": round(net_pnl_pct, 2), "exit_reason": reason, "current_balance": vault["balance"]
-}
-try:
-supabase.table("trade_history").insert(hist_row).execute()
-except Exception:
-vault["pending_supabase_sync"].append({"table": "trade_history", "op": "insert", "data": hist_row})
-vault["windows"][str(win_id)] = {"status": "WAITING", "symbol": "BTCUSDT" if win_id == 1 else None, "mandate_until": 0}
-safe_supabase_upsert("active_positions", {
-"window_id": win_id, "status": "WAITING", "symbol": None, "entry_price": 0.0,
-"tp1_price": 0.0, "tp2_price": 0.0, "tp3_price": 0.0, "sl_tsl_price": 0.0,
-"pnl_usd": 0.0, "pnl_percent": 0.0, "updated_at": datetime.now(timezone.utc).isoformat()
-}, vault)
-save_vault(vault)
-
-=========================================================================
 
 
-SPUSTENIE NEPRETRŽITÉHO JADRA
+def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
+    win_id = pos["window_id"]
+    dir_mult = 1.0 if pos["direction"] == "LONG" else -1.0
+    cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
+    gross_pnl_pct = ((exit_price - pos["entry_price"]) / pos["entry_price"]) * dir_mult * pos["leverage"] * 100.0
+    net_pnl_pct = gross_pnl_pct - (cost_rate * pos["leverage"] * 100.0)
+    pnl_usd = pos["active_margin"] * (net_pnl_pct / 100.0)
+    vault["balance"] = round(vault["balance"] + pnl_usd, 4)
+    is_win = pnl_usd > 0
+    r_mult = pnl_usd / max(0.01, pos["margin_usd"])
+    update_ai_learning(pos["symbol"], pos["direction"], pos["regime"], pos["is_funding_trap"], is_win, r_mult, vault)
+    hist_row = {
+        "window_id": win_id, "symbol": pos["symbol"], "direction": pos["direction"],
+        "regime": pos["regime"], "leverage": pos["leverage"], "entry_price": pos["entry_price"],
+        "exit_price": exit_price, "margin_usd": pos["active_margin"], "pnl_usd": round(pnl_usd, 4),
+        "pnl_percent": round(net_pnl_pct, 2), "exit_reason": reason, "current_balance": vault["balance"]
+    }
+    try:
+        supabase.table("trade_history").insert(hist_row).execute()
+    except Exception:
+        vault["pending_supabase_sync"].append({"table": "trade_history", "op": "insert", "data": hist_row})
+    vault["windows"][str(win_id)] = {"status": "WAITING", "symbol": "BTCUSDT" if win_id == 1 else None, "mandate_until": 0}
+    safe_supabase_upsert("active_positions", {
+        "window_id": win_id, "status": "WAITING", "symbol": None, "entry_price": 0.0,
+        "tp1_price": 0.0, "tp2_price": 0.0, "tp3_price": 0.0, "sl_tsl_price": 0.0,
+        "pnl_usd": 0.0, "pnl_percent": 0.0, "updated_at": datetime.now(timezone.utc).isoformat()
+    }, vault)
+    save_vault(vault)
 
 
-=========================================================================
+# =========================================================================
+# SPUSTENIE NEPRETRŽITÉHO JADRA
+# =========================================================================
 
 st.title("🦈 Shark Alpha Core (Cloud 1 - OKX Engine)")
 vault_state = load_vault()
@@ -1040,15 +1038,15 @@ col2.metric("Posledný 3m Sken (UTC)", last_scan_str)
 veto_info = vault_state.get("last_btc_veto", {})
 veto_status = "OK (Voľný trh)"
 if veto_info.get("veto_long"):
-veto_status = "🛑 VETO LONG"
+    veto_status = "🛑 VETO LONG"
 elif veto_info.get("veto_short"):
-veto_status = "🛑 VETO SHORT"
+    veto_status = "🛑 VETO SHORT"
 col3.metric("BTC Veto Filter", veto_status)
 try:
-asyncio.run(run_core_cycle(vault_state))
-st.success(f"✅ Cyklus dokončený ({datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC)")
+    asyncio.run(run_core_cycle(vault_state))
+    st.success(f"✅ Cyklus dokončený ({datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC)")
 except Exception as e:
-st.error(f"⚠️ Chyba cyklu: {e}")
+    st.error(f"⚠️ Chyba cyklu: {e}")
 st.json(vault_state["windows"])
 time.sleep(5)
 st.rerun()
