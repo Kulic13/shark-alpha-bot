@@ -254,15 +254,13 @@ for wid in (1, 2, 3, 4):
             st.markdown(f"**Smer:** {dir_icon} | **Režim:** {w.get('regime')} ({w.get('leverage')}x)")
             st.markdown(f"**Entry Price:** `{safe_float(w.get('entry_price')):.5f}`")
 
-            # TP hladiny + hit stavy
+            # TP hladiny + executed stavy
             tp1_hit = bool(w.get("tp1_hit", False))
             tp2_hit = bool(w.get("tp2_hit", False))
-            tp1_label = "✅ TP1" if tp1_hit else "TP1"
-            tp2_label = "✅ TP2" if tp2_hit else "TP2"
-            st.markdown(
-                f"**{tp1_label}:** `{safe_float(w.get('tp1_price')):.5f}` | "
-                f"**{tp2_label}:** `{safe_float(w.get('tp2_price')):.5f}`"
-            )
+            tp1_txt = f"`{safe_float(w.get('tp1_price')):.5f}`  ✅ executed" if tp1_hit else f"`{safe_float(w.get('tp1_price')):.5f}`"
+            tp2_txt = f"`{safe_float(w.get('tp2_price')):.5f}`  ✅ executed" if tp2_hit else f"`{safe_float(w.get('tp2_price')):.5f}`"
+            st.markdown(f"**TP1:** {tp1_txt}")
+            st.markdown(f"**TP2:** {tp2_txt}")
             st.markdown(f"**TP3 (Liq):** `{safe_float(w.get('tp3_price')):.5f}`")
 
             # SL / TSL
@@ -270,26 +268,24 @@ for wid in (1, 2, 3, 4):
             sl_label = "🟢 TSL (Aktívny)" if tsl_active else "🔴 Hard SL"
             st.markdown(f"**{sl_label}:** `{safe_float(w.get('sl_tsl_price')):.5f}`")
 
-            # DCA stavy (ak Cloud 1 ukladá filled flagy)
+            # DCA stavy + executed
             dca1_p = safe_float(w.get("dca1_price"))
             if dca1_p > 0:
                 dca1_f = bool(w.get("dca1_filled", False))
                 dca2_f = bool(w.get("dca2_filled", False))
                 dca3_f = bool(w.get("dca3_filled", False))
-                dca1_txt = "✅ DCA1" if dca1_f else "DCA1"
-                dca2_txt = "✅ DCA2" if dca2_f else "DCA2"
-                dca3_txt = "✅ DCA3" if dca3_f else "DCA3"
-                st.markdown(
-                    f"**{dca1_txt}:** `{dca1_p:.5f}` | "
-                    f"**{dca2_txt}:** `{safe_float(w.get('dca2_price')):.5f}` | "
-                    f"**{dca3_txt}:** `{safe_float(w.get('dca3_price')):.5f}`"
-                )
+                dca1_txt = f"`{dca1_p:.5f}`  ✅ executed" if dca1_f else f"`{dca1_p:.5f}`"
+                dca2_txt = f"`{safe_float(w.get('dca2_price')):.5f}`  ✅ executed" if dca2_f else f"`{safe_float(w.get('dca2_price')):.5f}`"
+                dca3_txt = f"`{safe_float(w.get('dca3_price')):.5f}`  ✅ executed" if dca3_f else f"`{safe_float(w.get('dca3_price')):.5f}`"
+                st.markdown(f"**DCA1:** {dca1_txt}")
+                st.markdown(f"**DCA2:** {dca2_txt}")
+                st.markdown(f"**DCA3:** {dca3_txt}")
 
             # Fáza obchodu (odvodená)
             if tp2_hit:
                 phase = "🎯 Fáza 3 – Trailing po TP2"
             elif tp1_hit:
-                phase = "🔒 Fáza 2 – Break-even lock (TP1)"
+                phase = "🔒 Fáza 2 – Break-even lock (TP1 executed)"
             else:
                 phase = "⏳ Fáza 1 – Čaká na TP1"
             st.caption(phase)
@@ -358,12 +354,12 @@ for wid in (1, 2, 3, 4):
         fig.add_hline(
             y=tp1, line_dash="dash", line_color="#00ff88",
             line_width=3 if tp1_hit else 1.5,
-            annotation_text="✅ TP1" if tp1_hit else "TP1"
+            annotation_text="TP1 executed" if tp1_hit else "TP1"
         )
         fig.add_hline(
             y=tp2, line_dash="dash", line_color="#00cc66",
             line_width=3 if tp2_hit else 1.5,
-            annotation_text="✅ TP2" if tp2_hit else "TP2"
+            annotation_text="TP2 executed" if tp2_hit else "TP2"
         )
         fig.add_hline(y=tp3, line_dash="dash", line_color="#009944", annotation_text="TP3")
 
@@ -371,7 +367,7 @@ for wid in (1, 2, 3, 4):
         sl_txt = "TSL" if tsl_active else "SL"
         fig.add_hline(y=sl, line_color="#ff3355", line_width=2, annotation_text=sl_txt)
 
-        # DCA hladiny – oranžové, filled = plná čiara
+        # DCA hladiny – oranžové, filled = plná čiara + "executed"
         dca1_p = safe_float(w.get("dca1_price"))
         if dca1_p > 0:
             dca1_f = bool(w.get("dca1_filled", False))
@@ -383,21 +379,21 @@ for wid in (1, 2, 3, 4):
                 line_dash="solid" if dca1_f else "dot",
                 line_color="orange",
                 line_width=2 if dca1_f else 1,
-                annotation_text="✅ DCA1" if dca1_f else "DCA1"
+                annotation_text="DCA1 executed" if dca1_f else "DCA1"
             )
             fig.add_hline(
                 y=safe_float(w.get("dca2_price")),
                 line_dash="solid" if dca2_f else "dot",
                 line_color="orange",
                 line_width=2 if dca2_f else 1,
-                annotation_text="✅ DCA2" if dca2_f else "DCA2"
+                annotation_text="DCA2 executed" if dca2_f else "DCA2"
             )
             fig.add_hline(
                 y=safe_float(w.get("dca3_price")),
                 line_dash="solid" if dca3_f else "dot",
                 line_color="orange",
                 line_width=2 if dca3_f else 1,
-                annotation_text="✅ DCA3" if dca3_f else "DCA3"
+                annotation_text="DCA3 executed" if dca3_f else "DCA3"
             )
 
     fig.update_layout(
