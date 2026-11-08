@@ -759,21 +759,29 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
     save_vault(vault)
 
 # =========================================================================
-# SPUSTENIE NEPRETRŽITÉHO JADRA (OKX EDITION)
+# SPUSTENIE NEPRETRŽITÉHO JADRA
 # =========================================================================
 st.title("🦈 Shark Alpha Core (Cloud 1 - OKX Engine)")
 vault_state = load_vault()
 
-next_scan_in = max(0, int(180 - (time.time() - vault_state.get("last_market_scan", 0))))
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 col1.metric("Live Fiktívny Kapitál", f"${vault_state['balance']:.2f} USD")
-col2.metric("Ďalší 3m Sken Trhu za", f"{next_scan_in} s")
+
+last_scan_ts = vault_state.get("last_main_scan", 0)
+last_scan_str = datetime.fromtimestamp(last_scan_ts, tz=timezone.utc).strftime("%H:%M:%S") if last_scan_ts > 0 else "Čaká"
+col2.metric("Posledný 3m Sken (UTC)", last_scan_str)
+
+veto_info = vault_state.get("last_btc_veto", {})
+veto_status = "OK (Voľný trh)"
+if veto_info.get("veto_long"):
+    veto_status = "🛑 VETO LONG"
+elif veto_info.get("veto_short"):
+    veto_status = "🛑 VETO SHORT"
+col3.metric("BTC Veto Filter", veto_status)
 
 try:
-    veto_info = asyncio.run(run_core_cycle(vault_state))
-    st.success(f"✅ OKX Cyklus dokončený ({datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC)")
-    if veto_info["veto_long"] or veto_info["veto_short"]:
-        st.warning(f"🛡️ BTC Veto Aktívne: {veto_info['reason']}")
+    asyncio.run(run_core_cycle(vault_state))
+    st.success(f"✅ Cyklus dokončený ({datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC)")
 except Exception as e:
     st.error(f"⚠️ Chyba cyklu: {e}")
 
@@ -781,11 +789,7 @@ st.json(vault_state["windows"])
 
 time.sleep(5)
 st.rerun()
-'''
 
-file_path = "app_cloud1_core_okx.txt"
-with open(file_path, "w", encoding="utf-8") as f:
-    f.write(code_content)
 
 compile(code_content, file_path, "exec")
 print(f"File {file_path} generated and verified successfully. Lines: {len(code_content.splitlines())}")
