@@ -1069,9 +1069,15 @@ async def run_core_cycle(vault: dict):
                     "window_id": win_id, "status": "ACTIVE", "symbol": sym, "direction": pos["direction"],
                     "regime": pos["regime"], "leverage": pos["leverage"], "entry_price": pos["entry_price"],
                     "dca1_price": pos["dca1_price"], "dca2_price": pos["dca2_price"], "dca3_price": pos["dca3_price"],
+                    "dca1_filled": pos.get("dca1_filled", False),
+                    "dca2_filled": pos.get("dca2_filled", False),
+                    "dca3_filled": pos.get("dca3_filled", False),
                     "tp1_price": pos["tp1_price"], "tp2_price": pos["tp2_price"], "tp3_price": pos["tp3_price"],
+                    "tp1_hit": pos.get("tp1_hit", False),
+                    "tp2_hit": pos.get("tp2_hit", False),
                     "sl_tsl_price": pos["sl_tsl_price"], "tsl_active": pos["tsl_active"],
                     "pnl_usd": round(pnl_usd, 4), "pnl_percent": round(net_pnl_pct, 2),
+                    "last_price": curr_price,
                     "mandate_expires_at": pos["mandate_expires_at"], "updated_at": now_dt.isoformat()
                 }, vault)
 
