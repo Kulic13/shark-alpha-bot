@@ -253,8 +253,7 @@ async def verify_execution_confirmation(client: httpx.AsyncClient, symbol: str, 
 
     # 2. Kontrola 1H trendu (EMA-21)
     klines_1h = await fetch_okx_klines(client, symbol, "1H", 25, cache)
-if len(klines_1h) >= 21:
-closes_1h = pd.Series([float(get_close(k)) for k in klines_1h])
+if len(klines_1h) >= 21: closes_1h = pd.Series([float(get_close(k)) for k in klines_1h])
 ema21_1h = float(closes_1h.ewm(span=21, adjust=False).mean().iloc[-1])
 last_1h_close = float(closes_1h.iloc[-1])
 if direction == "LONG" and last_1h_close < ema21_1h and ofd < 1.50:
