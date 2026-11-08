@@ -1,4 +1,4 @@
-code_content = '''import streamlit as st
+import streamlit as st
 import httpx
 import asyncio
 import json
