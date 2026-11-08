@@ -556,7 +556,7 @@ async def evaluate_candidates(
 
     sem = asyncio.Semaphore(10)
 
-        async def process_symbol(item):
+async def process_symbol(item):
         sym, vol, sec, price, price_change_pct = item
         async with sem:
             try:
