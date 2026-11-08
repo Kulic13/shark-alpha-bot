@@ -16,7 +16,7 @@ st.set_page_config(page_title="Shark Alpha Core (Cloud 1 - OKX)", layout="center
 # BLOK 1: INFRAŠTRUKTÚRA, CLOUD TREZOR (SUPABASE) & ZÁLOŽNÁ CACHE
 # =========================================================================
 VAULT_FILE = "vault_state_backup.json"
-OKX_API = "https://okx.com"
+OKX_API = "https://www.okx.com"
 
 get_open = operator.itemgetter(1)
 get_high = operator.itemgetter(2)
