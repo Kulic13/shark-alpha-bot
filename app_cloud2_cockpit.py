@@ -54,7 +54,8 @@ def fetch_btc_options_walls(day_epoch_key: str) -> dict:
             except ValueError:
                 continue
             opt_type = parts[4]
-            oi = float(item.get("oi", 0) or 0)
+            # Preferujeme oiCcy ak existuje, inak oi (počet kontraktov)
+            oi = float(item.get("oiCcy") or item.get("oi") or 0)
             if oi <= 0:
                 continue
 
@@ -98,7 +99,8 @@ def get_btc_options_with_friday_reset() -> dict:
 # =========================================================================
 @st.cache_data(ttl=10)
 def fetch_visual_klines(symbol: str, interval: str) -> pd.DataFrame:
-    limit = 24 if interval == "15m" else 30
+    # Viac histórie pre lepší prehľad (pôvodne 24/30)
+    limit = 60 if interval == "15m" else 90
     inst_id = symbol_to_okx_swap(symbol)
     try:
         with httpx.Client(timeout=8.0) as client:
@@ -131,20 +133,42 @@ def fetch_visual_klines(symbol: str, interval: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+
+def safe_float(val, default=0.0) -> float:
+    try:
+        if val is None:
+            return default
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
 # =========================================================================
 # BLOK 7: VIZUÁLNY KOKPIT (HORNÝ DASHBOARD, SIDEBAR & 4 VEĽKÉ GRAFY)
 # =========================================================================
 st.title("🦈 Shark Alpha Institutional Cockpit (Cloud 2)")
 
-# Načítanie dát zo Supabase
-pos_res = supabase.table("active_positions").select("*").order("window_id").execute()
-active_windows = {r["window_id"]: r for r in pos_res.data} if pos_res.data else {}
+# Načítanie dát zo Supabase s error handlingom
+try:
+    pos_res = supabase.table("active_positions").select("*").order("window_id").execute()
+    active_windows = {r["window_id"]: r for r in pos_res.data} if pos_res.data else {}
+except Exception as e:
+    st.error(f"Chyba načítania active_positions: {e}")
+    active_windows = {}
 
-hist_res = supabase.table("trade_history").select("*").order("id", desc=False).execute()
-history_df = pd.DataFrame(hist_res.data) if hist_res.data else pd.DataFrame()
+try:
+    hist_res = supabase.table("trade_history").select("*").order("id", desc=False).execute()
+    history_df = pd.DataFrame(hist_res.data) if hist_res.data else pd.DataFrame()
+except Exception as e:
+    st.error(f"Chyba načítania trade_history: {e}")
+    history_df = pd.DataFrame()
 
-ai_res = supabase.table("ai_learning_matrix").select("*").order("total_trades", desc=True).execute()
-ai_df = pd.DataFrame(ai_res.data) if ai_res.data else pd.DataFrame()
+try:
+    ai_res = supabase.table("ai_learning_matrix").select("*").order("total_trades", desc=True).execute()
+    ai_df = pd.DataFrame(ai_res.data) if ai_res.data else pd.DataFrame()
+except Exception as e:
+    st.error(f"Chyba načítania ai_learning_matrix: {e}")
+    ai_df = pd.DataFrame()
 
 # -------------------------------------------------------------------------
 # 1. HORNÁ ČASŤ OBRAZOVKY: DYNAMICKÝ EQUITY DASHBOARD & AI MATICA VÝKONU
@@ -154,17 +178,31 @@ top_col1, top_col2 = st.columns([1.2, 1.0])
 with top_col1:
     st.subheader("📈 Dynamický Equity Dashboard")
     if not history_df.empty:
-        curr_bal = float(history_df["current_balance"].iloc[-1])
+        curr_bal = safe_float(history_df["current_balance"].iloc[-1], 100.0)
         total_pnl = curr_bal - 100.0
         win_trades = len(history_df[history_df["pnl_usd"] > 0])
-        wr_total = (win_trades / len(history_df)) * 100.0
+        wr_total = (win_trades / len(history_df)) * 100.0 if len(history_df) > 0 else 0.0
+
+        # Nerealizované PnL – IBA aktívne pozície
+        unrealized = sum(
+            safe_float(w.get("pnl_usd"), 0.0)
+            for w in active_windows.values()
+            if w.get("status") == "ACTIVE"
+        )
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Aktuálny Kapitál", f"${curr_bal:.2f}", f"{total_pnl:+.2f} USD")
         m2.metric("Celková Úspešnosť", f"{wr_total:.1f} %", f"{len(history_df)} obchodov")
-        m3.metric("Nerealizované PnL", f"${sum(float(w.get('pnl_usd') or 0) for w in active_windows.values()):+.2f}")
+        m3.metric("Nerealizované PnL", f"${unrealized:+.2f}")
 
-        x_col = "closed_at" if "closed_at" in history_df.columns else "id"
+        # Equity krivka – preferujeme closed_at, potom updated_at, inak id
+        if "closed_at" in history_df.columns and history_df["closed_at"].notna().any():
+            x_col = "closed_at"
+        elif "updated_at" in history_df.columns and history_df["updated_at"].notna().any():
+            x_col = "updated_at"
+        else:
+            x_col = "id"
+
         fig_eq = go.Figure()
         fig_eq.add_trace(go.Scatter(
             x=history_df[x_col], y=history_df["current_balance"],
@@ -179,7 +217,8 @@ with top_col1:
 with top_col2:
     st.subheader("🧠 Matrica Výkonu a Učenia AI")
     if not ai_df.empty:
-        display_cols = ["symbol", "long_futures_wr", "short_futures_wr", "spot_regime_wr", "funding_reversal_wr", "sl_modifier", "tp_modifier", "total_trades"]
+        display_cols = ["symbol", "long_futures_wr", "short_futures_wr", "spot_regime_wr",
+                        "funding_reversal_wr", "sl_modifier", "tp_modifier", "total_trades"]
         available_cols = [c for c in display_cols if c in ai_df.columns]
         st.dataframe(ai_df[available_cols], height=310, use_container_width=True, hide_index=True)
     else:
@@ -206,19 +245,64 @@ window_titles = {
 for wid in (1, 2, 3, 4):
     w = active_windows.get(wid, {})
     status = w.get("status", "WAITING")
+    # Window 1 defaultne BTCUSDT aj keď WAITING
     sym = w.get("symbol") or ("BTCUSDT" if wid == 1 else "HĽADÁM...")
+
     with st.sidebar.expander(f"{window_titles[wid]} | {sym}", expanded=True):
         if status == "ACTIVE":
             dir_icon = "🟢 LONG" if w.get("direction") == "LONG" else "🔴 SHORT"
             st.markdown(f"**Smer:** {dir_icon} | **Režim:** {w.get('regime')} ({w.get('leverage')}x)")
-            st.markdown(f"**Entry Price:** `{float(w.get('entry_price') or 0):.5f}`")
-            st.markdown(f"**TP1:** `{float(w.get('tp1_price') or 0):.5f}` | **TP2:** `{float(w.get('tp2_price') or 0):.5f}`")
-            st.markdown(f"**TP3 (Liq):** `{float(w.get('tp3_price') or 0):.5f}`")
-            sl_label = "TSL (Aktívny)" if w.get("tsl_active") else "Hard SL"
-            st.markdown(f"**{sl_label}:** `{float(w.get('sl_tsl_price') or 0):.5f}`")
-            pnl_u = float(w.get("pnl_usd") or 0.0)
-            pnl_p = float(w.get("pnl_percent") or 0.0)
+            st.markdown(f"**Entry Price:** `{safe_float(w.get('entry_price')):.5f}`")
+
+            # TP hladiny + hit stavy
+            tp1_hit = bool(w.get("tp1_hit", False))
+            tp2_hit = bool(w.get("tp2_hit", False))
+            tp1_label = "✅ TP1" if tp1_hit else "TP1"
+            tp2_label = "✅ TP2" if tp2_hit else "TP2"
+            st.markdown(
+                f"**{tp1_label}:** `{safe_float(w.get('tp1_price')):.5f}` | "
+                f"**{tp2_label}:** `{safe_float(w.get('tp2_price')):.5f}`"
+            )
+            st.markdown(f"**TP3 (Liq):** `{safe_float(w.get('tp3_price')):.5f}`")
+
+            # SL / TSL
+            tsl_active = bool(w.get("tsl_active", False))
+            sl_label = "🟢 TSL (Aktívny)" if tsl_active else "🔴 Hard SL"
+            st.markdown(f"**{sl_label}:** `{safe_float(w.get('sl_tsl_price')):.5f}`")
+
+            # DCA stavy (ak Cloud 1 ukladá filled flagy)
+            dca1_p = safe_float(w.get("dca1_price"))
+            if dca1_p > 0:
+                dca1_f = bool(w.get("dca1_filled", False))
+                dca2_f = bool(w.get("dca2_filled", False))
+                dca3_f = bool(w.get("dca3_filled", False))
+                dca1_txt = "✅ DCA1" if dca1_f else "DCA1"
+                dca2_txt = "✅ DCA2" if dca2_f else "DCA2"
+                dca3_txt = "✅ DCA3" if dca3_f else "DCA3"
+                st.markdown(
+                    f"**{dca1_txt}:** `{dca1_p:.5f}` | "
+                    f"**{dca2_txt}:** `{safe_float(w.get('dca2_price')):.5f}` | "
+                    f"**{dca3_txt}:** `{safe_float(w.get('dca3_price')):.5f}`"
+                )
+
+            # Fáza obchodu (odvodená)
+            if tp2_hit:
+                phase = "🎯 Fáza 3 – Trailing po TP2"
+            elif tp1_hit:
+                phase = "🔒 Fáza 2 – Break-even lock (TP1)"
+            else:
+                phase = "⏳ Fáza 1 – Čaká na TP1"
+            st.caption(phase)
+
+            # Live PnL
+            pnl_u = safe_float(w.get("pnl_usd"))
+            pnl_p = safe_float(w.get("pnl_percent"))
             st.metric("Live PnL", f"${pnl_u:+.3f} USD", f"{pnl_p:+.2f} %")
+
+            # Updated_at ak existuje
+            updated = w.get("updated_at")
+            if updated:
+                st.caption(f"Posledný update: {updated}")
         else:
             st.caption("Stav: Čaká na vhodný signál z Cloudu 1...")
 
@@ -250,23 +334,71 @@ for wid in (1, 2, 3, 4):
 
     # Vykreslenie opčných stien pre BTC (Okno 1)
     if wid == 1 and btc_options:
-        fig.add_hline(y=btc_options["call_wall"], line_dash="dot", line_color="cyan", annotation_text="Call Wall")
-        fig.add_hline(y=btc_options["put_wall"], line_dash="dot", line_color="magenta", annotation_text="Put Wall")
-        fig.add_hline(y=btc_options["max_pain"], line_dash="dash", line_color="yellow", annotation_text="Max Pain")
+        fig.add_hline(y=btc_options["call_wall"], line_dash="dot", line_color="cyan",
+                      annotation_text="Call Wall", annotation_position="top left")
+        fig.add_hline(y=btc_options["put_wall"], line_dash="dot", line_color="magenta",
+                      annotation_text="Put Wall", annotation_position="top left")
+        fig.add_hline(y=btc_options["max_pain"], line_dash="dash", line_color="yellow",
+                      annotation_text="Max Pain", annotation_position="top left")
 
     # Vykreslenie živých obchodných hladín z Cloudu 1
     if status == "ACTIVE":
-        fig.add_hline(y=float(w["entry_price"]), line_color="white", line_width=2, annotation_text="ENTRY")
-        fig.add_hline(y=float(w["tp1_price"]), line_dash="dash", line_color="#00ff88", annotation_text="TP1")
-        fig.add_hline(y=float(w["tp2_price"]), line_dash="dash", line_color="#00cc66", annotation_text="TP2")
-        fig.add_hline(y=float(w["tp3_price"]), line_dash="dash", line_color="#009944", annotation_text="TP3")
-        sl_txt = "TSL" if w.get("tsl_active") else "SL"
-        fig.add_hline(y=float(w["sl_tsl_price"]), line_color="#ff3355", line_width=2, annotation_text=sl_txt)
+        entry = safe_float(w.get("entry_price"))
+        tp1 = safe_float(w.get("tp1_price"))
+        tp2 = safe_float(w.get("tp2_price"))
+        tp3 = safe_float(w.get("tp3_price"))
+        sl = safe_float(w.get("sl_tsl_price"))
 
-        if float(w.get("dca1_price") or 0) > 0:
-            fig.add_hline(y=float(w["dca1_price"]), line_dash="dot", line_color="orange", annotation_text="DCA1")
-            fig.add_hline(y=float(w["dca2_price"]), line_dash="dot", line_color="orange", annotation_text="DCA2")
-            fig.add_hline(y=float(w["dca3_price"]), line_dash="dot", line_color="orange", annotation_text="DCA3")
+        fig.add_hline(y=entry, line_color="white", line_width=2, annotation_text="ENTRY")
+
+        # TP1 / TP2 – zelené, ak už hitnuté tak hrubšie / iný štýl
+        tp1_hit = bool(w.get("tp1_hit", False))
+        tp2_hit = bool(w.get("tp2_hit", False))
+
+        fig.add_hline(
+            y=tp1, line_dash="dash", line_color="#00ff88",
+            line_width=3 if tp1_hit else 1.5,
+            annotation_text="✅ TP1" if tp1_hit else "TP1"
+        )
+        fig.add_hline(
+            y=tp2, line_dash="dash", line_color="#00cc66",
+            line_width=3 if tp2_hit else 1.5,
+            annotation_text="✅ TP2" if tp2_hit else "TP2"
+        )
+        fig.add_hline(y=tp3, line_dash="dash", line_color="#009944", annotation_text="TP3")
+
+        tsl_active = bool(w.get("tsl_active", False))
+        sl_txt = "TSL" if tsl_active else "SL"
+        fig.add_hline(y=sl, line_color="#ff3355", line_width=2, annotation_text=sl_txt)
+
+        # DCA hladiny – oranžové, filled = plná čiara
+        dca1_p = safe_float(w.get("dca1_price"))
+        if dca1_p > 0:
+            dca1_f = bool(w.get("dca1_filled", False))
+            dca2_f = bool(w.get("dca2_filled", False))
+            dca3_f = bool(w.get("dca3_filled", False))
+
+            fig.add_hline(
+                y=dca1_p,
+                line_dash="solid" if dca1_f else "dot",
+                line_color="orange",
+                line_width=2 if dca1_f else 1,
+                annotation_text="✅ DCA1" if dca1_f else "DCA1"
+            )
+            fig.add_hline(
+                y=safe_float(w.get("dca2_price")),
+                line_dash="solid" if dca2_f else "dot",
+                line_color="orange",
+                line_width=2 if dca2_f else 1,
+                annotation_text="✅ DCA2" if dca2_f else "DCA2"
+            )
+            fig.add_hline(
+                y=safe_float(w.get("dca3_price")),
+                line_dash="solid" if dca3_f else "dot",
+                line_color="orange",
+                line_width=2 if dca3_f else 1,
+                annotation_text="✅ DCA3" if dca3_f else "DCA3"
+            )
 
     fig.update_layout(
         height=520,
@@ -277,3 +409,4 @@ for wid in (1, 2, 3, 4):
     st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
+st.caption("Shark Alpha Cockpit Cloud 2 • Opravená verzia – DCA filled / TP hit stavy / lepšie PnL / viac histórie sviečok")
