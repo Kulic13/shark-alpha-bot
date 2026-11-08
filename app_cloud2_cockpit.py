@@ -8,35 +8,56 @@ from supabase import create_client, Client
 
 st.set_page_config(page_title="Shark Alpha Cockpit (Cloud 2)", layout="wide")
 
-BINANCE_FAPI = "https://binance.com"
-BINANCE_EAPI = "https://binance.com"
+OKX_API = "https://www.okx.com"
 
 @st.cache_resource
 def init_supabase() -> Client:
-    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+    url = st.secrets["SUPABASE_URL"].strip().rstrip("/")
+    key = st.secrets["SUPABASE_KEY"].strip()
+    return create_client(url, key)
 
 supabase = init_supabase()
 
+def symbol_to_okx_swap(sym: str) -> str:
+    if not sym:
+        return "BTC-USDT-SWAP"
+    if sym.endswith("USDT"):
+        base = sym[:-4]
+        return f"{base}-USDT-SWAP"
+    return sym
+
 # =========================================================================
-# BLOK 2: OPČNÉ STENY A MAX PAIN (12h Cache + Piatkový Hard-Reset 00:01 UTC)
+# BLOK 2: OPČNÉ STENY A MAX PAIN (OKX Options API + Piatkový Hard-Reset)
 # =========================================================================
 @st.cache_data(ttl=43200)
 def fetch_btc_options_walls(day_epoch_key: str) -> dict:
     try:
-        with httpx.Client(timeout=8.0) as client:
-            res = client.get(f"{BINANCE_EAPI}/eapi/v1/ticker")
-            data = res.json()
+        with httpx.Client(timeout=10.0) as client:
+            res = client.get(
+                f"{OKX_API}/api/v5/public/open-interest",
+                params={"instType": "OPTION", "uly": "BTC-USD"}
+            )
+            res.raise_for_status()
+            payload = res.json()
+
+        data = payload.get("data", [])
         calls, puts = {}, {}
+
         for item in data:
-            sym = item.get("symbol", "")
-            if not sym.startswith("BTC-"):
+            inst_id = item.get("instId", "")
+            # Formát OKX opcie: BTC-USD-261108-70000-C
+            parts = inst_id.split("-")
+            if len(parts) < 5:
                 continue
-            parts = sym.split("-")
-            if len(parts) < 4:
+            try:
+                strike = float(parts[3])
+            except ValueError:
                 continue
-            strike = float(parts[2])
-            opt_type = parts[3]
-            oi = float(item.get("openInterest", 0))
+            opt_type = parts[4]
+            oi = float(item.get("oi", 0) or 0)
+            if oi <= 0:
+                continue
+
             if opt_type == "C":
                 calls[strike] = calls.get(strike, 0.0) + oi
             elif opt_type == "P":
@@ -73,19 +94,39 @@ def get_btc_options_with_friday_reset() -> dict:
     return fetch_btc_options_walls(epoch_key)
 
 # =========================================================================
-# KANÁL 2: ODĽAHČENÉ SŤAHOVANIE SVIEČOK PRE VIZUALIZÁCIU (Max 24 / 30)
+# KANÁL 2: ODĽAHČENÉ SŤAHOVANIE SVIEČOK PRE VIZUALIZÁCIU (OKX API)
 # =========================================================================
 @st.cache_data(ttl=10)
 def fetch_visual_klines(symbol: str, interval: str) -> pd.DataFrame:
     limit = 24 if interval == "15m" else 30
+    inst_id = symbol_to_okx_swap(symbol)
     try:
-        with httpx.Client(timeout=5.0) as client:
-            res = client.get(f"{BINANCE_FAPI}/fapi/v1/klines", params={"symbol": symbol, "interval": interval, "limit": limit})
-            raw = res.json()
-        df = pd.DataFrame(raw, columns=["ts", "o", "h", "l", "c", "v", "ct", "qv", "tr", "tb", "tq", "ig"])
-        df["time"] = pd.to_datetime(df["ts"], unit="ms")
-        for col in ["o", "h", "l", "c"]:
-            df[col] = df[col].astype(float)
+        with httpx.Client(timeout=8.0) as client:
+            res = client.get(
+                f"{OKX_API}/api/v5/market/candles",
+                params={"instId": inst_id, "bar": interval, "limit": str(limit)}
+            )
+            res.raise_for_status()
+            raw = res.json().get("data", [])
+
+        if not raw:
+            return pd.DataFrame()
+
+        # OKX vracia sviečky od najnovšej po najstaršiu -> otočíme chronologicky
+        raw_chronological = list(reversed(raw))
+        # OKX formát: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+        rows = []
+        for k in raw_chronological:
+            rows.append({
+                "ts": int(k[0]),
+                "o": float(k[1]),
+                "h": float(k[2]),
+                "l": float(k[3]),
+                "c": float(k[4]),
+                "v": float(k[5])
+            })
+        df = pd.DataFrame(rows)
+        df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
         return df
     except Exception:
         return pd.DataFrame()
@@ -121,11 +162,12 @@ with top_col1:
         m1, m2, m3 = st.columns(3)
         m1.metric("Aktuálny Kapitál", f"${curr_bal:.2f}", f"{total_pnl:+.2f} USD")
         m2.metric("Celková Úspešnosť", f"{wr_total:.1f} %", f"{len(history_df)} obchodov")
-        m3.metric("Nerealizované PnL", f"${sum(w.get('pnl_usd', 0) for w in active_windows.values()):+.2f}")
+        m3.metric("Nerealizované PnL", f"${sum(float(w.get('pnl_usd') or 0) for w in active_windows.values()):+.2f}")
 
+        x_col = "closed_at" if "closed_at" in history_df.columns else "id"
         fig_eq = go.Figure()
         fig_eq.add_trace(go.Scatter(
-            x=history_df["closed_at"], y=history_df["current_balance"],
+            x=history_df[x_col], y=history_df["current_balance"],
             mode="lines+markers", name="Equity ($)", line=dict(color="#00ffcc", width=3)
         ))
         fig_eq.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), template="plotly_dark")
@@ -138,15 +180,18 @@ with top_col2:
     st.subheader("🧠 Matrica Výkonu a Učenia AI")
     if not ai_df.empty:
         display_cols = ["symbol", "long_futures_wr", "short_futures_wr", "spot_regime_wr", "funding_reversal_wr", "sl_modifier", "tp_modifier", "total_trades"]
-        st.dataframe(ai_df[display_cols], height=310, use_container_width=True, hide_index=True)
+        available_cols = [c for c in display_cols if c in ai_df.columns]
+        st.dataframe(ai_df[available_cols], height=310, use_container_width=True, hide_index=True)
     else:
         st.info("AI Matica (`ai_learning_matrix`) je pripravená a čaká na prvé dáta z Cloudu 1.")
+
 # -------------------------------------------------------------------------
 # 2. ĽAVÝ SIDEBAR: 4 OPERAČNÉ KARTY POZÍCIÍ (BTC, ŠAMPIÓN A, B, C)
 # -------------------------------------------------------------------------
 st.sidebar.header("🎛️ Ovládanie & Živé Pozície")
 timeframe = st.sidebar.radio("Časový rámec grafov:", ["15m", "1m"], horizontal=True)
 if st.sidebar.button("🔄 Obnoviť dáta Kokpitu"):
+    st.cache_data.clear()
     st.rerun()
 
 st.sidebar.divider()
@@ -158,7 +203,7 @@ window_titles = {
     4: "4️⃣ Šampión C (Pump & Dump)"
 }
 
-for wid in:
+for wid in (1, 2, 3, 4):
     w = active_windows.get(wid, {})
     status = w.get("status", "WAITING")
     sym = w.get("symbol") or ("BTCUSDT" if wid == 1 else "HĽADÁM...")
@@ -166,13 +211,13 @@ for wid in:
         if status == "ACTIVE":
             dir_icon = "🟢 LONG" if w.get("direction") == "LONG" else "🔴 SHORT"
             st.markdown(f"**Smer:** {dir_icon} | **Režim:** {w.get('regime')} ({w.get('leverage')}x)")
-            st.markdown(f"**Entry Price:** `{w.get('entry_price', 0):.5f}`")
-            st.markdown(f"**TP1:** `{w.get('tp1_price', 0):.5f}` | **TP2:** `{w.get('tp2_price', 0):.5f}`")
-            st.markdown(f"**TP3 (Liq):** `{w.get('tp3_price', 0):.5f}`")
+            st.markdown(f"**Entry Price:** `{float(w.get('entry_price') or 0):.5f}`")
+            st.markdown(f"**TP1:** `{float(w.get('tp1_price') or 0):.5f}` | **TP2:** `{float(w.get('tp2_price') or 0):.5f}`")
+            st.markdown(f"**TP3 (Liq):** `{float(w.get('tp3_price') or 0):.5f}`")
             sl_label = "TSL (Aktívny)" if w.get("tsl_active") else "Hard SL"
-            st.markdown(f"**{sl_label}:** `{w.get('sl_tsl_price', 0):.5f}`")
-            pnl_u = w.get("pnl_usd", 0.0)
-            pnl_p = w.get("pnl_percent", 0.0)
+            st.markdown(f"**{sl_label}:** `{float(w.get('sl_tsl_price') or 0):.5f}`")
+            pnl_u = float(w.get("pnl_usd") or 0.0)
+            pnl_p = float(w.get("pnl_percent") or 0.0)
             st.metric("Live PnL", f"${pnl_u:+.3f} USD", f"{pnl_p:+.2f} %")
         else:
             st.caption("Stav: Čaká na vhodný signál z Cloudu 1...")
@@ -183,7 +228,7 @@ for wid in:
 st.subheader("📊 Živé Trhové Grafy & Exekučné Hladiny")
 btc_options = get_btc_options_with_friday_reset()
 
-for wid in:
+for wid in (1, 2, 3, 4):
     w = active_windows.get(wid, {})
     status = w.get("status", "WAITING")
     sym = w.get("symbol") or ("BTCUSDT" if wid == 1 else None)
@@ -195,7 +240,7 @@ for wid in:
 
     df_k = fetch_visual_klines(sym, timeframe)
     if df_k.empty:
-        st.warning(f"Nepodarilo sa načítať sviečky pre {sym}.")
+        st.warning(f"Nepodarilo sa načítať sviečky pre {sym} z OKX API.")
         continue
 
     fig = go.Figure(data=[go.Candlestick(
@@ -211,17 +256,17 @@ for wid in:
 
     # Vykreslenie živých obchodných hladín z Cloudu 1
     if status == "ACTIVE":
-        fig.add_hline(y=w["entry_price"], line_color="white", line_width=2, annotation_text="ENTRY")
-        fig.add_hline(y=w["tp1_price"], line_dash="dash", line_color="#00ff88", annotation_text="TP1")
-        fig.add_hline(y=w["tp2_price"], line_dash="dash", line_color="#00cc66", annotation_text="TP2")
-        fig.add_hline(y=w["tp3_price"], line_dash="dash", line_color="#009944", annotation_text="TP3")
+        fig.add_hline(y=float(w["entry_price"]), line_color="white", line_width=2, annotation_text="ENTRY")
+        fig.add_hline(y=float(w["tp1_price"]), line_dash="dash", line_color="#00ff88", annotation_text="TP1")
+        fig.add_hline(y=float(w["tp2_price"]), line_dash="dash", line_color="#00cc66", annotation_text="TP2")
+        fig.add_hline(y=float(w["tp3_price"]), line_dash="dash", line_color="#009944", annotation_text="TP3")
         sl_txt = "TSL" if w.get("tsl_active") else "SL"
-        fig.add_hline(y=w["sl_tsl_price"], line_color="#ff3355", line_width=2, annotation_text=sl_txt)
+        fig.add_hline(y=float(w["sl_tsl_price"]), line_color="#ff3355", line_width=2, annotation_text=sl_txt)
 
-        if w.get("dca1_price", 0) > 0:
-            fig.add_hline(y=w["dca1_price"], line_dash="dot", line_color="orange", annotation_text="DCA1")
-            fig.add_hline(y=w["dca2_price"], line_dash="dot", line_color="orange", annotation_text="DCA2")
-            fig.add_hline(y=w["dca3_price"], line_dash="dot", line_color="orange", annotation_text="DCA3")
+        if float(w.get("dca1_price") or 0) > 0:
+            fig.add_hline(y=float(w["dca1_price"]), line_dash="dot", line_color="orange", annotation_text="DCA1")
+            fig.add_hline(y=float(w["dca2_price"]), line_dash="dot", line_color="orange", annotation_text="DCA2")
+            fig.add_hline(y=float(w["dca3_price"]), line_dash="dot", line_color="orange", annotation_text="DCA3")
 
     fig.update_layout(
         height=520,
@@ -230,6 +275,5 @@ for wid in:
         margin=dict(l=10, r=10, t=20, b=10)
     )
     st.plotly_chart(fig, use_container_width=True)
-
 
 st.divider()
