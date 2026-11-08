@@ -556,223 +556,260 @@ async def evaluate_candidates(
 
     sem = asyncio.Semaphore(10)
 
-    async def process_symbol(item):
-sym, vol, sec, price, price_change_pct = item
-async with sem:
-try:
-klines = await fetch_okx_klines(client, sym, "15m", 25, klines_cache)
-if len(klines) < 20:
-return None
-last_candle = klines[-1]
-last_open = float(get_open(last_candle))
-last_close = float(get_close(last_candle))
-is_15m_green = last_close > last_open
-ofd = compute_ofd_from_klines(klines)
-if is_pd_mode:
-oi_curr = oi_map.get(sym, 0.0) * price
-oi_avg = float(metrics_24h.get(sym, {}).get("oi_avg_24h", 0.0))
-if oi_avg <= 0:
-oi_avg = oi_curr
-oi_ratio = oi_curr / max(1.0, oi_avg)
-if oi_ratio > 1.80 and ofd > 1.60 and is_15m_green:
-if btc_veto.get("veto_long"):
-return None
-if not check_anti_extreme_shield(klines, "LONG", is_pd=True):
-return None
-ok_exec, exec_price = await verify_execution_confirmation(
-client, sym, "LONG", klines, ofd, True, klines_cache
-)
-if not ok_exec:
-return None
-sas_score = oi_ratio * ofd * 100.0
-return {
-"symbol": sym, "direction": "LONG", "score": sas_score,
-"is_funding_trap": False, "is_pd": True, "sector": sec,
-"ofd": ofd, "klines": klines, "exec_price": exec_price
-}
-elif price_change_pct > 15.0 and ofd < 0.80 and not is_15m_green:
-if btc_veto.get("veto_short"):
-return None
-funding_rate = await fetch_okx_funding(client, sym)
-if funding_rate > 0.0020 and check_anti_extreme_shield(klines, "SHORT", is_pd=True):
-ok_exec, exec_price = await verify_execution_confirmation(
-client, sym, "SHORT", klines, ofd, True, klines_cache
-)
-if not ok_exec:
-return None
-sas_score = abs(price_change_pct) * (1.0 / max(0.1, ofd)) * 50.0
-return {
-"symbol": sym, "direction": "SHORT", "score": sas_score,
-"is_funding_trap": True, "is_pd": True, "sector": sec,
-"ofd": ofd, "klines": klines, "exec_price": exec_price
-}
-return None
-direction = None
-is_trap = False
-if not is_15m_green and ofd < 0.90:
-funding_rate = await fetch_okx_funding(client, sym)
-if funding_rate > 0.0020:
-direction = "SHORT"
-is_trap = True
-if direction is None and is_15m_green and ofd > 1.15:
-funding_rate = await fetch_okx_funding(client, sym)
-if funding_rate < -0.0050:
-direction = "LONG"
-is_trap = True
-if direction is None:
-if ofd > 1.30 and is_15m_green:
-direction = "LONG"
-elif ofd < 0.70 and not is_15m_green:
-direction = "SHORT"
-if direction:
-if direction == "LONG" and btc_veto.get("veto_long"):
-return None
-if direction == "SHORT" and btc_veto.get("veto_short"):
-return None
-if not check_anti_extreme_shield(klines, direction, is_pd=False):
-return None
-ok_exec, exec_price = await verify_execution_confirmation(
-client, sym, direction, klines, ofd, False, klines_cache
-)
-if not ok_exec:
-return None
-vol_norm = np.log1p(vol)
-sas_score = (abs(price_change_pct) + 1.0) * (ofd if direction == "LONG" else (1.0 / max(0.1, ofd))) * (10.0 / vol_norm)
-return {
-"symbol": sym, "direction": direction, "score": sas_score,
-"is_funding_trap": is_trap, "is_pd": False, "sector": sec,
-"ofd": ofd, "klines": klines, "exec_price": exec_price
-}
-except Exception:
-return None
-return None
-results = await asyncio.gather(*(process_symbol(item) for item in pre_filtered))
-candidates = [r for r in results if r is not None]
-candidates.sort(key=lambda x: x["score"], reverse=True)
-return candidates
+        async def process_symbol(item):
+        sym, vol, sec, price, price_change_pct = item
+        async with sem:
+            try:
+                klines = await fetch_okx_klines(client, sym, "15m", 25, klines_cache)
+                if len(klines) < 20:
+                    return None
 
-=========================================================================
+                last_candle = klines[-1]
+                last_open = float(get_open(last_candle))
+                last_close = float(get_close(last_candle))
+                is_15m_green = last_close > last_open
+                ofd = compute_ofd_from_klines(klines)
 
+                if is_pd_mode:
+                    oi_curr = oi_map.get(sym, 0.0) * price
+                    oi_avg = float(metrics_24h.get(sym, {}).get("oi_avg_24h", 0.0))
+                    if oi_avg <= 0:
+                        oi_avg = oi_curr
+                    oi_ratio = oi_curr / max(1.0, oi_avg)
 
-BLOK 4: INTEGROVANÝ RISK ENGINE, BAYESOVSKÝ KELLY, NATR ŠTÍT & TSL
+                    if oi_ratio > 1.80 and ofd > 1.60 and is_15m_green:
+                        if btc_veto.get("veto_long"):
+                            return None
+                        if not check_anti_extreme_shield(klines, "LONG", is_pd=True):
+                            return None
+                        ok_exec, exec_price = await verify_execution_confirmation(
+                            client, sym, "LONG", klines, ofd, True, klines_cache
+                        )
+                        if not ok_exec:
+                            return None
+                        sas_score = oi_ratio * ofd * 100.0
+                        return {
+                            "symbol": sym,
+                            "direction": "LONG",
+                            "score": sas_score,
+                            "is_funding_trap": False,
+                            "is_pd": True,
+                            "sector": sec,
+                            "ofd": ofd,
+                            "klines": klines,
+                            "exec_price": exec_price
+                        }
 
+                    elif price_change_pct > 15.0 and ofd < 0.80 and not is_15m_green:
+                        if btc_veto.get("veto_short"):
+                            return None
+                        funding_rate = await fetch_okx_funding(client, sym)
+                        if funding_rate > 0.0020 and check_anti_extreme_shield(klines, "SHORT", is_pd=True):
+                            ok_exec, exec_price = await verify_execution_confirmation(
+                                client, sym, "SHORT", klines, ofd, True, klines_cache
+                            )
+                            if not ok_exec:
+                                return None
+                            sas_score = abs(price_change_pct) * (1.0 / max(0.1, ofd)) * 50.0
+                            return {
+                                "symbol": sym,
+                                "direction": "SHORT",
+                                "score": sas_score,
+                                "is_funding_trap": True,
+                                "is_pd": True,
+                                "sector": sec,
+                                "ofd": ofd,
+                                "klines": klines,
+                                "exec_price": exec_price
+                            }
+                    return None
 
-=========================================================================
+                direction = None
+                is_trap = False
 
+                if not is_15m_green and ofd < 0.90:
+                    funding_rate = await fetch_okx_funding(client, sym)
+                    if funding_rate > 0.0020:
+                        direction = "SHORT"
+                        is_trap = True
+                if direction is None and is_15m_green and ofd > 1.15:
+                    funding_rate = await fetch_okx_funding(client, sym)
+                    if funding_rate < -0.0050:
+                        direction = "LONG"
+                        is_trap = True
+
+                if direction is None:
+                    if ofd > 1.30 and is_15m_green:
+                        direction = "LONG"
+                    elif ofd < 0.70 and not is_15m_green:
+                        direction = "SHORT"
+
+                if direction:
+                    if direction == "LONG" and btc_veto.get("veto_long"):
+                        return None
+                    if direction == "SHORT" and btc_veto.get("veto_short"):
+                        return None
+                    if not check_anti_extreme_shield(klines, direction, is_pd=False):
+                        return None
+                    ok_exec, exec_price = await verify_execution_confirmation(
+                        client, sym, direction, klines, ofd, False, klines_cache
+                    )
+                    if not ok_exec:
+                        return None
+
+                    vol_norm = np.log1p(vol)
+                    sas_score = (abs(price_change_pct) + 1.0) * (ofd if direction == "LONG" else (1.0 / max(0.1, ofd))) * (10.0 / vol_norm)
+                    return {
+                        "symbol": sym,
+                        "direction": direction,
+                        "score": sas_score,
+                        "is_funding_trap": is_trap,
+                        "is_pd": False,
+                        "sector": sec,
+                        "ofd": ofd,
+                        "klines": klines,
+                        "exec_price": exec_price
+                    }
+            except Exception:
+                return None
+        return None
+
+    results = await asyncio.gather(*(process_symbol(item) for item in pre_filtered))
+    candidates = [r for r in results if r is not None]
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return candidates
+
+# =========================================================================
+# BLOK 4: INTEGROVANÝ RISK ENGINE, BAYESOVSKÝ KELLY, NATR ŠTÍT & TSL
+# =========================================================================
 def calculate_natr_14(klines: list) -> float:
-df = pd.DataFrame(klines, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "cf"])
-for col in ("h", "l", "c"):
-df[col] = df[col].astype(float)
-prev_c = df["c"].shift(1)
-tr = pd.concat((df["h"] - df["l"], (df["h"] - prev_c).abs(), (df["l"] - prev_c).abs()), axis=1).max(axis=1)
-atr_14 = tr.rolling(14).mean().iloc[-1]
-last_close = df["c"].iloc[-1]
-return float((atr_14 / last_close) * 100.0)
+    df = pd.DataFrame(klines, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "cf"])
+    for col in ("h", "l", "c"):
+        df[col] = df[col].astype(float)
+    prev_c = df["c"].shift(1)
+    tr = pd.concat((df["h"] - df["l"], (df["h"] - prev_c).abs(), (df["l"] - prev_c).abs()), axis=1).max(axis=1)
+    atr_14 = tr.rolling(14).mean().iloc[-1]
+    last_close = df["c"].iloc[-1]
+    return float((atr_14 / last_close) * 100.0)
+
 def compute_roundtrip_cost_rate(window_id: int) -> float:
-"""Reálny odhad obojsmerných poplatkov (0.10 %) + slippage podľa likvidity okna."""
-exchange_fees = 0.0010
-slippage = 0.0005 if window_id in (1, 2) else 0.0020
-return exchange_fees + slippage
+    exchange_fees = 0.0010
+    slippage = 0.0005 if window_id in (1, 2) else 0.0020
+    return exchange_fees + slippage
+
 def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None:
-sym = cand["symbol"]
-direction = cand["direction"]
-is_pd = cand["is_pd"]
-klines = cand["klines"]
-last_candle = klines[-1]
-price = float(cand.get("exec_price") or get_close(last_candle))
-natr = calculate_natr_14(klines)
-max_natr = 9.0 if is_pd else 5.5
-if natr > max_natr or natr < 0.3 or np.isnan(natr):
-return None
-if natr <= 3.0 and not is_pd:
-regime = "FUTURES"
-leverage = int(np.clip(int(22.0 / natr), 2, 10))
-elif is_pd:
-regime = "FUTURES"
-leverage = int(np.clip(int(15.0 / natr), 2, 5))
-else:
-regime = "SPOT"
-leverage = 1
-card = get_ai_card(sym)
-if cand["is_funding_trap"]:
-raw_wr = card["funding_reversal_wr"] / 100.0
-elif regime == "SPOT":
-raw_wr = card["spot_regime_wr"] / 100.0
-elif direction == "LONG":
-raw_wr = card["long_futures_wr"] / 100.0
-else:
-raw_wr = card["short_futures_wr"] / 100.0
-# Bayesovská stabilizácia Win Rate pri malej vzorke obchodov
-trades_n = int(card.get("total_trades", 0))
-prior_strength = 10.0
-prior_wr = 0.52
-wr = ((raw_wr * trades_n) + (prior_wr * prior_strength)) / (trades_n + prior_strength)
-b = card["avg_win_r"] / max(0.1, card["avg_loss_r"])
-q = 1.0 - wr
-full_kelly = (wr * b - q) / max(0.1, b)
-if full_kelly <= 0:
-return None
-frac_kelly = full_kelly * 0.35
-max_risk_pct = 0.015 if is_pd else 0.025
-margin_usd = min(balance * frac_kelly, balance * max_risk_pct)
-if (margin_usd * leverage) < 5.2:
-min_margin = 5.2 / max(1, leverage)
-if min_margin <= balance * 0.06:
-margin_usd = min_margin
-else:
-return None
-dir_mult = 1.0 if direction == "LONG" else -1.0
-sl_mod = card["sl_modifier"]
-tp_mod = card["tp_modifier"]
-cost_rate = compute_roundtrip_cost_rate(window_id)
-if is_pd:
-dca1 = dca2 = dca3 = 0.0
-sl_pct = (natr * 1.8 * sl_mod) / 100.0
-tp1 = price * (1.0 + dir_mult * ((natr * 1.0) / 100.0 + cost_rate))
-tp2 = tp1 * (1.0 + dir_mult * (0.01 + cost_rate))
-else:
-dca1 = price * (1.0 - dir_mult * ((0.5 * natr) / 100.0))
-dca2 = price * (1.0 - dir_mult * ((1.2 * natr) / 100.0))
-dca3 = price * (1.0 - dir_mult * ((2.0 * natr) / 100.0))
-sl_pct = (2.5 * natr * sl_mod) / 100.0
-tp1 = price * (1.0 + dir_mult * ((1.0 * natr * tp_mod) / 100.0 + cost_rate))
-tp2 = price * (1.0 + dir_mult * ((1.8 * natr * tp_mod) / 100.0 + cost_rate))
-sl_price = price * (1.0 - dir_mult * sl_pct)
-recent_klines = klines[-20:]
-highs = [float(get_high(k)) for k in recent_klines]
-lows = [float(get_low(k)) for k in recent_klines]
-mmr = 0.004
-if direction == "LONG":
-liq_short_20x = max(highs) * (1.0 + (1.0 / 20.0) - mmr)
-tp3 = liq_short_20x * 0.995
-else:
-liq_long_20x = min(lows) * (1.0 - (1.0 / 20.0) + mmr)
-tp3 = liq_long_20x * 1.005
-return {
-"window_id": window_id,
-"status": "ACTIVE",
-"symbol": sym,
-"direction": direction,
-"regime": regime,
-"leverage": leverage,
-"is_pd": is_pd,
-"is_funding_trap": cand["is_funding_trap"],
-"natr": natr,
-"cost_rate": cost_rate,
-"margin_usd": margin_usd,
-"active_margin": margin_usd if is_pd else margin_usd * 0.30,
-"entry_price": price,
-"dca1_price": dca1, "dca1_filled": False,
-"dca2_price": dca2, "dca2_filled": False,
-"dca3_price": dca3, "dca3_filled": False,
-"tp1_price": tp1, "tp1_hit": False,
-"tp2_price": tp2, "tp2_hit": False,
-"tp3_price": tp3,
-"sl_tsl_price": sl_price,
-"tsl_active": False,
-"extreme_price": price,
-"mandate_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+    sym = cand["symbol"]
+    direction = cand["direction"]
+    is_pd = cand["is_pd"]
+    klines = cand["klines"]
+    last_candle = klines[-1]
+    price = float(cand.get("exec_price") or get_close(last_candle))
+    natr = calculate_natr_14(klines)
+
+    max_natr = 9.0 if is_pd else 5.5
+    if natr > max_natr or natr < 0.3 or np.isnan(natr):
+        return None
+
+    if natr <= 3.0 and not is_pd:
+        regime = "FUTURES"
+        leverage = int(np.clip(int(22.0 / natr), 2, 10))
+    elif is_pd:
+        regime = "FUTURES"
+        leverage = int(np.clip(int(15.0 / natr), 2, 5))
+    else:
+        regime = "SPOT"
+        leverage = 1
+
+    card = get_ai_card(sym)
+    if cand["is_funding_trap"]:
+        raw_wr = card["funding_reversal_wr"] / 100.0
+    elif regime == "SPOT":
+        raw_wr = card["spot_regime_wr"] / 100.0
+    elif direction == "LONG":
+        raw_wr = card["long_futures_wr"] / 100.0
+    else:
+        raw_wr = card["short_futures_wr"] / 100.0
+
+    trades_n = int(card.get("total_trades", 0))
+    prior_strength = 10.0
+    prior_wr = 0.52
+    wr = ((raw_wr * trades_n) + (prior_wr * prior_strength)) / (trades_n + prior_strength)
+
+    b = card["avg_win_r"] / max(0.1, card["avg_loss_r"])
+    q = 1.0 - wr
+    full_kelly = (wr * b - q) / max(0.1, b)
+    if full_kelly <= 0:
+        return None
+
+    frac_kelly = full_kelly * 0.35
+    max_risk_pct = 0.015 if is_pd else 0.025
+    margin_usd = min(balance * frac_kelly, balance * max_risk_pct)
+
+    if (margin_usd * leverage) < 5.2:
+        min_margin = 5.2 / max(1, leverage)
+        if min_margin <= balance * 0.06:
+            margin_usd = min_margin
+        else:
+            return None
+
+    dir_mult = 1.0 if direction == "LONG" else -1.0
+    sl_mod = card["sl_modifier"]
+    tp_mod = card["tp_modifier"]
+    cost_rate = compute_roundtrip_cost_rate(window_id)
+
+    if is_pd:
+        dca1 = dca2 = dca3 = 0.0
+        sl_pct = (natr * 1.8 * sl_mod) / 100.0
+        tp1 = price * (1.0 + dir_mult * ((natr * 1.0) / 100.0 + cost_rate))
+        tp2 = tp1 * (1.0 + dir_mult * (0.01 + cost_rate))
+    else:
+        dca1 = price * (1.0 - dir_mult * ((0.5 * natr) / 100.0))
+        dca2 = price * (1.0 - dir_mult * ((1.2 * natr) / 100.0))
+        dca3 = price * (1.0 - dir_mult * ((2.0 * natr) / 100.0))
+        sl_pct = (2.5 * natr * sl_mod) / 100.0
+        tp1 = price * (1.0 + dir_mult * ((1.0 * natr * tp_mod) / 100.0 + cost_rate))
+        tp2 = price * (1.0 + dir_mult * ((1.8 * natr * tp_mod) / 100.0 + cost_rate))
+
+    sl_price = price * (1.0 - dir_mult * sl_pct)
+
+    recent_klines = klines[-20:]
+    highs = [float(get_high(k)) for k in recent_klines]
+    lows = [float(get_low(k)) for k in recent_klines]
+    mmr = 0.004
+    if direction == "LONG":
+        liq_short_20x = max(highs) * (1.0 + (1.0 / 20.0) - mmr)
+        tp3 = liq_short_20x * 0.995
+    else:
+        liq_long_20x = min(lows) * (1.0 - (1.0 / 20.0) + mmr)
+        tp3 = liq_long_20x * 1.005
+
+    return {
+        "window_id": window_id,
+        "status": "ACTIVE",
+        "symbol": sym,
+        "direction": direction,
+        "regime": regime,
+        "leverage": leverage,
+        "is_pd": is_pd,
+        "is_funding_trap": cand["is_funding_trap"],
+        "natr": natr,
+        "cost_rate": cost_rate,
+        "margin_usd": margin_usd,
+        "active_margin": margin_usd if is_pd else margin_usd * 0.30,
+        "entry_price": price,
+        "dca1_price": dca1, "dca1_filled": False,
+        "dca2_price": dca2, "dca2_filled": False,
+        "dca3_price": dca3, "dca3_filled": False,
+        "tp1_price": tp1, "tp1_hit": False,
+        "tp2_price": tp2, "tp2_hit": False,
+        "tp3_price": tp3,
+        "sl_tsl_price": sl_price,
+        "tsl_active": False,
+        "extreme_price": price,
+        "mandate_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
 }
+    ### Časť B: Hlavná autonómna slučka (`run_core_cycle`), zatváranie pozícií a UI
+```python
 # =========================================================================
 # HLAVNÁ AUTONÓMNA SLUČKA JADRA (CLOUD 1 - OKX)
 # =========================================================================
@@ -785,7 +822,6 @@ async def run_core_cycle(vault: dict):
         tickers, oi_map = await fetch_market_snapshot(client)
         klines_cache = {}
 
-        # 1. Správa otvorených pozícií (beží každých 5 sekúnd)
         for win_key, pos in vault["windows"].items():
             win_id = int(win_key)
             if pos["status"] != "ACTIVE":
@@ -803,7 +839,6 @@ async def run_core_cycle(vault: dict):
             dir_mult = 1.0 if is_long else -1.0
             natr = pos["natr"]
 
-            # Skorý únik pri toxickom Order Flow pred 3. DCA
             if not pos["is_pd"] and not pos["dca3_filled"]:
                 near_dca3 = (is_long and curr_price <= pos["dca3_price"]) or (not is_long and curr_price >= pos["dca3_price"])
                 toxic_of = (is_long and ofd < 0.40) or (not is_long and ofd > 1.60)
@@ -811,7 +846,6 @@ async def run_core_cycle(vault: dict):
                     close_position(pos, curr_price, "EARLY_ORDERFLOW_ESCAPE", vault)
                     continue
 
-            # DCA dokupy (10 %, 30 %, 30 %)
             if not pos["is_pd"]:
                 cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
                 for idx, pct in ((1, 0.10), (2, 0.30), (3, 0.30)):
@@ -827,7 +861,6 @@ async def run_core_cycle(vault: dict):
                             pos["tp1_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.0 * natr) / 100.0 + cost_rate))
                             pos["tp2_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.8 * natr) / 100.0 + cost_rate))
 
-            # Aktivácia Trailing Stop-Lossu po dosiahnutí TP1
             if not pos["tsl_active"]:
                 if (is_long and curr_price >= pos["tp1_price"]) or (not is_long and curr_price <= pos["tp1_price"]):
                     pos["tsl_active"] = True
@@ -837,7 +870,6 @@ async def run_core_cycle(vault: dict):
                     be_lock = pos["entry_price"] * (1.0 + dir_mult * (cost_rate + 0.0010))
                     pos["sl_tsl_price"] = be_lock
 
-            # Dynamické posúvanie TSL a kontrola likvidačného TP3
             if pos["tsl_active"]:
                 if is_long and curr_price > pos["extreme_price"]:
                     pos["extreme_price"] = curr_price
@@ -863,14 +895,12 @@ async def run_core_cycle(vault: dict):
                     if (is_long and new_tsl > pos["sl_tsl_price"]) or (not is_long and new_tsl < pos["sl_tsl_price"]):
                         pos["sl_tsl_price"] = new_tsl
 
-            # Kontrola zásahu SL alebo TSL
             hit_sl_tsl = (is_long and curr_price <= pos["sl_tsl_price"]) or (not is_long and curr_price >= pos["sl_tsl_price"])
             if hit_sl_tsl:
                 reason = "TRAILING_SL_PROFIT" if pos["tsl_active"] else "HARD_SL_HIT"
                 close_position(pos, curr_price, reason, vault)
                 continue
 
-            # Výpočet živého PnL vrátane reálnych poplatkov a slippage
             cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
             gross_pnl_pct = ((curr_price - pos["entry_price"]) / pos["entry_price"]) * dir_mult * pos["leverage"] * 100.0
             net_pnl_pct = gross_pnl_pct - (cost_rate * pos["leverage"] * 100.0)
@@ -886,7 +916,6 @@ async def run_core_cycle(vault: dict):
                 "mandate_expires_at": pos["mandate_expires_at"], "updated_at": now_dt.isoformat()
             }, vault)
 
-        # 2. Jednotný 3-minútový skener pre všetky 4 okná (180 s)
         last_main_scan = vault.get("last_main_scan", 0)
         if now_ts - last_main_scan >= 180:
             vault["last_main_scan"] = now_ts
@@ -901,7 +930,6 @@ async def run_core_cycle(vault: dict):
             sectors_map = get_sectors_map()
             active_secs = {sectors_map.get(s, "UNKNOWN") for s in active_syms}
 
-            # OKNO 1: Makrokotva BTCUSDT (s Anti-Extreme aj Anti-Blind exekučným štítom)
             if vault["windows"]["1"]["status"] == "WAITING" and len(btc_klines) >= 20:
                 last_btc = btc_klines[-1]
                 btc_dir = "LONG" if float(get_close(last_btc)) > float(get_open(last_btc)) else "SHORT"
@@ -927,7 +955,6 @@ async def run_core_cycle(vault: dict):
                             vault["windows"]["1"] = setup
                             active_syms.add("BTCUSDT")
 
-            # OKNO 2: Šampión A (Elitný objem >= 10M USDT)
             if vault["windows"]["2"]["status"] == "WAITING":
                 cands_a = await evaluate_candidates(
                     client, tickers, oi_map, active_syms, active_secs,
@@ -941,7 +968,6 @@ async def run_core_cycle(vault: dict):
                         active_secs.add(c["sector"])
                         break
 
-            # OKNO 3: Šampión B (Stredná/nižšia likvidita 5M - 9.99M USDT)
             if vault["windows"]["3"]["status"] == "WAITING":
                 cands_b = await evaluate_candidates(
                     client, tickers, oi_map, active_syms, active_secs,
@@ -951,22 +977,23 @@ async def run_core_cycle(vault: dict):
                     setup = build_trade_setup(c, vault["balance"], 3)
                     if setup:
                         vault["windows"]["3"] = setup
-active_syms.add(c["symbol"])
-active_secs.add(c["sector"])
-break
-# OKNO 4: Šampión C (Pump & Dump radar 1M - 4.99M USDT)
-if vault["windows"]["4"]["status"] == "WAITING":
-cands_c = await evaluate_candidates(
-client, tickers, oi_map, active_syms, active_secs,
-1_000_000, 4_999_999, btc_veto, klines_cache, is_pd_mode=True
-)
-for c in cands_c:
-setup = build_trade_setup(c, vault["balance"], 4)
-if setup:
-vault["windows"]["4"] = setup
-break
-save_vault(vault)
-def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
+                        active_syms.add(c["symbol"])
+                        active_secs.add(c["sector"])
+                        break
+
+            if vault["windows"]["4"]["status"] == "WAITING":
+                cands_c = await evaluate_candidates(
+                    client, tickers, oi_map, active_syms, active_secs,
+                    1_000_000, 4_999_999, btc_veto, klines_cache, is_pd_mode=True
+                )
+                for c in cands_c:
+                    setup = build_trade_setup(c, vault["balance"], 4)
+                    if setup:
+                        vault["windows"]["4"] = setup
+                        break
+
+    save_vault(vault)
+    def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
 win_id = pos["window_id"]
 dir_mult = 1.0 if pos["direction"] == "LONG" else -1.0
 cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
