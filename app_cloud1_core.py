@@ -560,7 +560,7 @@ def calculate_rsi_14(closes: pd.Series) -> float:
     rs = float(gain.iloc[-1]) / last_loss
     return float(100.0 - (100.0 / (1.0 + rs)))
 
-def check_anti_extreme_shield(klines: list, direction: str, is_pd: bool = False) -> bool:
+def check_anti_extreme_shield(klines: list, direction: str, is_pd: bool = False, is_btc: bool = False) -> bool:
     if len(klines) < 20:
         return False
 
@@ -591,25 +591,36 @@ def check_anti_extreme_shield(klines: list, direction: str, is_pd: bool = False)
     if atr_14 <= 0 or np.isnan(atr_14) or np.isnan(std_20):
         return False
 
-    max_atr_dist = 2.2 if is_pd else 1.3
+    # BTC: uvoľnené prahy (ATR 1.8, RSI 75/25), PD: 2.2 / 78, bežné: 1.3 / 68
+    if is_pd:
+        max_atr_dist = 2.2
+        rsi_high, rsi_low = 78.0, 22.0
+        skip_bb = True
+    elif is_btc:
+        max_atr_dist = 1.8
+        rsi_high, rsi_low = 75.0, 25.0
+        skip_bb = True  # BTC často beží pri BB, BB filter by bol príliš prísny
+    else:
+        max_atr_dist = 1.3
+        rsi_high, rsi_low = 68.0, 32.0
+        skip_bb = False
+
     bb_upper = ema_20 + (2.0 * std_20)
     bb_lower = ema_20 - (2.0 * std_20)
 
     if direction == "LONG":
         if (last_c - ema_20) > (max_atr_dist * atr_14):
             return False
-        if not is_pd and last_c > bb_upper:
+        if not skip_bb and last_c > bb_upper:
             return False
     else:
         if (ema_20 - last_c) > (max_atr_dist * atr_14):
             return False
-        if not is_pd and last_c < bb_lower:
+        if not skip_bb and last_c < bb_lower:
             return False
 
     rsi_14 = calculate_rsi_14(df["c"])
     if not np.isnan(rsi_14):
-        rsi_high = 78.0 if is_pd else 68.0
-        rsi_low = 22.0 if is_pd else 32.0
         if direction == "LONG" and rsi_14 > rsi_high:
             return False
         if direction == "SHORT" and rsi_14 < rsi_low:
@@ -1131,7 +1142,7 @@ async def run_core_cycle(vault: dict):
                     elif btc_ofd < 0.85 and not is_15m_green:
                         direction = "SHORT"
 
-                if direction and check_anti_extreme_shield(btc_klines, direction, is_pd=False):
+                if direction and check_anti_extreme_shield(btc_klines, direction, is_pd=False, is_btc=True):
                     ok_exec, exec_price = await verify_execution_confirmation_btc(
                         client, "BTCUSDT", direction, btc_klines, btc_ofd, klines_cache
                     )
