@@ -153,8 +153,38 @@ try:
     pos_res = supabase.table("active_positions").select("*").order("window_id").execute()
     active_windows = {r["window_id"]: r for r in pos_res.data} if pos_res.data else {}
 except Exception as e:
-    st.error(f"Chyba načítania active_positions: {e}")
+    st.warning(f"active_positions nedostupné ({e}) – skúšam bot_vault_state")
     active_windows = {}
+
+# Záložný zdroj živých pozícií + opened_at z Cloudu 1 (bot_vault_state)
+vault_windows = {}
+try:
+    vault_res = supabase.table("bot_vault_state").select("state_json").eq("id", 1).execute()
+    if vault_res.data and vault_res.data[0].get("state_json"):
+        vault_windows = vault_res.data[0]["state_json"].get("windows", {}) or {}
+except Exception:
+    vault_windows = {}
+
+# Ak active_positions je prázdne, postav okná z vaultu
+if not active_windows and vault_windows:
+    for k, v in vault_windows.items():
+        try:
+            wid_i = int(k)
+        except (TypeError, ValueError):
+            continue
+        row = dict(v) if isinstance(v, dict) else {}
+        row["window_id"] = wid_i
+        active_windows[wid_i] = row
+
+# Doplň opened_at z vaultu do active_windows (živá OPEN čiara / sidebar)
+for wid_i, row in list(active_windows.items()):
+    if row.get("opened_at"):
+        continue
+    vw = vault_windows.get(str(wid_i)) or vault_windows.get(wid_i) or {}
+    if isinstance(vw, dict) and vw.get("opened_at"):
+        row = dict(row)
+        row["opened_at"] = vw["opened_at"]
+        active_windows[wid_i] = row
 
 try:
     hist_res = supabase.table("trade_history").select("*").order("id", desc=False).execute()
@@ -294,6 +324,18 @@ for wid in (1, 2, 3, 4):
         if status == "ACTIVE":
             dir_icon = "🟢 LONG" if w.get("direction") == "LONG" else "🔴 SHORT"
             st.markdown(f"**Smer:** {dir_icon} | **Režim:** {w.get('regime')} ({w.get('leverage')}x)")
+
+            # Čas otvorenia – NAD Entry Price (pevný opened_at z Cloudu 1)
+            opened_raw = w.get("opened_at")
+            if opened_raw:
+                try:
+                    opened_dt = pd.to_datetime(opened_raw, utc=True)
+                    st.markdown(f"**Otvorené:** `{opened_dt.strftime('%Y-%m-%d %H:%M:%S')} UTC`")
+                except Exception:
+                    st.markdown(f"**Otvorené:** `{opened_raw}`")
+            else:
+                st.caption("Otvorené: — (čaká na opened_at z Cloudu 1)")
+
             st.markdown(f"**Entry Price:** `{safe_float(w.get('entry_price')):.5f}`")
 
             # TP hladiny + executed stavy
