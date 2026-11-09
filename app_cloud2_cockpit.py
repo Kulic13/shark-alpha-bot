@@ -453,19 +453,15 @@ for wid in (1, 2, 3, 4):
             price_low = min(price_low, min(level_prices))
             price_high = max(price_high, max(level_prices))
 
-        # Biela VERTIKÁLNA čiara = otváracia cena / čas vstupu do obchodu (všetky 4 okná)
-        # Preferujeme opened_at / entry_time / created_at; fallback = prvá sviečka v dátach
+        # Biela VERTIKÁLNA čiara = pevnú čas otvorenia obchodu (všetky 4 okná)
+        # IBA opened_at – updated_at / created_at by čiaru posúvali v čase
         entry_ts = None
-        for key in ("opened_at", "entry_time", "created_at", "updated_at"):
-            raw_ts = w.get(key)
-            if raw_ts:
-                try:
-                    entry_ts = pd.to_datetime(raw_ts, utc=True)
-                    break
-                except Exception:
-                    continue
-        if entry_ts is None and not df_k.empty:
-            entry_ts = df_k["time"].iloc[0]
+        raw_ts = w.get("opened_at")
+        if raw_ts:
+            try:
+                entry_ts = pd.to_datetime(raw_ts, utc=True)
+            except Exception:
+                entry_ts = None
 
         if entry_ts is not None:
             fig.add_vline(
