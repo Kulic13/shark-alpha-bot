@@ -198,6 +198,45 @@ with top_col1:
         m2.caption(f"✅ Win: **{win_trades}**  |  ❌ Fail: **{fail_trades}**")
         m3.metric("Nerealizované PnL", f"${unrealized:+.2f}")
 
+        # ----- SUMÁR ŠTATISTIKY: TP / DCA / EXIT REASON -----
+        st.markdown("##### 📊 Sumár štatistiky obchodov")
+        s1, s2, s3 = st.columns(3)
+
+        with s1:
+            st.markdown("**Take Profit hits**")
+            tp1_n = int(history_df["tp1_hit"].fillna(False).astype(bool).sum()) if "tp1_hit" in history_df.columns else 0
+            tp2_n = int(history_df["tp2_hit"].fillna(False).astype(bool).sum()) if "tp2_hit" in history_df.columns else 0
+            tp3_n = int((history_df["exit_reason"] == "TP3_LIQUIDATION_HIT").sum()) if "exit_reason" in history_df.columns else 0
+            st.write(f"TP1 executed: **{tp1_n}** / {total_trades}")
+            st.write(f"TP2 executed: **{tp2_n}** / {total_trades}")
+            st.write(f"TP3 hit (close): **{tp3_n}** / {total_trades}")
+
+        with s2:
+            st.markdown("**DCA fills**")
+            dca1_n = int(history_df["dca1_filled"].fillna(False).astype(bool).sum()) if "dca1_filled" in history_df.columns else 0
+            dca2_n = int(history_df["dca2_filled"].fillna(False).astype(bool).sum()) if "dca2_filled" in history_df.columns else 0
+            dca3_n = int(history_df["dca3_filled"].fillna(False).astype(bool).sum()) if "dca3_filled" in history_df.columns else 0
+            st.write(f"DCA1 filled: **{dca1_n}** / {total_trades}")
+            st.write(f"DCA2 filled: **{dca2_n}** / {total_trades}")
+            st.write(f"DCA3 filled: **{dca3_n}** / {total_trades}")
+
+        with s3:
+            st.markdown("**Dôvod zatvorenia**")
+            if "exit_reason" in history_df.columns:
+                reason_counts = history_df["exit_reason"].fillna("UNKNOWN").value_counts()
+                reason_labels = {
+                    "HARD_SL_HIT": "🔴 Hard SL",
+                    "TRAILING_SL_PROFIT": "🟢 Trailing SL (zisk)",
+                    "TP3_LIQUIDATION_HIT": "🎯 TP3",
+                    "EARLY_ORDERFLOW_ESCAPE": "⚠️ Early OF escape",
+                }
+                for reason, cnt in reason_counts.items():
+                    label = reason_labels.get(str(reason), str(reason))
+                    pct = (cnt / total_trades) * 100.0
+                    st.write(f"{label}: **{cnt}** ({pct:.0f}%)")
+            else:
+                st.caption("exit_reason ešte nie je v histórii")
+
         # Equity krivka – preferujeme closed_at, potom updated_at, inak id
         if "closed_at" in history_df.columns and history_df["closed_at"].notna().any():
             x_col = "closed_at"
