@@ -1211,7 +1211,13 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
         "window_id": win_id, "symbol": pos["symbol"], "direction": pos["direction"],
         "regime": pos["regime"], "leverage": pos["leverage"], "entry_price": pos["entry_price"],
         "exit_price": exit_price, "margin_usd": pos["active_margin"], "pnl_usd": round(pnl_usd, 4),
-        "pnl_percent": round(net_pnl_pct, 2), "exit_reason": reason, "current_balance": vault["balance"]
+        "pnl_percent": round(net_pnl_pct, 2), "exit_reason": reason, "current_balance": vault["balance"],
+        "tp1_hit": bool(pos.get("tp1_hit", False)),
+        "tp2_hit": bool(pos.get("tp2_hit", False)),
+        "dca1_filled": bool(pos.get("dca1_filled", False)),
+        "dca2_filled": bool(pos.get("dca2_filled", False)),
+        "dca3_filled": bool(pos.get("dca3_filled", False)),
+        "closed_at": datetime.now(timezone.utc).isoformat()
     }
     try:
         supabase.table("trade_history").insert(hist_row).execute()
