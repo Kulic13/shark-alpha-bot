@@ -76,8 +76,7 @@ def fetch_btc_options_walls(day_epoch_key: str) -> dict:
         p_oi = np.array([puts.get(s, 0.0) for s in strikes])
 
         # Vektorový výpočet Max Pain
-        pain_matrix = np.maximum(0, s_arr[:, None] - s_arr[None, :]) * c_oi[None, :] + \
-                      np.maximum(0, s_arr[None, :] - s_arr[:, None]) * p_oi[None, :]
+        pain_matrix = np.maximum(0, s_arr[:, None] - s_arr[None, :]) * c_oi[None, :] +                       np.maximum(0, s_arr[None, :] - s_arr[:, None]) * p_oi[None, :]
         max_pain = float(s_arr[np.argmin(pain_matrix.sum(axis=1))])
 
         return {"call_wall": call_wall, "put_wall": put_wall, "max_pain": max_pain}
@@ -181,9 +180,7 @@ with top_col1:
         curr_bal = safe_float(history_df["current_balance"].iloc[-1], 100.0)
         total_pnl = curr_bal - 100.0
         win_trades = len(history_df[history_df["pnl_usd"] > 0])
-        fail_trades = len(history_df[history_df["pnl_usd"] <= 0])
-        total_trades = len(history_df)
-        wr_total = (win_trades / total_trades) * 100.0 if total_trades > 0 else 0.0
+        wr_total = (win_trades / len(history_df)) * 100.0 if len(history_df) > 0 else 0.0
 
         # Nerealizované PnL – IBA aktívne pozície
         unrealized = sum(
@@ -194,48 +191,8 @@ with top_col1:
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Aktuálny Kapitál", f"${curr_bal:.2f}", f"{total_pnl:+.2f} USD")
-        m2.metric("Celková Úspešnosť", f"{wr_total:.1f} %", f"{total_trades} obchodov")
-        m2.caption(f"✅ Win: **{win_trades}**  |  ❌ Fail: **{fail_trades}**")
+        m2.metric("Celková Úspešnosť", f"{wr_total:.1f} %", f"{len(history_df)} obchodov")
         m3.metric("Nerealizované PnL", f"${unrealized:+.2f}")
-
-        # ----- SUMÁR ŠTATISTIKY: TP / DCA / EXIT REASON -----
-        st.markdown("##### 📊 Sumár štatistiky obchodov")
-        s1, s2, s3 = st.columns(3)
-
-        with s1:
-            st.markdown("**Take Profit hits**")
-            tp1_n = int(history_df["tp1_hit"].fillna(False).astype(bool).sum()) if "tp1_hit" in history_df.columns else 0
-            tp2_n = int(history_df["tp2_hit"].fillna(False).astype(bool).sum()) if "tp2_hit" in history_df.columns else 0
-            tp3_n = int((history_df["exit_reason"] == "TP3_LIQUIDATION_HIT").sum()) if "exit_reason" in history_df.columns else 0
-            st.write(f"TP1 executed: **{tp1_n}** / {total_trades}")
-            st.write(f"TP2 executed: **{tp2_n}** / {total_trades}")
-            st.write(f"TP3 hit (close): **{tp3_n}** / {total_trades}")
-
-        with s2:
-            st.markdown("**DCA fills**")
-            dca1_n = int(history_df["dca1_filled"].fillna(False).astype(bool).sum()) if "dca1_filled" in history_df.columns else 0
-            dca2_n = int(history_df["dca2_filled"].fillna(False).astype(bool).sum()) if "dca2_filled" in history_df.columns else 0
-            dca3_n = int(history_df["dca3_filled"].fillna(False).astype(bool).sum()) if "dca3_filled" in history_df.columns else 0
-            st.write(f"DCA1 filled: **{dca1_n}** / {total_trades}")
-            st.write(f"DCA2 filled: **{dca2_n}** / {total_trades}")
-            st.write(f"DCA3 filled: **{dca3_n}** / {total_trades}")
-
-        with s3:
-            st.markdown("**Dôvod zatvorenia**")
-            if "exit_reason" in history_df.columns:
-                reason_counts = history_df["exit_reason"].fillna("UNKNOWN").value_counts()
-                reason_labels = {
-                    "HARD_SL_HIT": "🔴 Hard SL",
-                    "TRAILING_SL_PROFIT": "🟢 Trailing SL (zisk)",
-                    "TP3_LIQUIDATION_HIT": "🎯 TP3",
-                    "EARLY_ORDERFLOW_ESCAPE": "⚠️ Early OF escape",
-                }
-                for reason, cnt in reason_counts.items():
-                    label = reason_labels.get(str(reason), str(reason))
-                    pct = (cnt / total_trades) * 100.0
-                    st.write(f"{label}: **{cnt}** ({pct:.0f}%)")
-            else:
-                st.caption("exit_reason ešte nie je v histórii")
 
         # Equity krivka – preferujeme closed_at, potom updated_at, inak id
         if "closed_at" in history_df.columns and history_df["closed_at"].notna().any():
@@ -296,13 +253,15 @@ for wid in (1, 2, 3, 4):
             st.markdown(f"**Smer:** {dir_icon} | **Režim:** {w.get('regime')} ({w.get('leverage')}x)")
             st.markdown(f"**Entry Price:** `{safe_float(w.get('entry_price')):.5f}`")
 
-            # TP hladiny + executed stavy
+            # TP hladiny + hit stavy
             tp1_hit = bool(w.get("tp1_hit", False))
             tp2_hit = bool(w.get("tp2_hit", False))
-            tp1_txt = f"`{safe_float(w.get('tp1_price')):.5f}`  ✅ executed" if tp1_hit else f"`{safe_float(w.get('tp1_price')):.5f}`"
-            tp2_txt = f"`{safe_float(w.get('tp2_price')):.5f}`  ✅ executed" if tp2_hit else f"`{safe_float(w.get('tp2_price')):.5f}`"
-            st.markdown(f"**TP1:** {tp1_txt}")
-            st.markdown(f"**TP2:** {tp2_txt}")
+            tp1_label = "✅ TP1" if tp1_hit else "TP1"
+            tp2_label = "✅ TP2" if tp2_hit else "TP2"
+            st.markdown(
+                f"**{tp1_label}:** `{safe_float(w.get('tp1_price')):.5f}` | "
+                f"**{tp2_label}:** `{safe_float(w.get('tp2_price')):.5f}`"
+            )
             st.markdown(f"**TP3 (Liq):** `{safe_float(w.get('tp3_price')):.5f}`")
 
             # SL / TSL
@@ -310,24 +269,26 @@ for wid in (1, 2, 3, 4):
             sl_label = "🟢 TSL (Aktívny)" if tsl_active else "🔴 Hard SL"
             st.markdown(f"**{sl_label}:** `{safe_float(w.get('sl_tsl_price')):.5f}`")
 
-            # DCA stavy + executed
+            # DCA stavy (ak Cloud 1 ukladá filled flagy)
             dca1_p = safe_float(w.get("dca1_price"))
             if dca1_p > 0:
                 dca1_f = bool(w.get("dca1_filled", False))
                 dca2_f = bool(w.get("dca2_filled", False))
                 dca3_f = bool(w.get("dca3_filled", False))
-                dca1_txt = f"`{dca1_p:.5f}`  ✅ executed" if dca1_f else f"`{dca1_p:.5f}`"
-                dca2_txt = f"`{safe_float(w.get('dca2_price')):.5f}`  ✅ executed" if dca2_f else f"`{safe_float(w.get('dca2_price')):.5f}`"
-                dca3_txt = f"`{safe_float(w.get('dca3_price')):.5f}`  ✅ executed" if dca3_f else f"`{safe_float(w.get('dca3_price')):.5f}`"
-                st.markdown(f"**DCA1:** {dca1_txt}")
-                st.markdown(f"**DCA2:** {dca2_txt}")
-                st.markdown(f"**DCA3:** {dca3_txt}")
+                dca1_txt = "✅ DCA1" if dca1_f else "DCA1"
+                dca2_txt = "✅ DCA2" if dca2_f else "DCA2"
+                dca3_txt = "✅ DCA3" if dca3_f else "DCA3"
+                st.markdown(
+                    f"**{dca1_txt}:** `{dca1_p:.5f}` | "
+                    f"**{dca2_txt}:** `{safe_float(w.get('dca2_price')):.5f}` | "
+                    f"**{dca3_txt}:** `{safe_float(w.get('dca3_price')):.5f}`"
+                )
 
             # Fáza obchodu (odvodená)
             if tp2_hit:
                 phase = "🎯 Fáza 3 – Trailing po TP2"
             elif tp1_hit:
-                phase = "🔒 Fáza 2 – Break-even lock (TP1 executed)"
+                phase = "🔒 Fáza 2 – Break-even lock (TP1)"
             else:
                 phase = "⏳ Fáza 1 – Čaká na TP1"
             st.caption(phase)
@@ -362,7 +323,7 @@ for wid in (1, 2, 3, 4):
 
     df_k = fetch_visual_klines(sym, timeframe)
     if df_k.empty:
-        st.warning(f"Nepodarilo sa načítať sviečky pre {sym} z OKX API.")
+        st.warning(f"Nepodarilo sa načítať sviečke pre {sym} z OKX API.")
         continue
 
     fig = go.Figure(data=[go.Candlestick(
@@ -396,12 +357,12 @@ for wid in (1, 2, 3, 4):
         fig.add_hline(
             y=tp1, line_dash="dash", line_color="#00ff88",
             line_width=3 if tp1_hit else 1.5,
-            annotation_text="TP1 executed" if tp1_hit else "TP1"
+            annotation_text="✅ TP1" if tp1_hit else "TP1"
         )
         fig.add_hline(
             y=tp2, line_dash="dash", line_color="#00cc66",
             line_width=3 if tp2_hit else 1.5,
-            annotation_text="TP2 executed" if tp2_hit else "TP2"
+            annotation_text="✅ TP2" if tp2_hit else "TP2"
         )
         fig.add_hline(y=tp3, line_dash="dash", line_color="#009944", annotation_text="TP3")
 
@@ -409,7 +370,7 @@ for wid in (1, 2, 3, 4):
         sl_txt = "TSL" if tsl_active else "SL"
         fig.add_hline(y=sl, line_color="#ff3355", line_width=2, annotation_text=sl_txt)
 
-        # DCA hladiny – oranžové, filled = plná čiara + "executed"
+        # DCA hladiny – oranžové, filled = plná čiara
         dca1_p = safe_float(w.get("dca1_price"))
         if dca1_p > 0:
             dca1_f = bool(w.get("dca1_filled", False))
@@ -421,28 +382,37 @@ for wid in (1, 2, 3, 4):
                 line_dash="solid" if dca1_f else "dot",
                 line_color="orange",
                 line_width=2 if dca1_f else 1,
-                annotation_text="DCA1 executed" if dca1_f else "DCA1"
+                annotation_text="✅ DCA1" if dca1_f else "DCA1"
             )
             fig.add_hline(
                 y=safe_float(w.get("dca2_price")),
                 line_dash="solid" if dca2_f else "dot",
                 line_color="orange",
                 line_width=2 if dca2_f else 1,
-                annotation_text="DCA2 executed" if dca2_f else "DCA2"
+                annotation_text="✅ DCA2" if dca2_f else "DCA2"
             )
             fig.add_hline(
                 y=safe_float(w.get("dca3_price")),
                 line_dash="solid" if dca3_f else "dot",
                 line_color="orange",
                 line_width=2 if dca3_f else 1,
-                annotation_text="DCA3 executed" if dca3_f else "DCA3"
+                annotation_text="✅ DCA3" if dca3_f else "DCA3"
             )
+
+    # Vypočítame dynamický rozsah osi Y iba na základe cien sviečok (High a Low) s 0.5% rezervou
+    ymin = float(df_k["l"].min() * 0.995)
+    ymax = float(df_k["h"].max() * 1.005)
 
     fig.update_layout(
         height=520,
         xaxis_rangeslider_visible=False,
         template="plotly_dark",
-        margin=dict(l=10, r=10, t=20, b=10)
+        margin=dict(l=10, r=10, t=20, b=10),
+        # HLAVNÁ ZMENA: Zamknutie osi Y na rozsah sviečok, čím sa zabráni stlačeniu grafu opčnými stenami
+        yaxis=dict(
+            range=[ymin, ymax],
+            autorange=False  # Vypne automatické rozťahovanie podľa hlines
+        )
     )
     st.plotly_chart(fig, use_container_width=True)
 
