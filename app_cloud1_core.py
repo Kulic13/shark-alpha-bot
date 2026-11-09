@@ -1268,6 +1268,23 @@ async def run_core_cycle(vault: dict):
                         if setup:
                             vault["windows"]["1"] = setup
                             active_syms.add("BTCUSDT")
+                            # Okamžitý zápis do Supabase vrátane opened_at (pre Cloud 2 OPEN line + sidebar)
+                            safe_supabase_upsert("active_positions", {
+                                "window_id": 1, "status": "ACTIVE", "symbol": setup["symbol"],
+                                "direction": setup["direction"], "regime": setup["regime"],
+                                "leverage": setup["leverage"], "entry_price": setup["entry_price"],
+                                "dca1_price": setup["dca1_price"], "dca2_price": setup["dca2_price"],
+                                "dca3_price": setup["dca3_price"],
+                                "dca1_filled": False, "dca2_filled": False, "dca3_filled": False,
+                                "tp1_price": setup["tp1_price"], "tp2_price": setup["tp2_price"],
+                                "tp3_price": setup["tp3_price"],
+                                "tp1_hit": False, "tp2_hit": False,
+                                "sl_tsl_price": setup["sl_tsl_price"], "tsl_active": False,
+                                "pnl_usd": 0.0, "pnl_percent": 0.0,
+                                "opened_at": setup.get("opened_at"),
+                                "mandate_expires_at": setup["mandate_expires_at"],
+                                "updated_at": now_dt.isoformat()
+                            }, vault)
 
             if vault["windows"]["2"]["status"] == "WAITING":
                 cands_a = await evaluate_candidates(
@@ -1280,6 +1297,22 @@ async def run_core_cycle(vault: dict):
                         vault["windows"]["2"] = setup
                         active_syms.add(c["symbol"])
                         active_secs.add(c["sector"])
+                        safe_supabase_upsert("active_positions", {
+                            "window_id": 2, "status": "ACTIVE", "symbol": setup["symbol"],
+                            "direction": setup["direction"], "regime": setup["regime"],
+                            "leverage": setup["leverage"], "entry_price": setup["entry_price"],
+                            "dca1_price": setup["dca1_price"], "dca2_price": setup["dca2_price"],
+                            "dca3_price": setup["dca3_price"],
+                            "dca1_filled": False, "dca2_filled": False, "dca3_filled": False,
+                            "tp1_price": setup["tp1_price"], "tp2_price": setup["tp2_price"],
+                            "tp3_price": setup["tp3_price"],
+                            "tp1_hit": False, "tp2_hit": False,
+                            "sl_tsl_price": setup["sl_tsl_price"], "tsl_active": False,
+                            "pnl_usd": 0.0, "pnl_percent": 0.0,
+                            "opened_at": setup.get("opened_at"),
+                            "mandate_expires_at": setup["mandate_expires_at"],
+                            "updated_at": now_dt.isoformat()
+                        }, vault)
                         break
 
             if vault["windows"]["3"]["status"] == "WAITING":
@@ -1293,6 +1326,22 @@ async def run_core_cycle(vault: dict):
                         vault["windows"]["3"] = setup
                         active_syms.add(c["symbol"])
                         active_secs.add(c["sector"])
+                        safe_supabase_upsert("active_positions", {
+                            "window_id": 3, "status": "ACTIVE", "symbol": setup["symbol"],
+                            "direction": setup["direction"], "regime": setup["regime"],
+                            "leverage": setup["leverage"], "entry_price": setup["entry_price"],
+                            "dca1_price": setup["dca1_price"], "dca2_price": setup["dca2_price"],
+                            "dca3_price": setup["dca3_price"],
+                            "dca1_filled": False, "dca2_filled": False, "dca3_filled": False,
+                            "tp1_price": setup["tp1_price"], "tp2_price": setup["tp2_price"],
+                            "tp3_price": setup["tp3_price"],
+                            "tp1_hit": False, "tp2_hit": False,
+                            "sl_tsl_price": setup["sl_tsl_price"], "tsl_active": False,
+                            "pnl_usd": 0.0, "pnl_percent": 0.0,
+                            "opened_at": setup.get("opened_at"),
+                            "mandate_expires_at": setup["mandate_expires_at"],
+                            "updated_at": now_dt.isoformat()
+                        }, vault)
                         break
 
             if vault["windows"]["4"]["status"] == "WAITING":
@@ -1304,6 +1353,22 @@ async def run_core_cycle(vault: dict):
                     setup = build_trade_setup(c, vault["balance"], 4)
                     if setup:
                         vault["windows"]["4"] = setup
+                        safe_supabase_upsert("active_positions", {
+                            "window_id": 4, "status": "ACTIVE", "symbol": setup["symbol"],
+                            "direction": setup["direction"], "regime": setup["regime"],
+                            "leverage": setup["leverage"], "entry_price": setup["entry_price"],
+                            "dca1_price": setup["dca1_price"], "dca2_price": setup["dca2_price"],
+                            "dca3_price": setup["dca3_price"],
+                            "dca1_filled": False, "dca2_filled": False, "dca3_filled": False,
+                            "tp1_price": setup["tp1_price"], "tp2_price": setup["tp2_price"],
+                            "tp3_price": setup["tp3_price"],
+                            "tp1_hit": False, "tp2_hit": False,
+                            "sl_tsl_price": setup["sl_tsl_price"], "tsl_active": False,
+                            "pnl_usd": 0.0, "pnl_percent": 0.0,
+                            "opened_at": setup.get("opened_at"),
+                            "mandate_expires_at": setup["mandate_expires_at"],
+                            "updated_at": now_dt.isoformat()
+                        }, vault)
                         break
 
     # Uloženie trezoru: lokálne vždy (0 ms), do cloudu Supabase len pri zmene alebo raz za 10 sekúnd
@@ -1334,6 +1399,8 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
         "dca1_filled": bool(pos.get("dca1_filled", False)),
         "dca2_filled": bool(pos.get("dca2_filled", False)),
         "dca3_filled": bool(pos.get("dca3_filled", False)),
+        # open_at = pevný čas otvorenia pozície (Cloud 2 / história)
+        "open_at": pos.get("opened_at"),
         "closed_at": datetime.now(timezone.utc).isoformat()
     }
     try:
