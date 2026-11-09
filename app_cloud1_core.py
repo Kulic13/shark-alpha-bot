@@ -457,8 +457,8 @@ async def verify_execution_confirmation_btc(
     vols = [float(get_vol(k)) for k in klines_15m[-11:]]
     avg_prev_vol = float(np.mean(vols[:-1])) if len(vols) > 1 else 0.0
     curr_vol = vols[-1]
-    # BTC: stačí, že volume neumiera (0.90x namiesto 1.05/1.10)
-    if avg_prev_vol > 0 and (curr_vol / avg_prev_vol) < 0.90:
+    # BTC: volume len nesmie úplne zomrieť (0.70x)
+    if avg_prev_vol > 0 and (curr_vol / avg_prev_vol) < 0.70:
         return False, 0.0
 
     klines_1h = await fetch_okx_klines(client, symbol, "1H", 25, cache)
@@ -466,10 +466,10 @@ async def verify_execution_confirmation_btc(
         closes_1h = pd.Series([float(get_close(k)) for k in klines_1h])
         ema21_1h = float(closes_1h.ewm(span=21, adjust=False).mean().iloc[-1])
         last_1h_close = float(closes_1h.iloc[-1])
-        # Zamietne len silne proti-trend: LONG pod EMA + veľmi slabý OFD
-        if direction == "LONG" and last_1h_close < ema21_1h and ofd < 1.10:
+        # Zamietne len silne proti-trend + slabý OFD
+        if direction == "LONG" and last_1h_close < ema21_1h and ofd < 1.05:
             return False, 0.0
-        if direction == "SHORT" and last_1h_close > ema21_1h and ofd > 0.90:
+        if direction == "SHORT" and last_1h_close > ema21_1h and ofd > 0.95:
             return False, 0.0
 
     inst_id = to_okx_inst_id(symbol)
@@ -496,17 +496,17 @@ async def verify_execution_confirmation_btc(
             return False, 0.0
 
         spread_pct = ((best_ask - best_bid) / best_bid) * 100.0
-        if spread_pct > 0.25:
+        if spread_pct > 0.30:
             return False, 0.0
 
         bid_depth = sum(float(b[1]) for b in bids[:5])
         ask_depth = sum(float(a[1]) for a in asks[:5])
         obi = bid_depth / max(1e-9, ask_depth)
 
-        # Mäkšie OBI prahy pre BTC (hlboký orderbook)
-        if direction == "LONG" and obi < 0.65:
+        # BTC orderbook je hlboký a často asymetrický v trende
+        if direction == "LONG" and obi < 0.45:
             return False, 0.0
-        if direction == "SHORT" and obi > 1.45:
+        if direction == "SHORT" and obi > 2.20:
             return False, 0.0
 
         exec_price = best_ask if direction == "LONG" else best_bid
@@ -1175,7 +1175,8 @@ async def run_core_cycle(vault: dict):
             sectors_map = get_sectors_map()
             active_secs = {sectors_map.get(s, "UNKNOWN") for s in active_syms}
 
-            # ===== BTC WINDOW 1 – UVOĽNENÁ LOGIKA (makrokotva, častejšie vstupy) =====
+            # ===== BTC WINDOW 1 – MAKROKOTVA (3-vrstvová smerová logika) =====
+            # BTC má stabilnejší OFD než altcoiny → prahy bližšie k 1.0 + silný OFD bez farby
             if vault["windows"]["1"]["status"] == "WAITING" and len(btc_klines) >= 20:
                 last_btc = btc_klines[-1]
                 is_15m_green = float(get_close(last_btc)) > float(get_open(last_btc))
@@ -1184,24 +1185,30 @@ async def run_core_cycle(vault: dict):
                 direction = None
                 is_trap = False
 
-                # Funding trap – mäkšie prahy (BTC funding zriedka dosahuje ±0.2%)
-                if not is_15m_green and btc_ofd < 0.95:
+                # Vrstva A: funding trap (zriedkavé, ale vysoká edge)
+                if not is_15m_green and btc_ofd < 1.00:
                     funding_rate = await fetch_okx_funding(client, "BTCUSDT")
-                    if funding_rate > 0.0010:
+                    if funding_rate > 0.0008:
                         direction = "SHORT"
                         is_trap = True
-                if direction is None and is_15m_green and btc_ofd > 1.10:
+                if direction is None and is_15m_green and btc_ofd > 1.05:
                     funding_rate = await fetch_okx_funding(client, "BTCUSDT")
-                    if funding_rate < -0.0020:
+                    if funding_rate < -0.0015:
                         direction = "LONG"
                         is_trap = True
 
-                # Klasický smer – uvoľnené OFD prahy pre BTC
-                # LONG: OFD > 1.15 + zelená  |  SHORT: OFD < 0.85 + červená
+                # Vrstva B: momentum (OFD + farba sviečky) – hlavný kanál
                 if direction is None:
-                    if btc_ofd > 1.15 and is_15m_green:
+                    if btc_ofd >= 1.08 and is_15m_green:
                         direction = "LONG"
-                    elif btc_ofd < 0.85 and not is_15m_green:
+                    elif btc_ofd <= 0.92 and not is_15m_green:
+                        direction = "SHORT"
+
+                # Vrstva C: silný orderflow bez farby (OFD vedie cenu na BTC)
+                if direction is None:
+                    if btc_ofd >= 1.20:
+                        direction = "LONG"
+                    elif btc_ofd <= 0.80:
                         direction = "SHORT"
 
                 if direction and check_anti_extreme_shield(btc_klines, direction, is_pd=False, is_btc=True):
