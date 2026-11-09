@@ -213,6 +213,64 @@ def from_okx_inst_id(inst_id: str) -> str:
         return f"{parts[0]}USDT"
     return inst_id
 
+
+# Cache špecifikácií instrumentov (minSz, ctVal) – TTL 1 hodina
+_INSTRUMENT_CACHE: dict = {}
+_INSTRUMENT_CACHE_TS: float = 0.0
+_INSTRUMENT_CACHE_TTL: float = 3600.0
+
+
+def fetch_okx_instrument_spec(symbol: str) -> dict | None:
+    """Načíta z OKX minSz/ctVal/lotSz pre daný SWAP symbol (sync, s cache)."""
+    global _INSTRUMENT_CACHE, _INSTRUMENT_CACHE_TS
+    now = time.time()
+    if (now - _INSTRUMENT_CACHE_TS) > _INSTRUMENT_CACHE_TTL:
+        _INSTRUMENT_CACHE = {}
+        _INSTRUMENT_CACHE_TS = now
+
+    if symbol in _INSTRUMENT_CACHE:
+        return _INSTRUMENT_CACHE[symbol]
+
+    inst_id = to_okx_inst_id(symbol)
+    try:
+        with httpx.Client(timeout=6.0) as client:
+            res = client.get(
+                f"{OKX_API}/api/v5/public/instruments",
+                params={"instType": "SWAP", "instId": inst_id}
+            )
+            if res.status_code != 200:
+                return None
+            data = res.json()
+            if data.get("code") != "0" or not data.get("data"):
+                return None
+            item = data["data"][0]
+            spec = {
+                "min_sz": float(item.get("minSz") or 0),
+                "lot_sz": float(item.get("lotSz") or 0),
+                "ct_val": float(item.get("ctVal") or 0),
+                "ct_mult": float(item.get("ctMult") or 1),
+                "tick_sz": float(item.get("tickSz") or 0),
+            }
+            _INSTRUMENT_CACHE[symbol] = spec
+            return spec
+    except Exception:
+        return None
+
+
+def okx_min_notional_usd(symbol: str, price: float) -> float:
+    """Minimálny notional v USDT podľa OKX (minSz × ctVal × price).
+    Fallback 5.2 USD ak API zlyhá.
+    """
+    if price <= 0:
+        return 5.2
+    spec = fetch_okx_instrument_spec(symbol)
+    if not spec or spec["min_sz"] <= 0 or spec["ct_val"] <= 0:
+        return 5.2
+    # Linear USDT SWAP: notional ≈ contracts × ctVal × price
+    min_notional = spec["min_sz"] * spec["ct_val"] * spec.get("ct_mult", 1.0) * price
+    # bezpečnostný floor (aj keď burza dovolí menej)
+    return max(float(min_notional), 1.0)
+
 async def fetch_single_ticker(client: httpx.AsyncClient, symbol: str) -> dict | None:
     """Odľahčené stiahnutie iba 1 konkrétneho tickeru (~0.5 kB) pre 1-sekundový TSL cyklus."""
     inst_id = to_okx_inst_id(symbol)
@@ -853,12 +911,16 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
     max_risk_pct = 0.015 if is_pd else 0.025
     margin_usd = min(balance * frac_kelly, balance * max_risk_pct)
 
-    if (margin_usd * leverage) < 5.2:
-        min_margin = 5.2 / max(1, leverage)
-        if min_margin <= balance * 0.06:
+    # Reálne OKX minimum (minSz × ctVal × price) – paper logika = realistický floor
+    min_notional = okx_min_notional_usd(sym, price)
+    notional = margin_usd * max(1, leverage)
+    if notional < min_notional:
+        min_margin = min_notional / max(1, leverage)
+        # dovolíme doťah max do 8 % balance (predtým 6 % pri fixnom $5.2)
+        if min_margin <= balance * 0.08:
             margin_usd = min_margin
         else:
-            return None
+            return None  # balance nestačí ani na minimálny OKX order
 
     dir_mult = 1.0 if direction == "LONG" else -1.0
     sl_mod = card["sl_modifier"]
