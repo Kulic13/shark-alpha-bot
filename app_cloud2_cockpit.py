@@ -45,6 +45,7 @@ def fetch_btc_options_walls(day_epoch_key: str) -> dict:
 
         for item in data:
             inst_id = item.get("instId", "")
+            # Formát OKX opcie: BTC-USD-261108-70000-C
             parts = inst_id.split("-")
             if len(parts) < 5:
                 continue
@@ -53,6 +54,7 @@ def fetch_btc_options_walls(day_epoch_key: str) -> dict:
             except ValueError:
                 continue
             opt_type = parts[4]
+            # Preferujeme oiCcy ak existuje, inak oi (počet kontraktov)
             oi = float(item.get("oiCcy") or item.get("oi") or 0)
             if oi <= 0:
                 continue
@@ -73,6 +75,7 @@ def fetch_btc_options_walls(day_epoch_key: str) -> dict:
         c_oi = np.array([calls.get(s, 0.0) for s in strikes])
         p_oi = np.array([puts.get(s, 0.0) for s in strikes])
 
+        # Vektorový výpočet Max Pain
         pain_matrix = np.maximum(0, s_arr[:, None] - s_arr[None, :]) * c_oi[None, :] +                       np.maximum(0, s_arr[None, :] - s_arr[:, None]) * p_oi[None, :]
         max_pain = float(s_arr[np.argmin(pain_matrix.sum(axis=1))])
 
@@ -82,8 +85,10 @@ def fetch_btc_options_walls(day_epoch_key: str) -> dict:
 
 def get_btc_options_with_friday_reset() -> dict:
     now_utc = datetime.now(timezone.utc)
+    # Piatok (weekday == 4) po 00:01 UTC zmaže hladiny v deň expirácie
     if now_utc.weekday() == 4 and (now_utc.hour > 0 or now_utc.minute >= 1):
         return {}
+    # Unikátny kľúč pre 12h blok a týždeň
     half_day = "AM" if now_utc.hour < 12 else "PM"
     epoch_key = f"{now_utc.strftime('%Y-%W-%d')}-{half_day}"
     return fetch_btc_options_walls(epoch_key)
@@ -93,6 +98,7 @@ def get_btc_options_with_friday_reset() -> dict:
 # =========================================================================
 @st.cache_data(ttl=10)
 def fetch_visual_klines(symbol: str, interval: str) -> pd.DataFrame:
+    # Viac histórie pre lepší prehľad (pôvodne 24/30)
     limit = 60 if interval == "15m" else 90
     inst_id = symbol_to_okx_swap(symbol)
     try:
@@ -107,7 +113,9 @@ def fetch_visual_klines(symbol: str, interval: str) -> pd.DataFrame:
         if not raw:
             return pd.DataFrame()
 
+        # OKX vracia sviečky od najnovšej po najstaršiu -> otočíme chronologicky
         raw_chronological = list(reversed(raw))
+        # OKX formát: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
         rows = []
         for k in raw_chronological:
             rows.append({
@@ -139,6 +147,7 @@ def safe_float(val, default=0.0) -> float:
 # =========================================================================
 st.title("🦈 Shark Alpha Institutional Cockpit (Cloud 2)")
 
+# Načítanie dát zo Supabase s error handlingom
 try:
     pos_res = supabase.table("active_positions").select("*").order("window_id").execute()
     active_windows = {r["window_id"]: r for r in pos_res.data} if pos_res.data else {}
@@ -173,6 +182,7 @@ with top_col1:
         win_trades = len(history_df[history_df["pnl_usd"] > 0])
         wr_total = (win_trades / len(history_df)) * 100.0 if len(history_df) > 0 else 0.0
 
+        # Nerealizované PnL – IBA aktívne pozície
         unrealized = sum(
             safe_float(w.get("pnl_usd"), 0.0)
             for w in active_windows.values()
@@ -184,6 +194,7 @@ with top_col1:
         m2.metric("Celková Úspešnosť", f"{wr_total:.1f} %", f"{len(history_df)} obchodov")
         m3.metric("Nerealizované PnL", f"${unrealized:+.2f}")
 
+        # Equity krivka – preferujeme closed_at, potom updated_at, inak id
         if "closed_at" in history_df.columns and history_df["closed_at"].notna().any():
             x_col = "closed_at"
         elif "updated_at" in history_df.columns and history_df["updated_at"].notna().any():
@@ -233,6 +244,7 @@ window_titles = {
 for wid in (1, 2, 3, 4):
     w = active_windows.get(wid, {})
     status = w.get("status", "WAITING")
+    # Window 1 defaultne BTCUSDT aj keď WAITING
     sym = w.get("symbol") or ("BTCUSDT" if wid == 1 else "HĽADÁM...")
 
     with st.sidebar.expander(f"{window_titles[wid]} | {sym}", expanded=True):
@@ -240,17 +252,12 @@ for wid in (1, 2, 3, 4):
             dir_icon = "🟢 LONG" if w.get("direction") == "LONG" else "🔴 SHORT"
             st.markdown(f"**Smer:** {dir_icon} | **Režim:** {w.get('regime')} ({w.get('leverage')}x)")
             
-            # NOVINKA: Zobrazenie veľkosti pozície a veľkosti objednávky (veľkosti kontraktov)
-            pos_size = w.get("position_size") or w.get("size") or w.get("volume")
-            order_size_usd = w.get("order_size_usd") or w.get("cost") or w.get("volume_usd")
-            
-            if pos_size is not None or order_size_usd is not None:
-                p_sz = f"`{pos_size}`" if pos_size is not None else "`N/A`"
-                o_sz = f"`${safe_float(order_size_usd):.2f}`" if order_size_usd is not None else "`N/A`"
-                st.markdown(f"**Size Position:** {p_sz} | **Veľkosť Orderu:** {o_sz}")
+            # Pridané zobrazovanie Size Position a Veľkosti Orderu pod Smer/Režim bez narušenia zvyšku bloku
+            st.markdown(f"**Size Position:** `{w.get('size', 'N/A')}` | **Veľkosť Orderu:** `${w.get('order_size_usd', 'N/A')}`")
             
             st.markdown(f"**Entry Price:** `{safe_float(w.get('entry_price')):.5f}`")
 
+            # TP hladiny + hit stavy
             tp1_hit = bool(w.get("tp1_hit", False))
             tp2_hit = bool(w.get("tp2_hit", False))
             tp1_label = "✅ TP1" if tp1_hit else "TP1"
@@ -261,10 +268,12 @@ for wid in (1, 2, 3, 4):
             )
             st.markdown(f"**TP3 (Liq):** `{safe_float(w.get('tp3_price')):.5f}`")
 
+            # SL / TSL
             tsl_active = bool(w.get("tsl_active", False))
             sl_label = "🟢 TSL (Aktívny)" if tsl_active else "🔴 Hard SL"
             st.markdown(f"**{sl_label}:** `{safe_float(w.get('sl_tsl_price')):.5f}`")
 
+            # DCA stavy (ak Cloud 1 ukladá filled flagy)
             dca1_p = safe_float(w.get("dca1_price"))
             if dca1_p > 0:
                 dca1_f = bool(w.get("dca1_filled", False))
@@ -279,6 +288,7 @@ for wid in (1, 2, 3, 4):
                     f"**{dca3_txt}:** `{safe_float(w.get('dca3_price')):.5f}`"
                 )
 
+            # Fáza obchodu (odvodená)
             if tp2_hit:
                 phase = "🎯 Fáza 3 – Trailing po TP2"
             elif tp1_hit:
@@ -287,10 +297,12 @@ for wid in (1, 2, 3, 4):
                 phase = "⏳ Fáza 1 – Čaká na TP1"
             st.caption(phase)
 
+            # Live PnL
             pnl_u = safe_float(w.get("pnl_usd"))
             pnl_p = safe_float(w.get("pnl_percent"))
             st.metric("Live PnL", f"${pnl_u:+.3f} USD", f"{pnl_p:+.2f} %")
 
+            # Updated_at ak existuje
             updated = w.get("updated_at")
             if updated:
                 st.caption(f"Posledný update: {updated}")
@@ -310,7 +322,7 @@ for wid in (1, 2, 3, 4):
 
     st.markdown(f"### {window_titles[wid]} — `{sym if sym else 'SKENUJEM TRH...'}`")
     if not sym:
-        st.info("Skener v Cloude 1 momentálne hľadá najlepšiu príležitosť pre ovo okno.")
+        st.info("Skener v Cloude 1 momentálne hľadá najlepšiu príležitosť pre toto okno.")
         continue
 
     df_k = fetch_visual_klines(sym, timeframe)
@@ -323,6 +335,7 @@ for wid in (1, 2, 3, 4):
         name=sym
     )])
 
+    # Vykreslenie opčných stien pre BTC (Okno 1)
     if wid == 1 and btc_options:
         fig.add_hline(y=btc_options["call_wall"], line_dash="dot", line_color="cyan",
                       annotation_text="Call Wall", annotation_position="top left")
@@ -331,6 +344,7 @@ for wid in (1, 2, 3, 4):
         fig.add_hline(y=btc_options["max_pain"], line_dash="dash", line_color="yellow",
                       annotation_text="Max Pain", annotation_position="top left")
 
+    # Vykreslenie živých obchodných hladín z Cloudu 1
     if status == "ACTIVE":
         entry = safe_float(w.get("entry_price"))
         tp1 = safe_float(w.get("tp1_price"))
@@ -340,6 +354,7 @@ for wid in (1, 2, 3, 4):
 
         fig.add_hline(y=entry, line_color="white", line_width=2, annotation_text="ENTRY")
 
+        # TP1 / TP2 – zelené, ak už hitnuté tak hrubšie / iný štýl
         tp1_hit = bool(w.get("tp1_hit", False))
         tp2_hit = bool(w.get("tp2_hit", False))
 
@@ -359,6 +374,7 @@ for wid in (1, 2, 3, 4):
         sl_txt = "TSL" if tsl_active else "SL"
         fig.add_hline(y=sl, line_color="#ff3355", line_width=2, annotation_text=sl_txt)
 
+        # DCA hladiny – oranžové, filled = plná čiara
         dca1_p = safe_float(w.get("dca1_price"))
         if dca1_p > 0:
             dca1_f = bool(w.get("dca1_filled", False))
@@ -387,7 +403,7 @@ for wid in (1, 2, 3, 4):
                 annotation_text="✅ DCA3" if dca3_f else "DCA3"
             )
 
-    # Apply the dynamic Y-axis fix combined with the sidebar requirement
+    # Vypočítame dynamický rozsah osi Y iba na základe cien sviečok (High a Low) s 0.5% rezervou
     ymin = df_k["l"].min() * 0.995
     ymax = df_k["h"].max() * 1.005
 
@@ -396,6 +412,7 @@ for wid in (1, 2, 3, 4):
         xaxis_rangeslider_visible=False,
         template="plotly_dark",
         margin=dict(l=10, r=10, t=20, b=10),
+        # Uzamknutie osi Y na rozsah sviečok, čím sa zabráni stlačeniu grafu opčnými stenami
         yaxis=dict(
             range=[ymin, ymax],
             autorange=False
