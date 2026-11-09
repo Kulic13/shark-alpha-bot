@@ -251,10 +251,6 @@ for wid in (1, 2, 3, 4):
         if status == "ACTIVE":
             dir_icon = "🟢 LONG" if w.get("direction") == "LONG" else "🔴 SHORT"
             st.markdown(f"**Smer:** {dir_icon} | **Režim:** {w.get('regime')} ({w.get('leverage')}x)")
-            
-            # Pridané zobrazovanie Size Position a Veľkosti Orderu pod Smer/Režim bez narušenia zvyšku bloku
-            st.markdown(f"**Size Position:** `{w.get('size', 'N/A')}` | **Veľkosť Orderu:** `${w.get('order_size_usd', 'N/A')}`")
-            
             st.markdown(f"**Entry Price:** `{safe_float(w.get('entry_price')):.5f}`")
 
             # TP hladiny + hit stavy
@@ -327,7 +323,7 @@ for wid in (1, 2, 3, 4):
 
     df_k = fetch_visual_klines(sym, timeframe)
     if df_k.empty:
-        st.warning(f"Nepodarilo sa načítať sviečky pre {sym} z OKX API.")
+        st.warning(f"Nepodarilo sa načítať sviečke pre {sym} z OKX API.")
         continue
 
     fig = go.Figure(data=[go.Candlestick(
@@ -404,18 +400,18 @@ for wid in (1, 2, 3, 4):
             )
 
     # Vypočítame dynamický rozsah osi Y iba na základe cien sviečok (High a Low) s 0.5% rezervou
-    ymin = df_k["l"].min() * 0.995
-    ymax = df_k["h"].max() * 1.005
+    ymin = float(df_k["l"].min() * 0.995)
+    ymax = float(df_k["h"].max() * 1.005)
 
     fig.update_layout(
         height=520,
         xaxis_rangeslider_visible=False,
         template="plotly_dark",
         margin=dict(l=10, r=10, t=20, b=10),
-        # Uzamknutie osi Y na rozsah sviečok, čím sa zabráni stlačeniu grafu opčnými stenami
+        # HLAVNÁ ZMENA: Zamknutie osi Y na rozsah sviečok, čím sa zabráni stlačeniu grafu opčnými stenami
         yaxis=dict(
             range=[ymin, ymax],
-            autorange=False
+            autorange=False  # Vypne automatické rozťahovanie podľa hlines
         )
     )
     st.plotly_chart(fig, use_container_width=True)
