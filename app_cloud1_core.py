@@ -1025,6 +1025,8 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
         "extreme_price": price,
         "cached_ofd": initial_ofd,
         "last_ofd_check": time.time(),
+        # Pevný čas otvorenia – nemení sa počas života pozície (pre OPEN v-line v Cloud 2)
+        "opened_at": datetime.now(timezone.utc).isoformat(),
         "mandate_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
     }
 
@@ -1190,6 +1192,7 @@ async def run_core_cycle(vault: dict):
                     "sl_tsl_price": pos["sl_tsl_price"], "tsl_active": pos["tsl_active"],
                     "pnl_usd": round(pnl_usd, 4), "pnl_percent": round(net_pnl_pct, 2),
                     "last_price": curr_price,
+                    "opened_at": pos.get("opened_at"),  # fixný čas otvorenia – nemení sa
                     "mandate_expires_at": pos["mandate_expires_at"], "updated_at": now_dt.isoformat()
                 }, vault)
 
@@ -1341,7 +1344,9 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
     safe_supabase_upsert("active_positions", {
         "window_id": win_id, "status": "WAITING", "symbol": None, "entry_price": 0.0,
         "tp1_price": 0.0, "tp2_price": 0.0, "tp3_price": 0.0, "sl_tsl_price": 0.0,
-        "pnl_usd": 0.0, "pnl_percent": 0.0, "updated_at": datetime.now(timezone.utc).isoformat()
+        "pnl_usd": 0.0, "pnl_percent": 0.0,
+        "opened_at": None,  # vymazať čas otvorenia po zatvorení
+        "updated_at": datetime.now(timezone.utc).isoformat()
     }, vault)
     save_vault(vault, sync_cloud=True)
 
