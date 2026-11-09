@@ -876,13 +876,26 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
     if natr > max_natr or natr < 0.3 or np.isnan(natr):
         return None
 
-    if natr <= 3.0 and not is_pd:
+    # Dynamická voľba regime + páky podľa NATR (volatilita trhu), nie fixné x10
+    # Nižšia volatilita → vyššia páka; vyššia volatilita → nižšia páka / SPOT
+    if is_pd:
+        # Pump & Dump: konzervatívnejšia páka 2–5x
         regime = "FUTURES"
-        leverage = int(np.clip(int(22.0 / natr), 2, 10))
-    elif is_pd:
+        leverage = int(np.clip(round(12.0 / max(natr, 0.5)), 2, 5))
+    elif natr <= 1.5:
+        # Veľmi pokojný trh → vyššia páka (6–12x)
         regime = "FUTURES"
-        leverage = int(np.clip(int(15.0 / natr), 2, 5))
+        leverage = int(np.clip(round(15.0 / max(natr, 0.5)), 6, 12))
+    elif natr <= 2.5:
+        # Stredne nízka volatilita → stredná páka (4–8x)
+        regime = "FUTURES"
+        leverage = int(np.clip(round(14.0 / max(natr, 0.5)), 4, 8))
+    elif natr <= 3.5:
+        # Stredná volatilita → nízka páka (2–5x)
+        regime = "FUTURES"
+        leverage = int(np.clip(round(12.0 / max(natr, 0.5)), 2, 5))
     else:
+        # Vysoká volatilita → SPOT (1x), bez páky
         regime = "SPOT"
         leverage = 1
 
@@ -909,18 +922,30 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
 
     frac_kelly = full_kelly * 0.35
     max_risk_pct = 0.015 if is_pd else 0.025
-    margin_usd = min(balance * frac_kelly, balance * max_risk_pct)
+    kelly_margin = min(balance * frac_kelly, balance * max_risk_pct)
 
-    # Reálne OKX minimum (minSz × ctVal × price) – paper logika = realistický floor
+    # Reálne OKX minimum (minSz × ctVal × price) → minimálny margin = min_notional / leverage
     min_notional = okx_min_notional_usd(sym, price)
-    notional = margin_usd * max(1, leverage)
-    if notional < min_notional:
-        min_margin = min_notional / max(1, leverage)
-        # dovolíme doťah max do 8 % balance (predtým 6 % pri fixnom $5.2)
+    min_margin = min_notional / max(1, leverage)
+
+    # LOGIKA: ak Kelly navrhne menej než OKX minimum → otvoríme s minimom burzy (nie s Kelly)
+    if kelly_margin < min_margin:
         if min_margin <= balance * 0.08:
-            margin_usd = min_margin
+            margin_usd = min_margin  # floor = exchange minimum
         else:
             return None  # balance nestačí ani na minimálny OKX order
+    else:
+        margin_usd = kelly_margin
+
+    # Počiatočný active_margin: PD = celý margin; inak 30 % (DCA plán)
+    # ALE: počiatočný notional musí spĺňať OKX min, inak by vstup bol ~1 USD
+    if is_pd:
+        active_margin = margin_usd
+    else:
+        active_margin = margin_usd * 0.30
+        if (active_margin * max(1, leverage)) < min_notional:
+            # Doťah počiatočnej veľkosti na exchange minimum (zvyšok marginu ostáva na DCA)
+            active_margin = min(min_margin, margin_usd)
 
     dir_mult = 1.0 if direction == "LONG" else -1.0
     sl_mod = card["sl_modifier"]
@@ -947,7 +972,8 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
 
     sl_price = price * (1.0 - dir_mult * sl_pct)
 
-    # Výpočet likvidačnej zóny 20x páky (TP3) s garantovanou monotónnosťou
+    # Výpočet likvidačnej zóny 20x páky (TP3)
+    # LONG/SHORT vetvy sú prehodené oproti pôvodnej (chybnej) verzii podľa požiadavky
     recent_klines = klines[-20:]
     highs = [float(get_high(k)) for k in recent_klines]
     lows = [float(get_low(k)) for k in recent_klines]
@@ -955,13 +981,21 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
     min_tp3_gap = (0.5 * natr) / 100.0
 
     if direction == "LONG":
-        liq_short_20x = max(highs) * (1.0 + (1.0 / 20.0) - mmr)
-        raw_tp3 = liq_short_20x * 0.995
-        tp3 = max(raw_tp3, tp2 * (1.0 + min_tp3_gap))
-    else:
-        liq_long_20x = min(lows) * (1.0 - (1.0 / 20.0) + mmr)
-        raw_tp3 = liq_long_20x * 1.005
+        # Pre LONG aplikujeme pôvodnú SHORT vetvu
+        liq_ref = min(lows) * (1.0 - (1.0 / 20.0) + mmr)
+        raw_tp3 = liq_ref * 1.005
         tp3 = min(raw_tp3, tp2 * (1.0 - min_tp3_gap))
+    else:
+        # Pre SHORT aplikujeme pôvodnú LONG vetvu
+        liq_ref = max(highs) * (1.0 + (1.0 / 20.0) - mmr)
+        raw_tp3 = liq_ref * 0.995
+        tp3 = max(raw_tp3, tp2 * (1.0 + min_tp3_gap))
+
+    # Monotónnosť TP úrovní: LONG → entry < tp1 < tp2 < tp3; SHORT → entry > tp1 > tp2 > tp3
+    if direction == "LONG":
+        tp3 = max(tp3, tp2 * (1.0 + min_tp3_gap))
+    else:
+        tp3 = min(tp3, tp2 * (1.0 - min_tp3_gap))
 
     initial_ofd = compute_ofd_from_klines(klines)
 
@@ -978,7 +1012,7 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
         "cost_rate": cost_rate,
         "tp_mod": tp_mod,
         "margin_usd": margin_usd,
-        "active_margin": margin_usd if is_pd else margin_usd * 0.30,
+        "active_margin": active_margin,
         "entry_price": price,
         "dca1_price": dca1, "dca1_filled": False,
         "dca2_price": dca2, "dca2_filled": False,
