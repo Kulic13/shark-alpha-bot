@@ -370,7 +370,13 @@ for wid in (1, 2, 3, 4):
         name=sym
     )])
 
-    # Vykreslenie opčných stien pre BTC (Okno 1)
+    # --- Y-rozsah: prioritne okolo ceny (sviečky + entry/TP/SL/DCA), aby graf nebol stlačený ---
+    # Opčné steny (call/put wall) môžu byť veľmi ďaleko → nechávame ich mimo default view.
+    # Po odzoomovaní (zoom out) budú stále viditeľné.
+    price_low = float(df_k["l"].min())
+    price_high = float(df_k["h"].max())
+
+    # Vykreslenie opčných stien pre BTC (Okno 1) – len ako referencie, mimo auto-range
     if wid == 1 and btc_options:
         fig.add_hline(y=btc_options["call_wall"], line_dash="dot", line_color="cyan",
                       annotation_text="Call Wall", annotation_position="top left")
@@ -387,6 +393,7 @@ for wid in (1, 2, 3, 4):
         tp3 = safe_float(w.get("tp3_price"))
         sl = safe_float(w.get("sl_tsl_price"))
 
+        # Horizontálna ENTRY (cena)
         fig.add_hline(y=entry, line_color="white", line_width=2, annotation_text="ENTRY")
 
         # TP1 / TP2 – zelené, ak už hitnuté tak hrubšie / iný štýl
@@ -438,13 +445,55 @@ for wid in (1, 2, 3, 4):
                 annotation_text="DCA3 executed" if dca3_f else "DCA3"
             )
 
+        # Rozšírenie y-range o obchodné hladiny (entry/TP/SL/DCA), nie o vzdialené walls
+        level_prices = [p for p in [entry, tp1, tp2, tp3, sl, dca1_p,
+                                    safe_float(w.get("dca2_price")),
+                                    safe_float(w.get("dca3_price"))] if p > 0]
+        if level_prices:
+            price_low = min(price_low, min(level_prices))
+            price_high = max(price_high, max(level_prices))
+
+        # Biela VERTIKÁLNA čiara = otváracia cena / čas vstupu do obchodu (všetky 4 okná)
+        # Preferujeme opened_at / entry_time / created_at; fallback = prvá sviečka v dátach
+        entry_ts = None
+        for key in ("opened_at", "entry_time", "created_at", "updated_at"):
+            raw_ts = w.get(key)
+            if raw_ts:
+                try:
+                    entry_ts = pd.to_datetime(raw_ts, utc=True)
+                    break
+                except Exception:
+                    continue
+        if entry_ts is None and not df_k.empty:
+            entry_ts = df_k["time"].iloc[0]
+
+        if entry_ts is not None:
+            fig.add_vline(
+                x=entry_ts,
+                line_color="white",
+                line_width=2,
+                line_dash="solid",
+                annotation_text="OPEN",
+                annotation_position="top"
+            )
+
+    # Padding okolo ceny, aby sviečky neboli nalepené na okraj
+    pad = max((price_high - price_low) * 0.08, price_high * 0.002)
+    y_min = price_low - pad
+    y_max = price_high + pad
+
     fig.update_layout(
         height=520,
         xaxis_rangeslider_visible=False,
         template="plotly_dark",
-        margin=dict(l=10, r=10, t=20, b=10)
+        margin=dict(l=10, r=10, t=20, b=10),
+        yaxis=dict(
+            range=[y_min, y_max],
+            autorange=False,          # pevný range okolo ceny – walls sú mimo, po zoom out ich uvidíš
+            fixedrange=False          # používateľ môže stále zoomovať / panovať
+        )
     )
     st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
-st.caption("Shark Alpha Cockpit Cloud 2 • Opravená verzia – DCA filled / TP hit stavy / lepšie PnL / viac histórie sviečok")
+st.caption("Shark Alpha Cockpit Cloud 2 • Opravená verzia – y-range okolo ceny (walls mimo default view) / biela OPEN v-line / DCA filled / TP hit stavy")
