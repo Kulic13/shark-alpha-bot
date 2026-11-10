@@ -363,11 +363,16 @@ def render_live_position_cards():
                 st.metric("Live PnL", f"${pnl_u:+.3f} USD", f"{pnl_p:+.2f} %")
 
                 # Počiatočný Kelly vklad (nemenný margin_usd z otvorenia)
-                st.markdown(
-                    f"**Počiatočný vklad (Kelly):** ${safe_float(w.get('margin_usd')):.2f} USD"
-                )
-                # Aktuálna zostávajúca marža po scale-outoch (ak je dostupná)
+                kelly_m = safe_float(w.get("margin_usd"))
                 act_m = safe_float(w.get("active_margin"))
+                if kelly_m > 0:
+                    st.markdown(f"**Počiatočný vklad (Kelly):** ${kelly_m:.2f} USD")
+                else:
+                    st.markdown("**Počiatočný vklad (Kelly):** _nedostupné_")
+                    st.caption(
+                        "Chýba stĺpec `margin_usd` v `active_positions` (alebo pozícia pred patchom). "
+                        "V Supabase pridaj stĺpce a nasad' aktualizovaný Core."
+                    )
                 if act_m > 0:
                     st.caption(f"Aktívna marža (po scale-out): ${act_m:.2f} USD")
 
