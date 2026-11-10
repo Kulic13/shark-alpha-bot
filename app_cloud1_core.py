@@ -482,10 +482,10 @@ async def verify_execution_confirmation_btc(
     ofd: float,
     cache: dict
 ) -> tuple[bool, float]:
-    """Výrazne uvoľnená verzia pre BTC (makrokotva).
-    Volume: stačí >= 0.90x priemeru (BTC volume je stabilný).
-    OBI: mäkšie prahy (0.65 / 1.45).
-    1H filter: zamietne len silne proti-trendové vstupy.
+    """Prísna inštitucionálna verzia pre BTC (makrokotva).
+    Volume: >= 1.05x priemeru predchádzajúcich periód.
+    OBI: LONG vyžaduje OBI > 1.15, SHORT OBI < 0.85.
+    1H EMA21: proti-trend len pri extrémnom OFD (LONG ofd>=1.50 / SHORT ofd<=0.65).
     """
     if len(klines_15m) < 12:
         return False, 0.0
@@ -493,8 +493,8 @@ async def verify_execution_confirmation_btc(
     vols = [float(get_vol(k)) for k in klines_15m[-11:]]
     avg_prev_vol = float(np.mean(vols[:-1])) if len(vols) > 1 else 0.0
     curr_vol = vols[-1]
-    # BTC: volume len nesmie úplne zomrieť (0.70x)
-    if avg_prev_vol > 0 and (curr_vol / avg_prev_vol) < 0.70:
+    # BTC: vstup len pri živom volume (>= 1.05x priemeru)
+    if avg_prev_vol > 0 and (curr_vol / avg_prev_vol) < 1.05:
         return False, 0.0
 
     klines_1h = await fetch_okx_klines(client, symbol, "1H", 25, cache)
@@ -502,10 +502,10 @@ async def verify_execution_confirmation_btc(
         closes_1h = pd.Series([float(get_close(k)) for k in klines_1h])
         ema21_1h = float(closes_1h.ewm(span=21, adjust=False).mean().iloc[-1])
         last_1h_close = float(closes_1h.iloc[-1])
-        # Zamietne len silne proti-trend + slabý OFD
-        if direction == "LONG" and last_1h_close < ema21_1h and ofd < 1.05:
+        # Proti-trend zakázaný, okrem extrémneho order-flow
+        if direction == "LONG" and last_1h_close < ema21_1h and ofd < 1.50:
             return False, 0.0
-        if direction == "SHORT" and last_1h_close > ema21_1h and ofd > 0.95:
+        if direction == "SHORT" and last_1h_close > ema21_1h and ofd > 0.65:
             return False, 0.0
 
     inst_id = to_okx_inst_id(symbol)
@@ -539,10 +539,10 @@ async def verify_execution_confirmation_btc(
         ask_depth = sum(float(a[1]) for a in asks[:5])
         obi = bid_depth / max(1e-9, ask_depth)
 
-        # BTC orderbook je hlboký a často asymetrický v trende
-        if direction == "LONG" and obi < 0.45:
+        # Prísny OBI: LONG len pri prevahu bidov, SHORT len pri prevahu askov
+        if direction == "LONG" and obi <= 1.15:
             return False, 0.0
-        if direction == "SHORT" and obi > 2.20:
+        if direction == "SHORT" and obi >= 0.85:
             return False, 0.0
 
         exec_price = best_ask if direction == "LONG" else best_bid
@@ -912,16 +912,16 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
     if natr > max_natr or natr < 0.3 or np.isnan(natr):
         return None
 
-    # Dynamická voľba regime + páky podľa NATR (volatilita trhu), nie fixné x10
-    # Nižšia volatilita → vyššia páka; vyššia volatilita → nižšia páka / SPOT
+    # Dynamická voľba regime + páky podľa NATR (volatilita trhu)
+    # Strop páky: striktné maximum x10 vo všetkých kategóriách
     if is_pd:
-        # Pump & Dump: konzervatívnejšia páka 2–5x
+        # Pump & Dump: konzervatívnejšia páka 2–5x (strop << 10)
         regime = "FUTURES"
         leverage = int(np.clip(round(12.0 / max(natr, 0.5)), 2, 5))
     elif natr <= 1.5:
-        # Veľmi pokojný trh → vyššia páka (6–12x)
+        # Veľmi pokojný trh → vyššia páka (6–10x)
         regime = "FUTURES"
-        leverage = int(np.clip(round(15.0 / max(natr, 0.5)), 6, 12))
+        leverage = int(np.clip(round(15.0 / max(natr, 0.5)), 6, 10))
     elif natr <= 2.5:
         # Stredne nízka volatilita → stredná páka (4–8x)
         regime = "FUTURES"
@@ -934,6 +934,8 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
         # Vysoká volatilita → SPOT (1x), bez páky
         regime = "SPOT"
         leverage = 1
+
+    leverage = int(min(leverage, 10))  # hard cap x10
 
     card = get_ai_card(sym)
     if cand["is_funding_trap"]:
