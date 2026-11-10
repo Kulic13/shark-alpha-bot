@@ -1025,8 +1025,6 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
         "extreme_price": price,
         "cached_ofd": initial_ofd,
         "last_ofd_check": time.time(),
-        # Pevný čas otvorenia – nemení sa počas života pozície (pre OPEN v-line v Cloud 2)
-        "opened_at": datetime.now(timezone.utc).isoformat(),
         "mandate_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
     }
 
@@ -1112,22 +1110,88 @@ async def run_core_cycle(vault: dict):
                             else:
                                 pos["tp3_price"] = min(pos["tp3_price"], pos["tp2_price"] * (1.0 - min_tp3_gap))
 
-            # C. DVOJSTUPŇOVÝ TSL ENGINE (Fáza 1: TP1 -> BE, Fáza 2: TP2 -> Trail)
+            # C. DVOJSTUPŇOVÝ TSL ENGINE + 50/30/20 SCALE-OUT (Fáza 1: TP1 50%, Fáza 2: TP2 30%, Fáza 3: trail 20%)
             if not pos.get("tp1_hit", False):
                 if (is_long and curr_price >= pos["tp1_price"]) or (not is_long and curr_price <= pos["tp1_price"]):
+                    cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
+                    gross_pnl_pct = ((curr_price - pos["entry_price"]) / pos["entry_price"]) * dir_mult * pos["leverage"] * 100.0
+                    net_pnl_pct = gross_pnl_pct - (cost_rate * pos["leverage"] * 100.0)
+                    # Odpredaj 50 % aktuálnej marže (50 % z pôvodnej)
+                    closed_margin = pos["active_margin"] * 0.5
+                    partial_pnl_usd = closed_margin * (net_pnl_pct / 100.0)
+                    vault["balance"] = round(vault["balance"] + partial_pnl_usd, 4)
+                    pos["active_margin"] = pos["active_margin"] * 0.5
                     pos["tp1_hit"] = True
                     pos["tsl_active"] = True
                     pos["extreme_price"] = curr_price
-                    cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
                     be_lock = pos["entry_price"] * (1.0 + dir_mult * (cost_rate + 0.0010))
                     if (is_long and be_lock > pos["sl_tsl_price"]) or (not is_long and be_lock < pos["sl_tsl_price"]):
                         pos["sl_tsl_price"] = be_lock
+                    # Priebežný záznam scale-outu do trade_history
+                    hist_row = {
+                        "window_id": win_id,
+                        "symbol": pos["symbol"],
+                        "direction": pos["direction"],
+                        "regime": pos["regime"],
+                        "leverage": pos["leverage"],
+                        "entry_price": pos["entry_price"],
+                        "exit_price": curr_price,
+                        "margin_usd": round(closed_margin, 4),
+                        "pnl_usd": round(partial_pnl_usd, 4),
+                        "pnl_percent": round(net_pnl_pct, 2),
+                        "exit_reason": "TP1_SCALE_OUT",
+                        "current_balance": vault["balance"],
+                        "tp1_hit": True,
+                        "tp2_hit": False,
+                        "dca1_filled": bool(pos.get("dca1_filled", False)),
+                        "dca2_filled": bool(pos.get("dca2_filled", False)),
+                        "dca3_filled": bool(pos.get("dca3_filled", False)),
+                        "closed_at": now_dt.isoformat()
+                    }
+                    try:
+                        supabase.table("trade_history").insert(hist_row).execute()
+                    except Exception:
+                        vault["pending_supabase_sync"].append({"table": "trade_history", "op": "insert", "data": hist_row})
                     db_dirty = True
 
             if pos.get("tp1_hit", False) and not pos.get("tp2_hit", False):
                 if (is_long and curr_price >= pos["tp2_price"]) or (not is_long and curr_price <= pos["tp2_price"]):
+                    cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
+                    gross_pnl_pct = ((curr_price - pos["entry_price"]) / pos["entry_price"]) * dir_mult * pos["leverage"] * 100.0
+                    net_pnl_pct = gross_pnl_pct - (cost_rate * pos["leverage"] * 100.0)
+                    # 30 % z pôvodnej marže = 60 % zo súčasnej (už zníženej po TP1) marže
+                    closed_margin = pos["active_margin"] * 0.6
+                    partial_pnl_usd = closed_margin * (net_pnl_pct / 100.0)
+                    vault["balance"] = round(vault["balance"] + partial_pnl_usd, 4)
+                    # Zvyšok = 40 % zo súčasnej = 20 % z pôvodnej
+                    pos["active_margin"] = pos["active_margin"] * 0.4
                     pos["tp2_hit"] = True
                     pos["extreme_price"] = curr_price
+                    # Priebežný záznam scale-outu do trade_history
+                    hist_row = {
+                        "window_id": win_id,
+                        "symbol": pos["symbol"],
+                        "direction": pos["direction"],
+                        "regime": pos["regime"],
+                        "leverage": pos["leverage"],
+                        "entry_price": pos["entry_price"],
+                        "exit_price": curr_price,
+                        "margin_usd": round(closed_margin, 4),
+                        "pnl_usd": round(partial_pnl_usd, 4),
+                        "pnl_percent": round(net_pnl_pct, 2),
+                        "exit_reason": "TP2_SCALE_OUT",
+                        "current_balance": vault["balance"],
+                        "tp1_hit": True,
+                        "tp2_hit": True,
+                        "dca1_filled": bool(pos.get("dca1_filled", False)),
+                        "dca2_filled": bool(pos.get("dca2_filled", False)),
+                        "dca3_filled": bool(pos.get("dca3_filled", False)),
+                        "closed_at": now_dt.isoformat()
+                    }
+                    try:
+                        supabase.table("trade_history").insert(hist_row).execute()
+                    except Exception:
+                        vault["pending_supabase_sync"].append({"table": "trade_history", "op": "insert", "data": hist_row})
                     db_dirty = True
 
             if pos.get("tp2_hit", False):
@@ -1192,7 +1256,6 @@ async def run_core_cycle(vault: dict):
                     "sl_tsl_price": pos["sl_tsl_price"], "tsl_active": pos["tsl_active"],
                     "pnl_usd": round(pnl_usd, 4), "pnl_percent": round(net_pnl_pct, 2),
                     "last_price": curr_price,
-                    "opened_at": pos.get("opened_at"),  # fixný čas otvorenia – nemení sa
                     "mandate_expires_at": pos["mandate_expires_at"], "updated_at": now_dt.isoformat()
                 }, vault)
 
@@ -1268,23 +1331,6 @@ async def run_core_cycle(vault: dict):
                         if setup:
                             vault["windows"]["1"] = setup
                             active_syms.add("BTCUSDT")
-                            # Okamžitý zápis do Supabase vrátane opened_at (pre Cloud 2 OPEN line + sidebar)
-                            safe_supabase_upsert("active_positions", {
-                                "window_id": 1, "status": "ACTIVE", "symbol": setup["symbol"],
-                                "direction": setup["direction"], "regime": setup["regime"],
-                                "leverage": setup["leverage"], "entry_price": setup["entry_price"],
-                                "dca1_price": setup["dca1_price"], "dca2_price": setup["dca2_price"],
-                                "dca3_price": setup["dca3_price"],
-                                "dca1_filled": False, "dca2_filled": False, "dca3_filled": False,
-                                "tp1_price": setup["tp1_price"], "tp2_price": setup["tp2_price"],
-                                "tp3_price": setup["tp3_price"],
-                                "tp1_hit": False, "tp2_hit": False,
-                                "sl_tsl_price": setup["sl_tsl_price"], "tsl_active": False,
-                                "pnl_usd": 0.0, "pnl_percent": 0.0,
-                                "opened_at": setup.get("opened_at"),
-                                "mandate_expires_at": setup["mandate_expires_at"],
-                                "updated_at": now_dt.isoformat()
-                            }, vault)
 
             if vault["windows"]["2"]["status"] == "WAITING":
                 cands_a = await evaluate_candidates(
@@ -1297,22 +1343,6 @@ async def run_core_cycle(vault: dict):
                         vault["windows"]["2"] = setup
                         active_syms.add(c["symbol"])
                         active_secs.add(c["sector"])
-                        safe_supabase_upsert("active_positions", {
-                            "window_id": 2, "status": "ACTIVE", "symbol": setup["symbol"],
-                            "direction": setup["direction"], "regime": setup["regime"],
-                            "leverage": setup["leverage"], "entry_price": setup["entry_price"],
-                            "dca1_price": setup["dca1_price"], "dca2_price": setup["dca2_price"],
-                            "dca3_price": setup["dca3_price"],
-                            "dca1_filled": False, "dca2_filled": False, "dca3_filled": False,
-                            "tp1_price": setup["tp1_price"], "tp2_price": setup["tp2_price"],
-                            "tp3_price": setup["tp3_price"],
-                            "tp1_hit": False, "tp2_hit": False,
-                            "sl_tsl_price": setup["sl_tsl_price"], "tsl_active": False,
-                            "pnl_usd": 0.0, "pnl_percent": 0.0,
-                            "opened_at": setup.get("opened_at"),
-                            "mandate_expires_at": setup["mandate_expires_at"],
-                            "updated_at": now_dt.isoformat()
-                        }, vault)
                         break
 
             if vault["windows"]["3"]["status"] == "WAITING":
@@ -1326,22 +1356,6 @@ async def run_core_cycle(vault: dict):
                         vault["windows"]["3"] = setup
                         active_syms.add(c["symbol"])
                         active_secs.add(c["sector"])
-                        safe_supabase_upsert("active_positions", {
-                            "window_id": 3, "status": "ACTIVE", "symbol": setup["symbol"],
-                            "direction": setup["direction"], "regime": setup["regime"],
-                            "leverage": setup["leverage"], "entry_price": setup["entry_price"],
-                            "dca1_price": setup["dca1_price"], "dca2_price": setup["dca2_price"],
-                            "dca3_price": setup["dca3_price"],
-                            "dca1_filled": False, "dca2_filled": False, "dca3_filled": False,
-                            "tp1_price": setup["tp1_price"], "tp2_price": setup["tp2_price"],
-                            "tp3_price": setup["tp3_price"],
-                            "tp1_hit": False, "tp2_hit": False,
-                            "sl_tsl_price": setup["sl_tsl_price"], "tsl_active": False,
-                            "pnl_usd": 0.0, "pnl_percent": 0.0,
-                            "opened_at": setup.get("opened_at"),
-                            "mandate_expires_at": setup["mandate_expires_at"],
-                            "updated_at": now_dt.isoformat()
-                        }, vault)
                         break
 
             if vault["windows"]["4"]["status"] == "WAITING":
@@ -1353,22 +1367,6 @@ async def run_core_cycle(vault: dict):
                     setup = build_trade_setup(c, vault["balance"], 4)
                     if setup:
                         vault["windows"]["4"] = setup
-                        safe_supabase_upsert("active_positions", {
-                            "window_id": 4, "status": "ACTIVE", "symbol": setup["symbol"],
-                            "direction": setup["direction"], "regime": setup["regime"],
-                            "leverage": setup["leverage"], "entry_price": setup["entry_price"],
-                            "dca1_price": setup["dca1_price"], "dca2_price": setup["dca2_price"],
-                            "dca3_price": setup["dca3_price"],
-                            "dca1_filled": False, "dca2_filled": False, "dca3_filled": False,
-                            "tp1_price": setup["tp1_price"], "tp2_price": setup["tp2_price"],
-                            "tp3_price": setup["tp3_price"],
-                            "tp1_hit": False, "tp2_hit": False,
-                            "sl_tsl_price": setup["sl_tsl_price"], "tsl_active": False,
-                            "pnl_usd": 0.0, "pnl_percent": 0.0,
-                            "opened_at": setup.get("opened_at"),
-                            "mandate_expires_at": setup["mandate_expires_at"],
-                            "updated_at": now_dt.isoformat()
-                        }, vault)
                         break
 
     # Uloženie trezoru: lokálne vždy (0 ms), do cloudu Supabase len pri zmene alebo raz za 10 sekúnd
@@ -1399,8 +1397,6 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
         "dca1_filled": bool(pos.get("dca1_filled", False)),
         "dca2_filled": bool(pos.get("dca2_filled", False)),
         "dca3_filled": bool(pos.get("dca3_filled", False)),
-        # open_at = pevný čas otvorenia pozície (Cloud 2 / história)
-        "open_at": pos.get("opened_at"),
         "closed_at": datetime.now(timezone.utc).isoformat()
     }
     try:
@@ -1411,9 +1407,7 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
     safe_supabase_upsert("active_positions", {
         "window_id": win_id, "status": "WAITING", "symbol": None, "entry_price": 0.0,
         "tp1_price": 0.0, "tp2_price": 0.0, "tp3_price": 0.0, "sl_tsl_price": 0.0,
-        "pnl_usd": 0.0, "pnl_percent": 0.0,
-        "opened_at": None,  # vymazať čas otvorenia po zatvorení
-        "updated_at": datetime.now(timezone.utc).isoformat()
+        "pnl_usd": 0.0, "pnl_percent": 0.0, "updated_at": datetime.now(timezone.utc).isoformat()
     }, vault)
     save_vault(vault, sync_cloud=True)
 
