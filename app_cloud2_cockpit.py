@@ -171,6 +171,20 @@ except Exception as e:
     ai_df = pd.DataFrame()
 
 # -------------------------------------------------------------------------
+# 0. NY OPEN LOCK – vizuálny status (14:00–15:30 UTC = 15:00–16:30 SEČ)
+# -------------------------------------------------------------------------
+_now_utc = datetime.now(timezone.utc)
+_ny_mins = _now_utc.hour * 60 + _now_utc.minute
+_ny_lock_active = (14 * 60) <= _ny_mins < (15 * 60 + 30)
+if _ny_lock_active:
+    st.error(
+        "🛑 NY OPEN LOCK AKTIVNÍ: Skener nových obchodů je dočasně uzamčen pro ochranu kapitálu. "
+        "Běžící pozice jsou chráněny rozšířeným SL-Shieldem pod/nad extrémními knoty."
+    )
+else:
+    st.caption("🟢 Core status: Skener trhu pracuje v běžném režimu (Volný trh).")
+
+# -------------------------------------------------------------------------
 # 1. HORNÁ ČASŤ OBRAZOVKY: DYNAMICKÝ EQUITY DASHBOARD & AI MATICA VÝKONU
 # -------------------------------------------------------------------------
 top_col1, top_col2 = st.columns([1.2, 1.0])
