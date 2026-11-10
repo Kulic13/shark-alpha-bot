@@ -279,12 +279,15 @@ with top_col2:
         st.info("AI Matica (`ai_learning_matrix`) je pripravená a čaká na prvé dáta z Cloudu 1.")
 
 # -------------------------------------------------------------------------
-# 2. ĽAVÝ SIDEBAR: 4 OPERAČNÉ KARTY POZÍCIÍ (BTC, ŠAMPIÓN A, B, C)
+# 2. ĽAVÝ SIDEBAR: OVLÁDANIE + REAKTÍVNE KARTY (1s fragment)
 # -------------------------------------------------------------------------
 st.sidebar.header("🎛️ Ovládanie & Živé Pozície")
 timeframe = st.sidebar.radio("Časový rámec grafov:", ["15m", "1m"], horizontal=True)
 if st.sidebar.button("🔄 Obnoviť dáta Kokpitu"):
     st.cache_data.clear()
+    for _k in list(st.session_state.keys()):
+        if str(_k).startswith("kline_cache_") or str(_k).startswith("kline_ts_"):
+            del st.session_state[_k]
     st.rerun()
 
 st.sidebar.divider()
@@ -296,216 +299,275 @@ window_titles = {
     4: "4️⃣ Šampión C (Pump & Dump)"
 }
 
-for wid in (1, 2, 3, 4):
-    w = active_windows.get(wid, {})
-    status = w.get("status", "WAITING")
-    # Window 1 defaultne BTCUSDT aj keď WAITING
-    sym = w.get("symbol") or ("BTCUSDT" if wid == 1 else "HĽADÁM...")
 
-    with st.sidebar.expander(f"{window_titles[wid]} | {sym}", expanded=True):
+@st.fragment(run_every="1s")
+def render_live_position_cards():
+    """Live načítanie active_positions každú 1s – TSL / marža / PnL bez refreshu grafov."""
+    try:
+        pos_res_live = supabase.table("active_positions").select("*").order("window_id").execute()
+        live_windows = {r["window_id"]: r for r in pos_res_live.data} if pos_res_live.data else {}
+    except Exception:
+        live_windows = {}
+
+    for wid in (1, 2, 3, 4):
+        w = live_windows.get(wid, {})
+        status = w.get("status", "WAITING")
+        # Window 1 defaultne BTCUSDT aj keď WAITING
+        sym = w.get("symbol") or ("BTCUSDT" if wid == 1 else "HĽADÁM...")
+
+        with st.sidebar.expander(f"{window_titles[wid]} | {sym}", expanded=True):
+            if status == "ACTIVE":
+                dir_icon = "🟢 LONG" if w.get("direction") == "LONG" else "🔴 SHORT"
+                st.markdown(f"**Smer:** {dir_icon} | **Režim:** {w.get('regime')} ({w.get('leverage')}x)")
+                st.markdown(f"**Entry Price:** `{safe_float(w.get('entry_price')):.5f}`")
+
+                # TP hladiny + executed stavy
+                tp1_hit = bool(w.get("tp1_hit", False))
+                tp2_hit = bool(w.get("tp2_hit", False))
+                tp1_txt = f"`{safe_float(w.get('tp1_price')):.5f}`  ✅ executed" if tp1_hit else f"`{safe_float(w.get('tp1_price')):.5f}`"
+                tp2_txt = f"`{safe_float(w.get('tp2_price')):.5f}`  ✅ executed" if tp2_hit else f"`{safe_float(w.get('tp2_price')):.5f}`"
+                st.markdown(f"**TP1:** {tp1_txt}")
+                st.markdown(f"**TP2:** {tp2_txt}")
+                st.markdown(f"**TP3 (Liq):** `{safe_float(w.get('tp3_price')):.5f}`")
+
+                # SL / TSL
+                tsl_active = bool(w.get("tsl_active", False))
+                sl_label = "🟢 TSL (Aktívny)" if tsl_active else "🔴 Hard SL"
+                st.markdown(f"**{sl_label}:** `{safe_float(w.get('sl_tsl_price')):.5f}`")
+
+                # DCA stavy + executed
+                dca1_p = safe_float(w.get("dca1_price"))
+                if dca1_p > 0:
+                    dca1_f = bool(w.get("dca1_filled", False))
+                    dca2_f = bool(w.get("dca2_filled", False))
+                    dca3_f = bool(w.get("dca3_filled", False))
+                    dca1_txt = f"`{dca1_p:.5f}`  ✅ executed" if dca1_f else f"`{dca1_p:.5f}`"
+                    dca2_txt = f"`{safe_float(w.get('dca2_price')):.5f}`  ✅ executed" if dca2_f else f"`{safe_float(w.get('dca2_price')):.5f}`"
+                    dca3_txt = f"`{safe_float(w.get('dca3_price')):.5f}`  ✅ executed" if dca3_f else f"`{safe_float(w.get('dca3_price')):.5f}`"
+                    st.markdown(f"**DCA1:** {dca1_txt}")
+                    st.markdown(f"**DCA2:** {dca2_txt}")
+                    st.markdown(f"**DCA3:** {dca3_txt}")
+
+                # Fáza obchodu (odvodená) – Fáza 1.5 = plynulý TSL medzi TP1 a TP2
+                if tp2_hit:
+                    phase = "🎯 Fáza 3 – Trailing po TP2"
+                elif tp1_hit:
+                    phase = "🔒 Fáza 1.5 – Plynulý TSL (medzi TP1 a TP2)"
+                else:
+                    phase = "⏳ Fáza 1 – Čaká na TP1"
+                st.caption(phase)
+
+                # Live PnL
+                pnl_u = safe_float(w.get("pnl_usd"))
+                pnl_p = safe_float(w.get("pnl_percent"))
+                st.metric("Live PnL", f"${pnl_u:+.3f} USD", f"{pnl_p:+.2f} %")
+
+                # Počiatočný Kelly vklad (nemenný margin_usd z otvorenia)
+                st.markdown(
+                    f"**Počiatočný vklad (Kelly):** ${safe_float(w.get('margin_usd')):.2f} USD"
+                )
+                # Aktuálna zostávajúca marža po scale-outoch (ak je dostupná)
+                act_m = safe_float(w.get("active_margin"))
+                if act_m > 0:
+                    st.caption(f"Aktívna marža (po scale-out): ${act_m:.2f} USD")
+
+                # Updated_at ak existuje
+                updated = w.get("updated_at")
+                if updated:
+                    st.caption(f"Posledný update: {updated}")
+            else:
+                st.caption("Stav: Čaká na vhodný signál z Cloudu 1...")
+
+
+render_live_position_cards()
+
+# -------------------------------------------------------------------------
+# 3. HLAVNÁ PLOCHA: 4 VEĽKÉ SVIEČKOVÉ GRAFY (riadený refresh podľa timeframe)
+# -------------------------------------------------------------------------
+
+
+@st.fragment(run_every="1s")
+def render_market_charts():
+    """Grafy sa prekresľujú každú 1s (hladiny/TSL), ale OKX sviečky len raz za 15m / 1m."""
+    import time as _time
+
+    st.subheader("📊 Živé Trhové Grafy & Exekučné Hladiny")
+    btc_options = get_btc_options_with_friday_reset()
+
+    # Live symboly a hladiny z active_positions
+    try:
+        pos_res_charts = supabase.table("active_positions").select("*").order("window_id").execute()
+        chart_windows = {r["window_id"]: r for r in pos_res_charts.data} if pos_res_charts.data else {}
+    except Exception:
+        chart_windows = active_windows
+
+    tf = timeframe  # z outer scope (sidebar radio)
+    refresh_sec = 900 if tf == "15m" else 60  # 15 min vs 1 min
+    now_ts = _time.time()
+
+    for wid in (1, 2, 3, 4):
+        w = chart_windows.get(wid, {})
+        status = w.get("status", "WAITING")
+        sym = w.get("symbol") or ("BTCUSDT" if wid == 1 else None)
+
+        st.markdown(f"### {window_titles[wid]} — `{sym if sym else 'SKENUJEM TRH...'}`")
+        if not sym:
+            st.info("Skener v Cloude 1 momentálne hľadá najlepšiu príležitosť pre toto okno.")
+            continue
+
+        cache_key = f"kline_cache_{wid}_{sym}_{tf}"
+        ts_key = f"kline_ts_{wid}_{sym}_{tf}"
+        last_ts = float(st.session_state.get(ts_key, 0.0))
+        need_fetch = (now_ts - last_ts) >= refresh_sec or cache_key not in st.session_state
+
+        if need_fetch:
+            df_k = fetch_visual_klines(sym, tf)
+            if not df_k.empty:
+                st.session_state[cache_key] = df_k
+                st.session_state[ts_key] = now_ts
+            else:
+                df_k = st.session_state.get(cache_key, pd.DataFrame())
+        else:
+            df_k = st.session_state.get(cache_key, pd.DataFrame())
+
+        if df_k is None or (isinstance(df_k, pd.DataFrame) and df_k.empty):
+            st.warning(f"Nepodarilo sa načítať sviečky pre {sym} z OKX API.")
+            continue
+
+        fig = go.Figure(data=[go.Candlestick(
+            x=df_k["time"], open=df_k["o"], high=df_k["h"], low=df_k["l"], close=df_k["c"],
+            name=sym
+        )])
+
+        # --- Y-rozsah: prioritne okolo ceny (sviečky + entry/TP/SL/DCA) ---
+        price_low = float(df_k["l"].min())
+        price_high = float(df_k["h"].max())
+
+        # Vykreslenie opčných stien pre BTC (Okno 1)
+        if wid == 1 and btc_options:
+            fig.add_hline(y=btc_options["call_wall"], line_dash="dot", line_color="cyan",
+                          annotation_text="Call Wall", annotation_position="top left")
+            fig.add_hline(y=btc_options["put_wall"], line_dash="dot", line_color="magenta",
+                          annotation_text="Put Wall", annotation_position="top left")
+            fig.add_hline(y=btc_options["max_pain"], line_dash="dash", line_color="yellow",
+                          annotation_text="Max Pain", annotation_position="top left")
+
+        # Vykreslenie živých obchodných hladín z Cloudu 1
         if status == "ACTIVE":
-            dir_icon = "🟢 LONG" if w.get("direction") == "LONG" else "🔴 SHORT"
-            st.markdown(f"**Smer:** {dir_icon} | **Režim:** {w.get('regime')} ({w.get('leverage')}x)")
-            st.markdown(f"**Entry Price:** `{safe_float(w.get('entry_price')):.5f}`")
+            entry = safe_float(w.get("entry_price"))
+            tp1 = safe_float(w.get("tp1_price"))
+            tp2 = safe_float(w.get("tp2_price"))
+            tp3 = safe_float(w.get("tp3_price"))
+            sl = safe_float(w.get("sl_tsl_price"))
 
-            # TP hladiny + executed stavy
+            fig.add_hline(y=entry, line_color="white", line_width=2, annotation_text="ENTRY")
+
             tp1_hit = bool(w.get("tp1_hit", False))
             tp2_hit = bool(w.get("tp2_hit", False))
-            tp1_txt = f"`{safe_float(w.get('tp1_price')):.5f}`  ✅ executed" if tp1_hit else f"`{safe_float(w.get('tp1_price')):.5f}`"
-            tp2_txt = f"`{safe_float(w.get('tp2_price')):.5f}`  ✅ executed" if tp2_hit else f"`{safe_float(w.get('tp2_price')):.5f}`"
-            st.markdown(f"**TP1:** {tp1_txt}")
-            st.markdown(f"**TP2:** {tp2_txt}")
-            st.markdown(f"**TP3 (Liq):** `{safe_float(w.get('tp3_price')):.5f}`")
 
-            # SL / TSL
+            fig.add_hline(
+                y=tp1, line_dash="dash", line_color="#00ff88",
+                line_width=3 if tp1_hit else 1.5,
+                annotation_text="TP1 executed" if tp1_hit else "TP1"
+            )
+            fig.add_hline(
+                y=tp2, line_dash="dash", line_color="#00cc66",
+                line_width=3 if tp2_hit else 1.5,
+                annotation_text="TP2 executed" if tp2_hit else "TP2"
+            )
+            fig.add_hline(y=tp3, line_dash="dash", line_color="#009944", annotation_text="TP3")
+
             tsl_active = bool(w.get("tsl_active", False))
-            sl_label = "🟢 TSL (Aktívny)" if tsl_active else "🔴 Hard SL"
-            st.markdown(f"**{sl_label}:** `{safe_float(w.get('sl_tsl_price')):.5f}`")
+            sl_txt = "TSL" if tsl_active else "SL"
+            fig.add_hline(y=sl, line_color="#ff3355", line_width=2, annotation_text=sl_txt)
 
-            # DCA stavy + executed
             dca1_p = safe_float(w.get("dca1_price"))
             if dca1_p > 0:
                 dca1_f = bool(w.get("dca1_filled", False))
                 dca2_f = bool(w.get("dca2_filled", False))
                 dca3_f = bool(w.get("dca3_filled", False))
-                dca1_txt = f"`{dca1_p:.5f}`  ✅ executed" if dca1_f else f"`{dca1_p:.5f}`"
-                dca2_txt = f"`{safe_float(w.get('dca2_price')):.5f}`  ✅ executed" if dca2_f else f"`{safe_float(w.get('dca2_price')):.5f}`"
-                dca3_txt = f"`{safe_float(w.get('dca3_price')):.5f}`  ✅ executed" if dca3_f else f"`{safe_float(w.get('dca3_price')):.5f}`"
-                st.markdown(f"**DCA1:** {dca1_txt}")
-                st.markdown(f"**DCA2:** {dca2_txt}")
-                st.markdown(f"**DCA3:** {dca3_txt}")
 
-            # Fáza obchodu (odvodená)
-            if tp2_hit:
-                phase = "🎯 Fáza 3 – Trailing po TP2"
-            elif tp1_hit:
-                phase = "🔒 Fáza 2 – Break-even lock (TP1 executed)"
-            else:
-                phase = "⏳ Fáza 1 – Čaká na TP1"
-            st.caption(phase)
+                fig.add_hline(
+                    y=dca1_p,
+                    line_dash="solid" if dca1_f else "dot",
+                    line_color="orange",
+                    line_width=2 if dca1_f else 1,
+                    annotation_text="DCA1 executed" if dca1_f else "DCA1"
+                )
+                fig.add_hline(
+                    y=safe_float(w.get("dca2_price")),
+                    line_dash="solid" if dca2_f else "dot",
+                    line_color="orange",
+                    line_width=2 if dca2_f else 1,
+                    annotation_text="DCA2 executed" if dca2_f else "DCA2"
+                )
+                fig.add_hline(
+                    y=safe_float(w.get("dca3_price")),
+                    line_dash="solid" if dca3_f else "dot",
+                    line_color="orange",
+                    line_width=2 if dca3_f else 1,
+                    annotation_text="DCA3 executed" if dca3_f else "DCA3"
+                )
 
-            # Live PnL
-            pnl_u = safe_float(w.get("pnl_usd"))
-            pnl_p = safe_float(w.get("pnl_percent"))
-            st.metric("Live PnL", f"${pnl_u:+.3f} USD", f"{pnl_p:+.2f} %")
+            level_prices = [p for p in [entry, tp1, tp2, tp3, sl, dca1_p,
+                                        safe_float(w.get("dca2_price")),
+                                        safe_float(w.get("dca3_price"))] if p > 0]
+            if level_prices:
+                price_low = min(price_low, min(level_prices))
+                price_high = max(price_high, max(level_prices))
 
-            # Updated_at ak existuje
-            updated = w.get("updated_at")
-            if updated:
-                st.caption(f"Posledný update: {updated}")
-        else:
-            st.caption("Stav: Čaká na vhodný signál z Cloudu 1...")
+            entry_ts = None
+            for key in ("opened_at", "entry_time", "created_at", "updated_at"):
+                raw_ts = w.get(key)
+                if raw_ts:
+                    try:
+                        entry_ts = pd.to_datetime(raw_ts, utc=True)
+                        break
+                    except Exception:
+                        continue
+            if entry_ts is None and not df_k.empty:
+                entry_ts = df_k["time"].iloc[0]
 
-# -------------------------------------------------------------------------
-# 3. HLAVNÁ PLOCHA: 4 VEĽKÉ SVIEČKOVÉ GRAFY VERTIKÁLNE POD SEBOU
-# -------------------------------------------------------------------------
-st.subheader("📊 Živé Trhové Grafy & Exekučné Hladiny")
-btc_options = get_btc_options_with_friday_reset()
+            if entry_ts is not None:
+                fig.add_vline(
+                    x=entry_ts,
+                    line_color="white",
+                    line_width=2,
+                    line_dash="solid",
+                    annotation_text="OPEN",
+                    annotation_position="top"
+                )
 
-for wid in (1, 2, 3, 4):
-    w = active_windows.get(wid, {})
-    status = w.get("status", "WAITING")
-    sym = w.get("symbol") or ("BTCUSDT" if wid == 1 else None)
+        pad = max((price_high - price_low) * 0.08, price_high * 0.002)
+        y_min = price_low - pad
+        y_max = price_high + pad
 
-    st.markdown(f"### {window_titles[wid]} — `{sym if sym else 'SKENUJEM TRH...'}`")
-    if not sym:
-        st.info("Skener v Cloude 1 momentálne hľadá najlepšiu príležitosť pre toto okno.")
-        continue
-
-    df_k = fetch_visual_klines(sym, timeframe)
-    if df_k.empty:
-        st.warning(f"Nepodarilo sa načítať sviečky pre {sym} z OKX API.")
-        continue
-
-    fig = go.Figure(data=[go.Candlestick(
-        x=df_k["time"], open=df_k["o"], high=df_k["h"], low=df_k["l"], close=df_k["c"],
-        name=sym
-    )])
-
-    # --- Y-rozsah: prioritne okolo ceny (sviečky + entry/TP/SL/DCA), aby graf nebol stlačený ---
-    # Opčné steny (call/put wall) môžu byť veľmi ďaleko → nechávame ich mimo default view.
-    # Po odzoomovaní (zoom out) budú stále viditeľné.
-    price_low = float(df_k["l"].min())
-    price_high = float(df_k["h"].max())
-
-    # Vykreslenie opčných stien pre BTC (Okno 1) – len ako referencie, mimo auto-range
-    if wid == 1 and btc_options:
-        fig.add_hline(y=btc_options["call_wall"], line_dash="dot", line_color="cyan",
-                      annotation_text="Call Wall", annotation_position="top left")
-        fig.add_hline(y=btc_options["put_wall"], line_dash="dot", line_color="magenta",
-                      annotation_text="Put Wall", annotation_position="top left")
-        fig.add_hline(y=btc_options["max_pain"], line_dash="dash", line_color="yellow",
-                      annotation_text="Max Pain", annotation_position="top left")
-
-    # Vykreslenie živých obchodných hladín z Cloudu 1
-    if status == "ACTIVE":
-        entry = safe_float(w.get("entry_price"))
-        tp1 = safe_float(w.get("tp1_price"))
-        tp2 = safe_float(w.get("tp2_price"))
-        tp3 = safe_float(w.get("tp3_price"))
-        sl = safe_float(w.get("sl_tsl_price"))
-
-        # Horizontálna ENTRY (cena)
-        fig.add_hline(y=entry, line_color="white", line_width=2, annotation_text="ENTRY")
-
-        # TP1 / TP2 – zelené, ak už hitnuté tak hrubšie / iný štýl
-        tp1_hit = bool(w.get("tp1_hit", False))
-        tp2_hit = bool(w.get("tp2_hit", False))
-
-        fig.add_hline(
-            y=tp1, line_dash="dash", line_color="#00ff88",
-            line_width=3 if tp1_hit else 1.5,
-            annotation_text="TP1 executed" if tp1_hit else "TP1"
+        fig.update_layout(
+            height=520,
+            xaxis_rangeslider_visible=False,
+            template="plotly_dark",
+            margin=dict(l=10, r=10, t=20, b=10),
+            yaxis=dict(
+                range=[y_min, y_max],
+                autorange=False,
+                fixedrange=False
+            )
         )
-        fig.add_hline(
-            y=tp2, line_dash="dash", line_color="#00cc66",
-            line_width=3 if tp2_hit else 1.5,
-            annotation_text="TP2 executed" if tp2_hit else "TP2"
-        )
-        fig.add_hline(y=tp3, line_dash="dash", line_color="#009944", annotation_text="TP3")
+        st.plotly_chart(fig, use_container_width=True)
 
-        tsl_active = bool(w.get("tsl_active", False))
-        sl_txt = "TSL" if tsl_active else "SL"
-        fig.add_hline(y=sl, line_color="#ff3355", line_width=2, annotation_text=sl_txt)
-
-        # DCA hladiny – oranžové, filled = plná čiara + "executed"
-        dca1_p = safe_float(w.get("dca1_price"))
-        if dca1_p > 0:
-            dca1_f = bool(w.get("dca1_filled", False))
-            dca2_f = bool(w.get("dca2_filled", False))
-            dca3_f = bool(w.get("dca3_filled", False))
-
-            fig.add_hline(
-                y=dca1_p,
-                line_dash="solid" if dca1_f else "dot",
-                line_color="orange",
-                line_width=2 if dca1_f else 1,
-                annotation_text="DCA1 executed" if dca1_f else "DCA1"
-            )
-            fig.add_hline(
-                y=safe_float(w.get("dca2_price")),
-                line_dash="solid" if dca2_f else "dot",
-                line_color="orange",
-                line_width=2 if dca2_f else 1,
-                annotation_text="DCA2 executed" if dca2_f else "DCA2"
-            )
-            fig.add_hline(
-                y=safe_float(w.get("dca3_price")),
-                line_dash="solid" if dca3_f else "dot",
-                line_color="orange",
-                line_width=2 if dca3_f else 1,
-                annotation_text="DCA3 executed" if dca3_f else "DCA3"
-            )
-
-        # Rozšírenie y-range o obchodné hladiny (entry/TP/SL/DCA), nie o vzdialené walls
-        level_prices = [p for p in [entry, tp1, tp2, tp3, sl, dca1_p,
-                                    safe_float(w.get("dca2_price")),
-                                    safe_float(w.get("dca3_price"))] if p > 0]
-        if level_prices:
-            price_low = min(price_low, min(level_prices))
-            price_high = max(price_high, max(level_prices))
-
-        # Biela VERTIKÁLNA čiara = otváracia cena / čas vstupu do obchodu (všetky 4 okná)
-        # Preferujeme opened_at / entry_time / created_at; fallback = prvá sviečka v dátach
-        entry_ts = None
-        for key in ("opened_at", "entry_time", "created_at", "updated_at"):
-            raw_ts = w.get(key)
-            if raw_ts:
-                try:
-                    entry_ts = pd.to_datetime(raw_ts, utc=True)
-                    break
-                except Exception:
-                    continue
-        if entry_ts is None and not df_k.empty:
-            entry_ts = df_k["time"].iloc[0]
-
-        if entry_ts is not None:
-            fig.add_vline(
-                x=entry_ts,
-                line_color="white",
-                line_width=2,
-                line_dash="solid",
-                annotation_text="OPEN",
-                annotation_position="top"
-            )
-
-    # Padding okolo ceny, aby sviečky neboli nalepené na okraj
-    pad = max((price_high - price_low) * 0.08, price_high * 0.002)
-    y_min = price_low - pad
-    y_max = price_high + pad
-
-    fig.update_layout(
-        height=520,
-        xaxis_rangeslider_visible=False,
-        template="plotly_dark",
-        margin=dict(l=10, r=10, t=20, b=10),
-        yaxis=dict(
-            range=[y_min, y_max],
-            autorange=False,          # pevný range okolo ceny – walls sú mimo, po zoom out ich uvidíš
-            fixedrange=False          # používateľ môže stále zoomovať / panovať
-        )
+    next_in = max(0, int(refresh_sec - (now_ts - float(st.session_state.get(
+        f"kline_ts_1_{(chart_windows.get(1, {}).get('symbol') or 'BTCUSDT')}_{tf}", now_ts
+    )))))
+    st.caption(
+        f"Sviečky: refresh každých {refresh_sec // 60} min ({tf}) • "
+        f"Hladiny/TSL: live 1s • OKX rate-limit ochrana aktívna"
     )
-    st.plotly_chart(fig, use_container_width=True)
+
+
+render_market_charts()
 
 st.divider()
-st.caption("Shark Alpha Cockpit Cloud 2 • Opravená verzia – y-range okolo ceny (walls mimo default view) / biela OPEN v-line / DCA filled / TP hit stavy")
+st.caption(
+    "Shark Alpha Cockpit Cloud 2 • Scale-out 50/30/20 • Fáza 1.5 plynulý TSL • "
+    "1s sidebar fragment • riadený refresh grafov podľa timeframe"
+)
