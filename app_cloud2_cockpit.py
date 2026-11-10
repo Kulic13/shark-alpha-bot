@@ -153,38 +153,8 @@ try:
     pos_res = supabase.table("active_positions").select("*").order("window_id").execute()
     active_windows = {r["window_id"]: r for r in pos_res.data} if pos_res.data else {}
 except Exception as e:
-    st.warning(f"active_positions nedostupné ({e}) – skúšam bot_vault_state")
+    st.error(f"Chyba načítania active_positions: {e}")
     active_windows = {}
-
-# Záložný zdroj živých pozícií + opened_at z Cloudu 1 (bot_vault_state)
-vault_windows = {}
-try:
-    vault_res = supabase.table("bot_vault_state").select("state_json").eq("id", 1).execute()
-    if vault_res.data and vault_res.data[0].get("state_json"):
-        vault_windows = vault_res.data[0]["state_json"].get("windows", {}) or {}
-except Exception:
-    vault_windows = {}
-
-# Ak active_positions je prázdne, postav okná z vaultu
-if not active_windows and vault_windows:
-    for k, v in vault_windows.items():
-        try:
-            wid_i = int(k)
-        except (TypeError, ValueError):
-            continue
-        row = dict(v) if isinstance(v, dict) else {}
-        row["window_id"] = wid_i
-        active_windows[wid_i] = row
-
-# Doplň opened_at z vaultu do active_windows (živá OPEN čiara / sidebar)
-for wid_i, row in list(active_windows.items()):
-    if row.get("opened_at"):
-        continue
-    vw = vault_windows.get(str(wid_i)) or vault_windows.get(wid_i) or {}
-    if isinstance(vw, dict) and vw.get("opened_at"):
-        row = dict(row)
-        row["opened_at"] = vw["opened_at"]
-        active_windows[wid_i] = row
 
 try:
     hist_res = supabase.table("trade_history").select("*").order("id", desc=False).execute()
@@ -210,9 +180,15 @@ with top_col1:
     if not history_df.empty:
         curr_bal = safe_float(history_df["current_balance"].iloc[-1], 100.0)
         total_pnl = curr_bal - 100.0
-        win_trades = len(history_df[history_df["pnl_usd"] > 0])
-        fail_trades = len(history_df[history_df["pnl_usd"] <= 0])
-        total_trades = len(history_df)
+        # Scale-out riadky (TP1/TP2) nie sú samostatné obchody – filtrujeme ich z počítania WR
+        if "exit_reason" in history_df.columns:
+            final_mask = ~history_df["exit_reason"].isin(["TP1_SCALE_OUT", "TP2_SCALE_OUT"])
+            final_df = history_df[final_mask]
+        else:
+            final_df = history_df
+        total_trades = len(final_df)
+        win_trades = len(final_df[final_df["pnl_usd"] > 0]) if total_trades > 0 else 0
+        fail_trades = len(final_df[final_df["pnl_usd"] <= 0]) if total_trades > 0 else 0
         wr_total = (win_trades / total_trades) * 100.0 if total_trades > 0 else 0.0
 
         # Nerealizované PnL – IBA aktívne pozície
@@ -229,23 +205,24 @@ with top_col1:
         m3.metric("Nerealizované PnL", f"${unrealized:+.2f}")
 
         # ----- SUMÁR ŠTATISTIKY: TP / DCA / EXIT REASON -----
+        # Hit/DCA počty berieme z finálnych uzavretí (bez scale-out riadkov), aby sa nenafukovali
         st.markdown("##### 📊 Sumár štatistiky obchodov")
         s1, s2, s3 = st.columns(3)
 
         with s1:
             st.markdown("**Take Profit hits**")
-            tp1_n = int(history_df["tp1_hit"].fillna(False).astype(bool).sum()) if "tp1_hit" in history_df.columns else 0
-            tp2_n = int(history_df["tp2_hit"].fillna(False).astype(bool).sum()) if "tp2_hit" in history_df.columns else 0
-            tp3_n = int((history_df["exit_reason"] == "TP3_LIQUIDATION_HIT").sum()) if "exit_reason" in history_df.columns else 0
+            tp1_n = int(final_df["tp1_hit"].fillna(False).astype(bool).sum()) if "tp1_hit" in final_df.columns else 0
+            tp2_n = int(final_df["tp2_hit"].fillna(False).astype(bool).sum()) if "tp2_hit" in final_df.columns else 0
+            tp3_n = int((final_df["exit_reason"] == "TP3_LIQUIDATION_HIT").sum()) if "exit_reason" in final_df.columns else 0
             st.write(f"TP1 executed: **{tp1_n}** / {total_trades}")
             st.write(f"TP2 executed: **{tp2_n}** / {total_trades}")
             st.write(f"TP3 hit (close): **{tp3_n}** / {total_trades}")
 
         with s2:
             st.markdown("**DCA fills**")
-            dca1_n = int(history_df["dca1_filled"].fillna(False).astype(bool).sum()) if "dca1_filled" in history_df.columns else 0
-            dca2_n = int(history_df["dca2_filled"].fillna(False).astype(bool).sum()) if "dca2_filled" in history_df.columns else 0
-            dca3_n = int(history_df["dca3_filled"].fillna(False).astype(bool).sum()) if "dca3_filled" in history_df.columns else 0
+            dca1_n = int(final_df["dca1_filled"].fillna(False).astype(bool).sum()) if "dca1_filled" in final_df.columns else 0
+            dca2_n = int(final_df["dca2_filled"].fillna(False).astype(bool).sum()) if "dca2_filled" in final_df.columns else 0
+            dca3_n = int(final_df["dca3_filled"].fillna(False).astype(bool).sum()) if "dca3_filled" in final_df.columns else 0
             st.write(f"DCA1 filled: **{dca1_n}** / {total_trades}")
             st.write(f"DCA2 filled: **{dca2_n}** / {total_trades}")
             st.write(f"DCA3 filled: **{dca3_n}** / {total_trades}")
@@ -253,21 +230,26 @@ with top_col1:
         with s3:
             st.markdown("**Dôvod zatvorenia**")
             if "exit_reason" in history_df.columns:
+                # Zobraziť všetky dôvody vrátane scale-outov (informácie o priebežných výberoch)
                 reason_counts = history_df["exit_reason"].fillna("UNKNOWN").value_counts()
                 reason_labels = {
                     "HARD_SL_HIT": "🔴 Hard SL",
                     "TRAILING_SL_PROFIT": "🟢 Trailing SL (zisk)",
                     "TP3_LIQUIDATION_HIT": "🎯 TP3",
                     "EARLY_ORDERFLOW_ESCAPE": "⚠️ Early OF escape",
+                    "TP1_SCALE_OUT": "🟦 TP1 Scale-out 50%",
+                    "TP2_SCALE_OUT": "🟦 TP2 Scale-out 30%",
                 }
+                hist_n = max(1, len(history_df))
                 for reason, cnt in reason_counts.items():
                     label = reason_labels.get(str(reason), str(reason))
-                    pct = (cnt / total_trades) * 100.0
+                    pct = (cnt / hist_n) * 100.0
                     st.write(f"{label}: **{cnt}** ({pct:.0f}%)")
             else:
                 st.caption("exit_reason ešte nie je v histórii")
 
-        # Equity krivka – preferujeme closed_at, potom updated_at, inak id
+        # Equity krivka – KAŽDÝ bod vrátane TP1/TP2 scale-outov (zubovitý rast kapitálu)
+        # Preferujeme closed_at, potom updated_at, inak id
         if "closed_at" in history_df.columns and history_df["closed_at"].notna().any():
             x_col = "closed_at"
         elif "updated_at" in history_df.columns and history_df["updated_at"].notna().any():
@@ -324,18 +306,6 @@ for wid in (1, 2, 3, 4):
         if status == "ACTIVE":
             dir_icon = "🟢 LONG" if w.get("direction") == "LONG" else "🔴 SHORT"
             st.markdown(f"**Smer:** {dir_icon} | **Režim:** {w.get('regime')} ({w.get('leverage')}x)")
-
-            # Čas otvorenia – NAD Entry Price (pevný opened_at z Cloudu 1)
-            opened_raw = w.get("opened_at")
-            if opened_raw:
-                try:
-                    opened_dt = pd.to_datetime(opened_raw, utc=True)
-                    st.markdown(f"**Otvorené:** `{opened_dt.strftime('%Y-%m-%d %H:%M:%S')} UTC`")
-                except Exception:
-                    st.markdown(f"**Otvorené:** `{opened_raw}`")
-            else:
-                st.caption("Otvorené: — (čaká na opened_at z Cloudu 1)")
-
             st.markdown(f"**Entry Price:** `{safe_float(w.get('entry_price')):.5f}`")
 
             # TP hladiny + executed stavy
@@ -495,15 +465,19 @@ for wid in (1, 2, 3, 4):
             price_low = min(price_low, min(level_prices))
             price_high = max(price_high, max(level_prices))
 
-        # Biela VERTIKÁLNA čiara = pevnú čas otvorenia obchodu (všetky 4 okná)
-        # IBA opened_at – updated_at / created_at by čiaru posúvali v čase
+        # Biela VERTIKÁLNA čiara = otváracia cena / čas vstupu do obchodu (všetky 4 okná)
+        # Preferujeme opened_at / entry_time / created_at; fallback = prvá sviečka v dátach
         entry_ts = None
-        raw_ts = w.get("opened_at")
-        if raw_ts:
-            try:
-                entry_ts = pd.to_datetime(raw_ts, utc=True)
-            except Exception:
-                entry_ts = None
+        for key in ("opened_at", "entry_time", "created_at", "updated_at"):
+            raw_ts = w.get(key)
+            if raw_ts:
+                try:
+                    entry_ts = pd.to_datetime(raw_ts, utc=True)
+                    break
+                except Exception:
+                    continue
+        if entry_ts is None and not df_k.empty:
+            entry_ts = df_k["time"].iloc[0]
 
         if entry_ts is not None:
             fig.add_vline(
