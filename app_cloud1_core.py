@@ -1155,6 +1155,19 @@ async def run_core_cycle(vault: dict):
                     db_dirty = True
 
             if pos.get("tp1_hit", False) and not pos.get("tp2_hit", False):
+                # Fáza 1.5: plynulé vlečenie TSL medzi TP1 a TP2 (NATR šum 0.65x)
+                if is_long and curr_price > pos["extreme_price"]:
+                    pos["extreme_price"] = curr_price
+                elif not is_long and curr_price < pos["extreme_price"]:
+                    pos["extreme_price"] = curr_price
+
+                step_pct = (0.65 * natr) / 100.0
+                new_tsl = pos["extreme_price"] * (1.0 - dir_mult * step_pct)
+                if (is_long and new_tsl > pos["sl_tsl_price"]) or (not is_long and new_tsl < pos["sl_tsl_price"]):
+                    pos["sl_tsl_price"] = new_tsl
+                    db_dirty = True
+
+                # Kontrola dosiahnutia TP2 (pôvodná scale-out logika 30 % / zvyšok 20 %)
                 if (is_long and curr_price >= pos["tp2_price"]) or (not is_long and curr_price <= pos["tp2_price"]):
                     cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
                     gross_pnl_pct = ((curr_price - pos["entry_price"]) / pos["entry_price"]) * dir_mult * pos["leverage"] * 100.0
@@ -1246,6 +1259,8 @@ async def run_core_cycle(vault: dict):
                 safe_supabase_upsert("active_positions", {
                     "window_id": win_id, "status": "ACTIVE", "symbol": sym, "direction": pos["direction"],
                     "regime": pos["regime"], "leverage": pos["leverage"], "entry_price": pos["entry_price"],
+                    "margin_usd": pos.get("margin_usd", 0.0),
+                    "active_margin": pos.get("active_margin", 0.0),
                     "dca1_price": pos["dca1_price"], "dca2_price": pos["dca2_price"], "dca3_price": pos["dca3_price"],
                     "dca1_filled": pos.get("dca1_filled", False),
                     "dca2_filled": pos.get("dca2_filled", False),
