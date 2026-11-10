@@ -126,6 +126,42 @@ def safe_supabase_upsert(table: str, data: dict, vault: dict):
             "data": data
         })
 
+
+def push_active_position_row(pos: dict, vault: dict, extra: dict | None = None):
+    """Okamžitý zápis ACTIVE pozície do Supabase vrátane margin_usd / active_margin (Kelly)."""
+    row = {
+        "window_id": int(pos["window_id"]),
+        "status": "ACTIVE",
+        "symbol": pos.get("symbol"),
+        "direction": pos.get("direction"),
+        "regime": pos.get("regime"),
+        "leverage": pos.get("leverage"),
+        "entry_price": pos.get("entry_price"),
+        "margin_usd": float(pos.get("margin_usd") or 0.0),
+        "active_margin": float(pos.get("active_margin") or 0.0),
+        "dca1_price": pos.get("dca1_price", 0.0),
+        "dca2_price": pos.get("dca2_price", 0.0),
+        "dca3_price": pos.get("dca3_price", 0.0),
+        "dca1_filled": bool(pos.get("dca1_filled", False)),
+        "dca2_filled": bool(pos.get("dca2_filled", False)),
+        "dca3_filled": bool(pos.get("dca3_filled", False)),
+        "tp1_price": pos.get("tp1_price", 0.0),
+        "tp2_price": pos.get("tp2_price", 0.0),
+        "tp3_price": pos.get("tp3_price", 0.0),
+        "tp1_hit": bool(pos.get("tp1_hit", False)),
+        "tp2_hit": bool(pos.get("tp2_hit", False)),
+        "sl_tsl_price": pos.get("sl_tsl_price", 0.0),
+        "tsl_active": bool(pos.get("tsl_active", False)),
+        "pnl_usd": float(pos.get("live_pnl_usd") or pos.get("pnl_usd") or 0.0),
+        "pnl_percent": float(pos.get("live_pnl_pct") or pos.get("pnl_percent") or 0.0),
+        "mandate_expires_at": pos.get("mandate_expires_at"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if extra:
+        row.update(extra)
+    safe_supabase_upsert("active_positions", row, vault)
+
+
 def flush_pending_sync(vault: dict):
     if not vault.get("pending_supabase_sync"):
         return
@@ -1029,12 +1065,53 @@ def build_trade_setup(cand: dict, balance: float, window_id: int) -> dict | None
     }
 
 # =========================================================================
+# NY OPEN LOCK & SL-SHIELD (14:00–15:30 UTC = 15:00–16:30 SEČ)
+# =========================================================================
+def is_ny_open_lock(now_dt: datetime) -> bool:
+    """Polopropustný zámek: True v intervalu [14:00, 15:30) UTC."""
+    minutes = now_dt.hour * 60 + now_dt.minute
+    return (14 * 60) <= minutes < (15 * 60 + 30)
+
+
+async def apply_ny_sl_shield(client: httpx.AsyncClient, pos: dict, klines_cache: dict) -> bool:
+    """Jednorázově odsunout SL za extrémní knoty (20×15m). Vrátí True pokud se SL posunul."""
+    sym = pos.get("symbol")
+    if not sym:
+        return False
+    klines = await fetch_okx_klines(client, sym, "15m", 25, klines_cache)
+    if len(klines) < 10:
+        return False
+    recent = klines[-20:] if len(klines) >= 20 else klines
+    lows = [float(get_low(k)) for k in recent]
+    highs = [float(get_high(k)) for k in recent]
+    is_long = pos.get("direction") == "LONG"
+    old_sl = float(pos.get("sl_tsl_price") or 0.0)
+    if is_long:
+        emergency_sl = min(lows) * 0.995
+        # Větší prostor = nižší SL (dál od ceny); nikdy nepřibližovat
+        if old_sl <= 0 or emergency_sl < old_sl:
+            pos["sl_tsl_price"] = emergency_sl
+            pos["ny_shield_sl"] = emergency_sl
+            return True
+    else:
+        emergency_sl = max(highs) * 1.005
+        # Větší prostor = vyšší SL; nikdy nepřibližovat
+        if old_sl <= 0 or emergency_sl > old_sl:
+            pos["sl_tsl_price"] = emergency_sl
+            pos["ny_shield_sl"] = emergency_sl
+            return True
+    return False
+
+
+# =========================================================================
 # HLAVNÁ AUTONÓMNA SLUČKA JADRA (ODĽAHČENÝ 1-SEKUNDOVÝ REŽIM)
 # =========================================================================
 async def run_core_cycle(vault: dict):
     now_ts = time.time()
     now_dt = datetime.now(timezone.utc)
     db_dirty = False  # Sleduje, či nastala kritická udalosť vyžadujúca okamžitý zápis do cloudu
+    ny_lock = is_ny_open_lock(now_dt)
+    vault["ny_open_lock"] = ny_lock
 
     active_windows = [
         (win_key, pos) for win_key, pos in vault["windows"].items()
@@ -1055,6 +1132,18 @@ async def run_core_cycle(vault: dict):
         active_syms_list = [pos["symbol"] for _, pos in active_windows]
         active_tickers = await fetch_active_tickers_only(client, active_syms_list) if active_syms_list else {}
         klines_cache = {}
+
+        # NY Open SL-Shield: jednorázově při vstupu do zóny 14:00–15:30 UTC (1× denně)
+        shield_day = now_dt.strftime("%Y-%m-%d")
+        if ny_lock and vault.get("ny_shield_applied_date") != shield_day and active_windows:
+            for _wk, _pos in active_windows:
+                try:
+                    moved = await apply_ny_sl_shield(client, _pos, klines_cache)
+                    if moved:
+                        db_dirty = True
+                except Exception:
+                    pass
+            vault["ny_shield_applied_date"] = shield_day
 
         for win_key, pos in active_windows:
             win_id = int(win_key)
@@ -1275,114 +1364,122 @@ async def run_core_cycle(vault: dict):
                 }, vault)
 
         # 2. Hlavný 3-minútový skener celého trhu (sťahuje všetky tickery a OI len raz za 180s)
+        # NY Open Lock: v 14:00–15:30 UTC neskenerujeme ani neotvárame nové okná
         if is_scan_due:
             vault["last_main_scan"] = now_ts
             db_dirty = True
+            if ny_lock:
+                # Zámek aktivní – přeskoč snapshot + kandidáty, management pozic běží dál výše
+                pass
+            else:
+                tickers, oi_map = await fetch_market_snapshot(client)
+                update_24h_oi_metrics(tickers, oi_map)
 
-            tickers, oi_map = await fetch_market_snapshot(client)
-            update_24h_oi_metrics(tickers, oi_map)
+                btc_klines = await fetch_okx_klines(client, "BTCUSDT", "15m", 25, klines_cache)
+                btc_veto = evaluate_btc_veto(btc_klines)
+                vault["last_btc_veto"] = btc_veto
 
-            btc_klines = await fetch_okx_klines(client, "BTCUSDT", "15m", 25, klines_cache)
-            btc_veto = evaluate_btc_veto(btc_klines)
-            vault["last_btc_veto"] = btc_veto
+                active_syms = {p["symbol"] for p in vault["windows"].values() if p["status"] == "ACTIVE" and p["symbol"]}
+                sectors_map = get_sectors_map()
+                active_secs = {sectors_map.get(s, "UNKNOWN") for s in active_syms}
 
-            active_syms = {p["symbol"] for p in vault["windows"].values() if p["status"] == "ACTIVE" and p["symbol"]}
-            sectors_map = get_sectors_map()
-            active_secs = {sectors_map.get(s, "UNKNOWN") for s in active_syms}
+                # ===== BTC WINDOW 1 – MAKROKOTVA (3-vrstvová smerová logika) =====
+                # BTC má stabilnejší OFD než altcoiny → prahy bližšie k 1.0 + silný OFD bez farby
+                if vault["windows"]["1"]["status"] == "WAITING" and len(btc_klines) >= 20:
+                    last_btc = btc_klines[-1]
+                    is_15m_green = float(get_close(last_btc)) > float(get_open(last_btc))
+                    btc_ofd = compute_ofd_from_klines(btc_klines)
 
-            # ===== BTC WINDOW 1 – MAKROKOTVA (3-vrstvová smerová logika) =====
-            # BTC má stabilnejší OFD než altcoiny → prahy bližšie k 1.0 + silný OFD bez farby
-            if vault["windows"]["1"]["status"] == "WAITING" and len(btc_klines) >= 20:
-                last_btc = btc_klines[-1]
-                is_15m_green = float(get_close(last_btc)) > float(get_open(last_btc))
-                btc_ofd = compute_ofd_from_klines(btc_klines)
+                    direction = None
+                    is_trap = False
 
-                direction = None
-                is_trap = False
+                    # Vrstva A: funding trap (zriedkavé, ale vysoká edge)
+                    if not is_15m_green and btc_ofd < 1.00:
+                        funding_rate = await fetch_okx_funding(client, "BTCUSDT")
+                        if funding_rate > 0.0008:
+                            direction = "SHORT"
+                            is_trap = True
+                    if direction is None and is_15m_green and btc_ofd > 1.05:
+                        funding_rate = await fetch_okx_funding(client, "BTCUSDT")
+                        if funding_rate < -0.0015:
+                            direction = "LONG"
+                            is_trap = True
 
-                # Vrstva A: funding trap (zriedkavé, ale vysoká edge)
-                if not is_15m_green and btc_ofd < 1.00:
-                    funding_rate = await fetch_okx_funding(client, "BTCUSDT")
-                    if funding_rate > 0.0008:
-                        direction = "SHORT"
-                        is_trap = True
-                if direction is None and is_15m_green and btc_ofd > 1.05:
-                    funding_rate = await fetch_okx_funding(client, "BTCUSDT")
-                    if funding_rate < -0.0015:
-                        direction = "LONG"
-                        is_trap = True
+                    # Vrstva B: momentum (OFD + farba sviečky) – hlavný kanál
+                    if direction is None:
+                        if btc_ofd >= 1.08 and is_15m_green:
+                            direction = "LONG"
+                        elif btc_ofd <= 0.92 and not is_15m_green:
+                            direction = "SHORT"
 
-                # Vrstva B: momentum (OFD + farba sviečky) – hlavný kanál
-                if direction is None:
-                    if btc_ofd >= 1.08 and is_15m_green:
-                        direction = "LONG"
-                    elif btc_ofd <= 0.92 and not is_15m_green:
-                        direction = "SHORT"
+                    # Vrstva C: silný orderflow bez farby (OFD vedie cenu na BTC)
+                    if direction is None:
+                        if btc_ofd >= 1.20:
+                            direction = "LONG"
+                        elif btc_ofd <= 0.80:
+                            direction = "SHORT"
 
-                # Vrstva C: silný orderflow bez farby (OFD vedie cenu na BTC)
-                if direction is None:
-                    if btc_ofd >= 1.20:
-                        direction = "LONG"
-                    elif btc_ofd <= 0.80:
-                        direction = "SHORT"
-
-                if direction and check_anti_extreme_shield(btc_klines, direction, is_pd=False, is_btc=True):
-                    ok_exec, exec_price = await verify_execution_confirmation_btc(
-                        client, "BTCUSDT", direction, btc_klines, btc_ofd, klines_cache
-                    )
-                    if ok_exec:
-                        setup = build_trade_setup(
-                            {
-                                "symbol": "BTCUSDT",
-                                "direction": direction,
-                                "is_pd": False,
-                                "is_funding_trap": is_trap,
-                                "klines": btc_klines,
-                                "exec_price": exec_price
-                            },
-                            vault["balance"],
-                            1
+                    if direction and check_anti_extreme_shield(btc_klines, direction, is_pd=False, is_btc=True):
+                        ok_exec, exec_price = await verify_execution_confirmation_btc(
+                            client, "BTCUSDT", direction, btc_klines, btc_ofd, klines_cache
                         )
+                        if ok_exec:
+                            setup = build_trade_setup(
+                                {
+                                    "symbol": "BTCUSDT",
+                                    "direction": direction,
+                                    "is_pd": False,
+                                    "is_funding_trap": is_trap,
+                                    "klines": btc_klines,
+                                    "exec_price": exec_price
+                                },
+                                vault["balance"],
+                                1
+                            )
+                            if setup:
+                                vault["windows"]["1"] = setup
+                                push_active_position_row(setup, vault)
+                                active_syms.add("BTCUSDT")
+
+                if vault["windows"]["2"]["status"] == "WAITING":
+                    cands_a = await evaluate_candidates(
+                        client, tickers, oi_map, active_syms, active_secs,
+                        10_000_000, 1e12, btc_veto, klines_cache, is_pd_mode=False
+                    )
+                    for c in cands_a:
+                        setup = build_trade_setup(c, vault["balance"], 2)
                         if setup:
-                            vault["windows"]["1"] = setup
-                            active_syms.add("BTCUSDT")
+                            vault["windows"]["2"] = setup
+                            push_active_position_row(setup, vault)
+                            active_syms.add(c["symbol"])
+                            active_secs.add(c["sector"])
+                            break
 
-            if vault["windows"]["2"]["status"] == "WAITING":
-                cands_a = await evaluate_candidates(
-                    client, tickers, oi_map, active_syms, active_secs,
-                    10_000_000, 1e12, btc_veto, klines_cache, is_pd_mode=False
-                )
-                for c in cands_a:
-                    setup = build_trade_setup(c, vault["balance"], 2)
-                    if setup:
-                        vault["windows"]["2"] = setup
-                        active_syms.add(c["symbol"])
-                        active_secs.add(c["sector"])
-                        break
+                if vault["windows"]["3"]["status"] == "WAITING":
+                    cands_b = await evaluate_candidates(
+                        client, tickers, oi_map, active_syms, active_secs,
+                        5_000_000, 9_999_999, btc_veto, klines_cache, is_pd_mode=False
+                    )
+                    for c in cands_b:
+                        setup = build_trade_setup(c, vault["balance"], 3)
+                        if setup:
+                            vault["windows"]["3"] = setup
+                            push_active_position_row(setup, vault)
+                            active_syms.add(c["symbol"])
+                            active_secs.add(c["sector"])
+                            break
 
-            if vault["windows"]["3"]["status"] == "WAITING":
-                cands_b = await evaluate_candidates(
-                    client, tickers, oi_map, active_syms, active_secs,
-                    5_000_000, 9_999_999, btc_veto, klines_cache, is_pd_mode=False
-                )
-                for c in cands_b:
-                    setup = build_trade_setup(c, vault["balance"], 3)
-                    if setup:
-                        vault["windows"]["3"] = setup
-                        active_syms.add(c["symbol"])
-                        active_secs.add(c["sector"])
-                        break
-
-            if vault["windows"]["4"]["status"] == "WAITING":
-                cands_c = await evaluate_candidates(
-                    client, tickers, oi_map, active_syms, active_secs,
-                    1_000_000, 4_999_999, btc_veto, klines_cache, is_pd_mode=True
-                )
-                for c in cands_c:
-                    setup = build_trade_setup(c, vault["balance"], 4)
-                    if setup:
-                        vault["windows"]["4"] = setup
-                        break
+                if vault["windows"]["4"]["status"] == "WAITING":
+                    cands_c = await evaluate_candidates(
+                        client, tickers, oi_map, active_syms, active_secs,
+                        1_000_000, 4_999_999, btc_veto, klines_cache, is_pd_mode=True
+                    )
+                    for c in cands_c:
+                        setup = build_trade_setup(c, vault["balance"], 4)
+                        if setup:
+                            vault["windows"]["4"] = setup
+                            push_active_position_row(setup, vault)
+                            break
 
     # Uloženie trezoru: lokálne vždy (0 ms), do cloudu Supabase len pri zmene alebo raz za 10 sekúnd
     need_cloud_sync = db_dirty or (now_ts - vault.get("last_db_sync", 0)) >= 10.0
@@ -1421,6 +1518,7 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
     vault["windows"][str(win_id)] = {"status": "WAITING", "symbol": "BTCUSDT" if win_id == 1 else None, "mandate_until": 0}
     safe_supabase_upsert("active_positions", {
         "window_id": win_id, "status": "WAITING", "symbol": None, "entry_price": 0.0,
+        "margin_usd": 0.0, "active_margin": 0.0,
         "tp1_price": 0.0, "tp2_price": 0.0, "tp3_price": 0.0, "sl_tsl_price": 0.0,
         "pnl_usd": 0.0, "pnl_percent": 0.0, "updated_at": datetime.now(timezone.utc).isoformat()
     }, vault)
