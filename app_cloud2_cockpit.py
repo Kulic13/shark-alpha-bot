@@ -457,39 +457,62 @@ for wid in (1, 2, 3, 4, 5, 6):
             price_low = min(price_low, min(level_prices))
             price_high = max(price_high, max(level_prices))
 
-        # Biela VERTIKÁLNA čiara = čas otvorenia obchodu (OPEN)
-        # Používame výhradne opened_at (z core1). updated_at / prvá sviečka = klamlivé.
+        # Biela VERTIKÁLNA čiara = skutočný čas otvorenia obchodu z core1
+        # Priorita: opened_at → (mandate_expires_at - 30 min). Nikdy updated_at / prvá sviečka.
         entry_ts = None
-        raw_ts = w.get("opened_at") or w.get("entry_time") or w.get("created_at")
-        if raw_ts:
+        source = None
+
+        raw_opened = w.get("opened_at")
+        if raw_opened:
             try:
-                entry_ts = pd.to_datetime(raw_ts, utc=True)
+                entry_ts = pd.to_datetime(raw_opened, utc=True)
+                source = "opened_at"
             except Exception:
                 entry_ts = None
 
-        # Ak máme platný timestamp a spadá do rozsahu grafu, vykreslíme
+        # Fallback: mandate je vždy entry+30min → vieme spätne spočítať open time
+        if entry_ts is None:
+            raw_mandate = w.get("mandate_expires_at")
+            if raw_mandate:
+                try:
+                    mandate_ts = pd.to_datetime(raw_mandate, utc=True)
+                    entry_ts = mandate_ts - pd.Timedelta(minutes=30)
+                    source = "mandate-30m"
+                except Exception:
+                    entry_ts = None
+
         if entry_ts is not None and not df_k.empty:
+            # Zjednotenie timezone s osou X grafu (UTC)
+            if entry_ts.tzinfo is None:
+                entry_ts = entry_ts.tz_localize("UTC")
+            else:
+                entry_ts = entry_ts.tz_convert("UTC")
+
             t_min = df_k["time"].min()
             t_max = df_k["time"].max()
-            # ak je open mimo aktuálneho okna sviečok, posunieme anotáciu na okraj
+
             if entry_ts < t_min:
                 x_draw = t_min
-                ann = "OPEN (pred grafom)"
+                ann = f"OPEN ({source}, pred grafom)"
             elif entry_ts > t_max:
                 x_draw = t_max
-                ann = "OPEN (za grafom)"
+                ann = f"OPEN ({source}, za grafom)"
             else:
                 x_draw = entry_ts
-                ann = "OPEN"
+                ann = f"OPEN ({source})"
 
             fig.add_vline(
                 x=x_draw,
                 line_color="white",
-                line_width=2,
+                line_width=2.5,
                 line_dash="solid",
                 annotation_text=ann,
                 annotation_position="top"
             )
+            # Debug info pod grafom – uvidíš presný čas z DB
+            st.caption(f"OPEN timestamp: `{entry_ts}`  | zdroj: `{source}`  | raw opened_at: `{raw_opened}`")
+        else:
+            st.caption("OPEN čiara: chýba `opened_at` aj `mandate_expires_at` v active_positions – core1 ešte neuložil čas otvorenia.")
 
     # Padding okolo ceny, aby sviečky neboli nalepené na okraj
     pad = max((price_high - price_low) * 0.08, price_high * 0.002)
