@@ -47,6 +47,7 @@ def get_default_vault() -> dict:
         },
         "last_main_scan": 0,
         "last_db_sync": 0,
+        "last_heartbeat": 0,
         "last_btc_veto": {
             "veto_long": False,
             "veto_short": False,
@@ -65,6 +66,7 @@ def load_vault() -> dict:
                 if "windows" in state and "balance" in state:
                     state.setdefault("last_main_scan", 0)
                     state.setdefault("last_db_sync", 0)
+                    state.setdefault("last_heartbeat", 0)
                     state.setdefault("pending_supabase_sync", [])
                     state.setdefault("natr_history_30d", [])
                     state.setdefault("last_btc_veto", {
@@ -87,6 +89,7 @@ def load_vault() -> dict:
             state = res.data[0]["state_json"]
             state.setdefault("last_main_scan", 0)
             state.setdefault("last_db_sync", 0)
+            state.setdefault("last_heartbeat", 0)
             state.setdefault("pending_supabase_sync", [])
             state.setdefault("natr_history_30d", [])
             state.setdefault("last_btc_veto", {
@@ -1806,10 +1809,72 @@ def update_live_pnl_metrics(pos: dict, curr_price: float, dir_mult: float, win_i
 # INTEGRACE LOGIKY 2.0: MANAGEMENT POZIC (SHADOW OBI, AMEND, REŽIMOVÝ TSL)
 # =========================================================================
 
+
+# Maximálny čas offline (sekundy). Ak appka spí/offline dlhšie, pozície sa mažú.
+STALE_POSITION_MAX_SEC = 600  # 10 minút
+
+
+def purge_stale_open_positions(vault: dict, reason: str = "APP_OFFLINE_GT_10MIN") -> int:
+    """
+    Ak od posledného heartbeat-u ubehlo > 10 minút, všetky ACTIVE pozície sa
+    vymažú z vault-u aj z active_positions. Nezapisujú sa do trade_history
+    (nie je to riadne zatvorenie obchodu, ale výpadok appky).
+    Vracia počet zmazaných pozícií.
+    """
+    now_ts = time.time()
+    last_hb = float(vault.get("last_heartbeat") or 0)
+    # Ak heartbeat ešte nikdy nebol, nastav teraz a nič nemaž
+    if last_hb <= 0:
+        vault["last_heartbeat"] = now_ts
+        return 0
+    if (now_ts - last_hb) <= STALE_POSITION_MAX_SEC:
+        return 0
+
+    purged = 0
+    windows = vault.get("windows", {})
+    for key in ("1", "2", "3", "4", "5", "6"):
+        pos = windows.get(key) or {}
+        if pos.get("status") == "ACTIVE" and pos.get("symbol"):
+            purged += 1
+        windows[key] = {
+            "status": "WAITING",
+            "symbol": "BTCUSDT" if key == "1" else None,
+            "mandate_until": 0,
+        }
+    vault["windows"] = windows
+    vault["last_heartbeat"] = now_ts
+
+    # Vyčisti DB active_positions
+    try:
+        sync_all_windows_to_db(vault)
+    except Exception:
+        for key in ("1", "2", "3", "4", "5", "6"):
+            try:
+                push_waiting_window_row(int(key), vault)
+            except Exception:
+                pass
+
+    try:
+        save_vault(vault, sync_cloud=True)
+    except Exception:
+        save_vault_local(vault)
+
+    return purged
+
+
 async def run_core_cycle(vault: dict):
     now_ts = time.time()
     now_dt = datetime.now(timezone.utc)
-    db_dirty = False  
+    db_dirty = False
+
+    # Ak appka bola offline > 10 min, zmaž otvorené pozície (bez zápisu do histórie)
+    purged = purge_stale_open_positions(vault)
+    if purged > 0:
+        db_dirty = True
+
+    # Heartbeat – doklad, že core1 práve beží
+    vault["last_heartbeat"] = now_ts
+
     ny_lock = is_ny_open_lock(now_dt)
     vault["ny_open_lock"] = ny_lock
 
@@ -2207,6 +2272,15 @@ def main_ui():
         st.session_state.vault = load_vault()
 
     vault = st.session_state.vault
+
+    # Pri otvorení stránky: ak offline > 10 min, zmaž visuté pozície
+    purged = purge_stale_open_positions(vault)
+    if purged > 0:
+        st.warning(
+            f"Appka bola offline viac ako 10 minút. "
+            f"Zmazaných otvorených pozícií: **{purged}** (neuložené do histórie)."
+        )
+        st.session_state.vault = vault
 
     # Horný panel – balance + ovládanie
     top1, top2, top3 = st.columns([2, 1, 1])
