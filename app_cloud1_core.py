@@ -1575,10 +1575,11 @@ async def verify_execution_confirmation_btc(
     if len(klines_15m) < 12:
         return False, 0.0
 
+    # Volume: stačí, že trh nie je mŕtvy (uvoľnené z 1.05 → 0.90)
     vols = [float(get_vol(k)) for k in klines_15m[-11:]]
     avg_prev_vol = float(np.mean(vols[:-1])) if len(vols) > 1 else 0.0
     curr_vol = vols[-1]
-    if avg_prev_vol > 0 and (curr_vol / avg_prev_vol) < 1.05:
+    if avg_prev_vol > 0 and (curr_vol / avg_prev_vol) < 0.90:
         return False, 0.0
 
     klines_1h = await fetch_okx_klines(client, symbol, "1H", 25, cache)
@@ -1586,9 +1587,10 @@ async def verify_execution_confirmation_btc(
         closes_1h = pd.Series([float(get_close(k)) for k in klines_1h])
         ema21_1h = float(closes_1h.ewm(span=21, adjust=False).mean().iloc[-1])
         last_1h_close = float(closes_1h.iloc[-1])
-        if direction == "LONG" and last_1h_close < ema21_1h and ofd < 1.50:
+        # Proti-trend len pri slabej OFD (mierne uvoľnené)
+        if direction == "LONG" and last_1h_close < ema21_1h and ofd < 1.25:
             return False, 0.0
-        if direction == "SHORT" and last_1h_close > ema21_1h and ofd > 0.65:
+        if direction == "SHORT" and last_1h_close > ema21_1h and ofd > 0.80:
             return False, 0.0
 
     inst_id = to_okx_inst_id(symbol)
@@ -1615,19 +1617,22 @@ async def verify_execution_confirmation_btc(
             return False, 0.0
 
         spread_pct = ((best_ask - best_bid) / best_bid) * 100.0
-        if spread_pct > 0.12:  # Přísnější spread limit pro makrokotvu BTC
+        if spread_pct > 0.18:  # uvoľnené z 0.12
             return False, 0.0
 
         wob_imbalance = calculate_weighted_order_book_imbalance(book)
         vpin_score = calculate_vpin_toxicity(klines_15m)
-        
-        if vpin_score > 0.70:  # Pro BTC je toxický práh stažen ještě níže
+
+        # Toxicita: stále blokuje extrém, ale nie bežný tok (0.70 → 0.82)
+        if vpin_score > 0.82:
             return False, 0.0
 
-        # Přísné hloubkové ověření pasivního flow pro BTC
-        if direction == "LONG" and wob_imbalance <= 0.10:  # Vyžaduje čistou nákupní převahu v knize
+        # WOB: už nevyžaduje silnú stenu, len blokuje jasný proti-tlak
+        # LONG: zamietni len ak sú ask steny výrazne silnejšie
+        if direction == "LONG" and wob_imbalance < -0.12:
             return False, 0.0
-        if direction == "SHORT" and wob_imbalance >= -0.10: # Vyžaduje čistou prodejní převahu v knize
+        # SHORT: zamietni len ak sú bid steny výrazne silnejšie
+        if direction == "SHORT" and wob_imbalance > 0.12:
             return False, 0.0
 
         exec_price = best_ask if direction == "LONG" else best_bid
@@ -2151,25 +2156,28 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
         btc_ofd = compute_ofd_from_klines(btc_klines)
         direction, is_trap = None, False
 
-        if not is_15m_green and btc_ofd < 1.00:
+        # Funding trap (mierne uvoľnené)
+        if not is_15m_green and btc_ofd < 1.02:
             funding_rate = await fetch_okx_funding(client, "BTCUSDT")
-            if funding_rate > 0.0008:
+            if funding_rate > 0.0005:
                 direction, is_trap = "SHORT", True
-        if direction is None and is_15m_green and btc_ofd > 1.05:
+        if direction is None and is_15m_green and btc_ofd > 1.02:
             funding_rate = await fetch_okx_funding(client, "BTCUSDT")
-            if funding_rate < -0.0015:
+            if funding_rate < -0.0008:
                 direction, is_trap = "LONG", True
 
+        # Smer + farba sviečky (uvoľnené z 1.08/0.92)
         if direction is None:
-            if btc_ofd >= 1.08 and is_15m_green:
+            if btc_ofd >= 1.04 and is_15m_green:
                 direction = "LONG"
-            elif btc_ofd <= 0.92 and not is_15m_green:
+            elif btc_ofd <= 0.96 and not is_15m_green:
                 direction = "SHORT"
 
+        # Čistý OFD bez farby – stále prísnejší, aby sme nelovili fake chop
         if direction is None:
-            if btc_ofd >= 1.20:
+            if btc_ofd >= 1.12:
                 direction = "LONG"
-            elif btc_ofd <= 0.80:
+            elif btc_ofd <= 0.88:
                 direction = "SHORT"
 
         if direction and check_anti_extreme_shield(btc_klines, direction, is_pd=False, is_btc=True):
