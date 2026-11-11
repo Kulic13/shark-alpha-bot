@@ -166,6 +166,7 @@ def push_active_position_row(pos: dict, vault: dict, extra: dict | None = None):
         "pnl_usd": float(pos.get("live_pnl_usd") or pos.get("pnl_usd") or 0.0),
         "pnl_percent": float(pos.get("live_pnl_pct") or pos.get("pnl_percent") or 0.0),
         "mandate_expires_at": pos.get("mandate_expires_at"),
+        "opened_at": pos.get("opened_at"),
         "updated_at": datetime.now(timezone.utc).isoformat(),
         # Verzia 2.0 Infrastruktúrne priradenie klientských ID pre AMEND protokoly
         "okx_entry_order_id": pos.get("okx_entry_order_id"),
@@ -1093,6 +1094,7 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
         "cached_ofd": initial_ofd,
         "last_ofd_check": time.time(),
         "tp3_zone_entered_at": None,  # pre min. čas v zóne pred Liquidation Climax
+        "opened_at": datetime.now(timezone.utc).isoformat(),  # čas otvorenia pozície (pre cockpit OPEN v-line)
         "mandate_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
         # Injektáž unikátních klientských ID pro atomické změny bez rušení příkazů
         "okx_entry_order_id": f"{tx_id}_ent_{window_id}",
