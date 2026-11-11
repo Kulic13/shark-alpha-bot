@@ -135,19 +135,92 @@ def safe_supabase_upsert(table: str, data: dict, vault: dict):
     Upsert do Supabase.
     Pre ai_mmr_matrix musí ísť conflict na (regime_x, regime_y),
     inak vznikajú duplicitné riadky a 'obrovská matica'.
+    Pre active_positions preferujeme UPDATE podľa window_id (spoľahlivejšie než čistý upsert).
     """
     try:
         if table == "ai_mmr_matrix":
             supabase.table(table).upsert(data, on_conflict="regime_x,regime_y").execute()
         elif table == "active_positions":
-            supabase.table(table).upsert(data, on_conflict="window_id").execute()
+            wid = data.get("window_id")
+            if wid is not None:
+                # 1) skús update existujúceho riadku
+                res = supabase.table(table).update(data).eq("window_id", int(wid)).execute()
+                # 2) ak nič neaktualizovalo (riadok neexistuje), urob upsert
+                if not res.data:
+                    supabase.table(table).upsert(data, on_conflict="window_id").execute()
+            else:
+                supabase.table(table).upsert(data, on_conflict="window_id").execute()
         else:
             supabase.table(table).upsert(data).execute()
-    except Exception:
+    except Exception as e:
+        # neschovávať chybu úplne – aspoň do pending + varovanie
+        try:
+            st.warning(f"Supabase upsert zlyhal ({table}): {e}")
+        except Exception:
+            pass
         vault.setdefault("pending_supabase_sync", []).append({
             "table": table,
             "op": "upsert",
             "data": data
+        })
+
+
+def force_clear_active_position(window_id: int, vault: dict):
+    """
+    Tvrdý clear jedného okna v active_positions.
+    Najprv UPDATE podľa window_id, pri zlyhaní do pending.
+    Zabraňuje situácii, keď cockpit stále vidí starú ACTIVE pozíciu po close.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    row = {
+        "window_id": int(window_id),
+        "status": "WAITING",
+        "symbol": "BTCUSDT" if int(window_id) == 1 else None,
+        "direction": None,
+        "regime": None,
+        "leverage": None,
+        "entry_price": None,
+        "margin_usd": 0.0,
+        "active_margin": 0.0,
+        "dca1_price": 0.0,
+        "dca2_price": 0.0,
+        "dca3_price": 0.0,
+        "dca1_filled": False,
+        "dca2_filled": False,
+        "dca3_filled": False,
+        "tp1_price": 0.0,
+        "tp2_price": 0.0,
+        "tp3_price": 0.0,
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "sl_tsl_price": 0.0,
+        "tsl_active": False,
+        "pnl_usd": 0.0,
+        "pnl_percent": 0.0,
+        "mandate_expires_at": None,
+        "opened_at": None,
+        "updated_at": now_iso,
+        "okx_entry_order_id": None,
+        "okx_sl_order_id": None,
+        "okx_tp1_order_id": None,
+        "okx_tp2_order_id": None,
+        "okx_tp3_order_id": None,
+    }
+    try:
+        # Priorita: priamy UPDATE – necháva 1 riadok, žiadne duplicity
+        res = supabase.table("active_positions").update(row).eq("window_id", int(window_id)).execute()
+        if not res.data:
+            # Riadok neexistoval → insert/upsert
+            supabase.table("active_positions").upsert(row, on_conflict="window_id").execute()
+    except Exception as e:
+        try:
+            st.warning(f"Clear active_positions window {window_id} zlyhal: {e}")
+        except Exception:
+            pass
+        vault.setdefault("pending_supabase_sync", []).append({
+            "table": "active_positions",
+            "op": "upsert",
+            "data": row
         })
 
 
@@ -264,7 +337,13 @@ def flush_pending_sync(vault: dict):
                 if tbl == "ai_mmr_matrix":
                     supabase.table(tbl).upsert(data, on_conflict="regime_x,regime_y").execute()
                 elif tbl == "active_positions":
-                    supabase.table(tbl).upsert(data, on_conflict="window_id").execute()
+                    wid = data.get("window_id")
+                    if wid is not None:
+                        res = supabase.table(tbl).update(data).eq("window_id", int(wid)).execute()
+                        if not res.data:
+                            supabase.table(tbl).upsert(data, on_conflict="window_id").execute()
+                    else:
+                        supabase.table(tbl).upsert(data, on_conflict="window_id").execute()
                 else:
                     supabase.table(tbl).upsert(data).execute()
             elif item["op"] == "insert":
@@ -1718,46 +1797,9 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
         "mandate_until": 0
     }
 
-    # DÔLEŽITÉ: uvoľniť aj riadok v Supabase active_positions
-    # (inak Cloud 2 / cockpit stále vidí starú ACTIVE pozíciu)
-    try:
-        closed_row = {
-            "window_id": int(pos["window_id"]),
-            "status": "WAITING",
-            "symbol": "BTCUSDT" if win_key == "1" else None,
-            "direction": None,
-            "regime": None,
-            "leverage": None,
-            "entry_price": None,
-            "margin_usd": 0.0,
-            "active_margin": 0.0,
-            "dca1_price": 0.0,
-            "dca2_price": 0.0,
-            "dca3_price": 0.0,
-            "dca1_filled": False,
-            "dca2_filled": False,
-            "dca3_filled": False,
-            "tp1_price": 0.0,
-            "tp2_price": 0.0,
-            "tp3_price": 0.0,
-            "tp1_hit": False,
-            "tp2_hit": False,
-            "sl_tsl_price": 0.0,
-            "tsl_active": False,
-            "pnl_usd": 0.0,
-            "pnl_percent": 0.0,
-            "mandate_expires_at": None,
-            "opened_at": None,
-            "updated_at": now_dt.isoformat(),
-            "okx_entry_order_id": None,
-            "okx_sl_order_id": None,
-            "okx_tp1_order_id": None,
-            "okx_tp2_order_id": None,
-            "okx_tp3_order_id": None,
-        }
-        safe_supabase_upsert("active_positions", closed_row, vault)
-    except Exception:
-        pass
+    # DÔLEŽITÉ: okamžitý hard-clear v Supabase active_positions
+    # (UPDATE podľa window_id – inak Cloud 2 / cockpit stále vidí starú ACTIVE pozíciu)
+    force_clear_active_position(int(pos["window_id"]), vault)
 
 
 def is_ny_open_lock(now_dt: datetime) -> bool:
