@@ -1984,3 +1984,120 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
                 vault["windows"]["6"] = setup
                 push_active_position_row(setup, vault)
                 break
+
+
+# =========================================================================
+# STREAMLIT UI (základné rozhranie – nezasahuje do core logiky vyššie)
+# =========================================================================
+
+def render_window_card(win_key: str, pos: dict):
+    """Jednoduchá karta pre jedno okno."""
+    status = pos.get("status", "WAITING")
+    symbol = pos.get("symbol") or "—"
+    direction = pos.get("direction", "")
+    leverage = pos.get("leverage", "—")
+    entry = pos.get("entry_price")
+    live_pnl_usd = pos.get("live_pnl_usd")
+    live_pnl_pct = pos.get("live_pnl_pct")
+    regime = pos.get("regime", "")
+    natr = pos.get("natr")
+
+    with st.container(border=True):
+        st.markdown(f"**Okno {win_key}**  |  `{status}`")
+        if status == "ACTIVE" and symbol:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.write(f"**{symbol}**")
+                st.caption(f"{direction} ×{leverage}  |  {regime}")
+            with col2:
+                if entry is not None:
+                    st.metric("Entry", f"{entry:.6g}")
+                if natr is not None:
+                    st.caption(f"NATR: {natr:.2f}%")
+            with col3:
+                if live_pnl_usd is not None:
+                    st.metric("Live PnL", f"{live_pnl_usd:+.2f} $", f"{live_pnl_pct:+.2f}%")
+        else:
+            st.caption("Čaká na signál…")
+
+
+def main_ui():
+    st.title("Shark Alpha Core – Paper Trade")
+    st.caption("Cloud 1 · OKX public data · Fiktívne obchody")
+
+    # Načítanie trezoru
+    if "vault" not in st.session_state:
+        st.session_state.vault = load_vault()
+
+    vault = st.session_state.vault
+
+    # Horný panel – balance + ovládanie
+    top1, top2, top3 = st.columns([2, 1, 1])
+    with top1:
+        st.metric("Balance (paper)", f"{vault.get('balance', 0):.2f} USDT")
+    with top2:
+        last_scan = vault.get("last_main_scan", 0)
+        if last_scan:
+            ago = int(time.time() - last_scan)
+            st.metric("Posledný scan", f"pred {ago}s")
+        else:
+            st.metric("Posledný scan", "—")
+    with top3:
+        ny_lock = vault.get("ny_open_lock", False)
+        st.metric("NY Lock", "AKTÍVNY" if ny_lock else "OFF")
+
+    st.divider()
+
+    # Tlačidlá
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        run_once = st.button("▶ Spustiť 1 cyklus", type="primary", use_container_width=True)
+    with c2:
+        auto_refresh = st.toggle("Auto-refresh (15s)", value=False)
+    with c3:
+        if st.button("🔄 Reload vault", use_container_width=True):
+            st.session_state.vault = load_vault()
+            st.rerun()
+
+    # Spustenie jadra
+    if run_once or auto_refresh:
+        with st.spinner("Beží core cyklus…"):
+            try:
+                asyncio.run(run_core_cycle(st.session_state.vault))
+                save_vault(st.session_state.vault, sync_cloud=True)
+            except Exception as e:
+                st.error(f"Chyba v core cykle: {e}")
+
+    st.divider()
+
+    # 6 okien
+    st.subheader("Obchodné okná")
+    cols = st.columns(3)
+    windows = vault.get("windows", {})
+    for i, win_key in enumerate(["1", "2", "3", "4", "5", "6"]):
+        with cols[i % 3]:
+            pos = windows.get(win_key, {"status": "WAITING"})
+            render_window_card(win_key, pos)
+
+    # BTC Veto info
+    st.divider()
+    btc_veto = vault.get("last_btc_veto", {})
+    v1, v2, v3, v4 = st.columns(4)
+    with v1:
+        st.metric("BTC 15m %", f"{btc_veto.get('btc_15m_pct', 0):+.3f}%")
+    with v2:
+        st.metric("BTC 1h %", f"{btc_veto.get('btc_1h_pct', 0):+.3f}%")
+    with v3:
+        st.metric("Veto LONG", "ÁNO" if btc_veto.get("veto_long") else "nie")
+    with v4:
+        st.metric("Veto SHORT", "ÁNO" if btc_veto.get("veto_short") else "nie")
+
+    # Auto-refresh
+    if auto_refresh:
+        time.sleep(15)
+        st.rerun()
+
+
+# Vstupný bod Streamlit
+if __name__ == "__main__" or True:  # Streamlit vždy spúšťa modul
+    main_ui()
