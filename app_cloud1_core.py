@@ -36,7 +36,7 @@ supabase = init_supabase()
 
 def get_default_vault() -> dict:
     return {
-        "balance": 100.0,
+        "balance": 1000.0,
         "windows": {
             "1": {"status": "WAITING", "symbol": "BTCUSDT", "mandate_until": 0},
             "2": {"status": "WAITING", "symbol": None, "mandate_until": 0},
@@ -675,80 +675,6 @@ def calculate_natr_14(klines: list) -> float:
     return float(natr)
 
 
-async def verify_execution_confirmation(
-    client: httpx.AsyncClient,
-    symbol: str,
-    direction: str,
-    klines_15m: list,
-    ofd: float,
-    is_pd: bool,
-    cache: dict
-) -> tuple[bool, float]:
-    if len(klines_15m) < 12:
-        return False, 0.0
-    vols = [float(get_vol(k)) for k in klines_15m[-11:]]
-    avg_prev_vol = float(np.mean(vols[:-1])) if len(vols) > 1 else 0.0
-    curr_vol = vols[-1]
-    if avg_prev_vol > 0 and (curr_vol / avg_prev_vol) < 1.10:
-        return False, 0.0
-    klines_1h = await fetch_okx_klines(client, symbol, "1H", 25, cache)
-    if len(klines_1h) >= 21:
-        closes_1h = pd.Series([float(get_close(k)) for k in klines_1h])
-        ema21_1h = float(closes_1h.ewm(span=21, adjust=False).mean().iloc[-1])
-        last_1h_close = float(closes_1h.iloc[-1])
-        if direction == "LONG" and last_1h_close < ema21_1h and ofd < 1.50:
-            return False, 0.0
-        if direction == "SHORT" and last_1h_close > ema21_1h and ofd > 0.65:
-            return False, 0.0
-    # Verzia 2.0 Inkorporace hluboké mikrostruktury do exekuce
-    micro = await fetch_hloubkova_mikrostruktura(client, symbol)
-    obi = micro["obi_hluboke"]
-    if direction == "LONG" and obi < 0.85:
-        return False, 0.0
-    if direction == "SHORT" and obi > 1.18:
-        return False, 0.0
-    ticker = await fetch_single_ticker(client, symbol)
-    if not ticker:
-        return False, 0.0
-    exec_price = float(ticker["askPx"]) if direction == "LONG" else float(ticker["bidPx"])
-    return True, exec_price
-
-async def verify_execution_confirmation_btc(
-    client: httpx.AsyncClient,
-    symbol: str,
-    direction: str,
-    klines_15m: list,
-    ofd: float,
-    cache: dict
-) -> tuple[bool, float]:
-    if len(klines_15m) < 12:
-        return False, 0.0
-    vols = [float(get_vol(k)) for k in klines_15m[-11:]]
-    avg_prev_vol = float(np.mean(vols[:-1])) if len(vols) > 1 else 0.0
-    curr_vol = vols[-1]
-    if avg_prev_vol > 0 and (curr_vol / avg_prev_vol) < 1.05:
-        return False, 0.0
-    klines_1h = await fetch_okx_klines(client, symbol, "1H", 25, cache)
-    if len(klines_1h) >= 21:
-        closes_1h = pd.Series([float(get_close(k)) for k in klines_1h])
-        ema21_1h = float(closes_1h.ewm(span=21, adjust=False).mean().iloc[-1])
-        last_1h_close = float(closes_1h.iloc[-1])
-        if direction == "LONG" and last_1h_close < ema21_1h and ofd < 1.50:
-            return False, 0.0
-        if direction == "SHORT" and last_1h_close > ema21_1h and ofd > 0.65:
-            return False, 0.0
-    micro = await fetch_hloubkova_mikrostruktura(client, symbol)
-    obi = micro["obi_hluboke"]
-    if direction == "LONG" and obi <= 1.15:
-        return False, 0.0
-    if direction == "SHORT" and obi >= 0.85:
-        return False, 0.0
-    ticker = await fetch_single_ticker(client, symbol)
-    if not ticker:
-        return False, 0.0
-    exec_price = float(ticker["askPx"]) if direction == "LONG" else float(ticker["bidPx"])
-    return True, exec_price
-
 def compute_ofd_from_klines(klines: list) -> float:
     if not klines:
         return 1.0
@@ -827,9 +753,9 @@ def evaluate_btc_veto(btc_klines: list) -> dict:
     btc_1h_pct = ((curr_close - open_1h_ago) / max(1e-9, open_1h_ago)) * 100.0
     result["btc_15m_pct"] = round(btc_15m_pct, 3)
     result["btc_1h_pct"] = round(btc_1h_pct, 3)
-    if btc_1h_pct < -0.80 or btc_15m_pct < -0.45:
+    if btc_1h_pct < -1.80 or btc_15m_pct < -0.90:
         result["veto_long"] = True
-    if btc_1h_pct > 0.80 or btc_15m_pct > 0.45:
+    if btc_1h_pct > 1.80 or btc_15m_pct > 0.90:
         result["veto_short"] = True
     return result
 
@@ -877,8 +803,8 @@ def check_anti_extreme_shield(klines: list, direction: str, is_pd: bool = False,
         rsi_high, rsi_low = 75.0, 25.0
         skip_bb = True
     else:
-        max_atr_dist = 1.3
-        rsi_high, rsi_low = 68.0, 32.0
+        max_atr_dist = 2.0
+        rsi_high, rsi_low = 75.0, 25.0
         skip_bb = False
     bb_upper = ema_20 + (2.0 * std_20)
     bb_lower = ema_20 - (2.0 * std_20)
@@ -1158,7 +1084,7 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
     # 1. Výpočet NATR a kontrola extrémních limitů šumu  (OPRAVENÉ: skutočný ATR/NATR z 15m)
     natr = calculate_natr_14(klines)
     max_natr = 9.0 if is_pd else 5.5
-    if natr > max_natr or natr < 0.3 or np.isnan(natr):
+    if natr > max_natr or natr < 0.12 or np.isnan(natr):
         return None
 
     # 2. Určení souřadnic v MMR matici
