@@ -190,6 +190,65 @@ def push_active_position_row(pos: dict, vault: dict, extra: dict | None = None):
     safe_supabase_upsert("active_positions", row, vault)
 
 
+def push_waiting_window_row(window_id: int, vault: dict):
+    """Nastaví okno v active_positions na WAITING (vyčistené)."""
+    row = {
+        "window_id": int(window_id),
+        "status": "WAITING",
+        "symbol": "BTCUSDT" if int(window_id) == 1 else None,
+        "direction": None,
+        "regime": None,
+        "leverage": None,
+        "entry_price": None,
+        "margin_usd": 0.0,
+        "active_margin": 0.0,
+        "dca1_price": 0.0,
+        "dca2_price": 0.0,
+        "dca3_price": 0.0,
+        "dca1_filled": False,
+        "dca2_filled": False,
+        "dca3_filled": False,
+        "tp1_price": 0.0,
+        "tp2_price": 0.0,
+        "tp3_price": 0.0,
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "sl_tsl_price": 0.0,
+        "tsl_active": False,
+        "pnl_usd": 0.0,
+        "pnl_percent": 0.0,
+        "mandate_expires_at": None,
+        "opened_at": None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "okx_entry_order_id": None,
+        "okx_sl_order_id": None,
+        "okx_tp1_order_id": None,
+        "okx_tp2_order_id": None,
+        "okx_tp3_order_id": None,
+    }
+    safe_supabase_upsert("active_positions", row, vault)
+
+
+def sync_all_windows_to_db(vault: dict):
+    """
+    Kompletná synchronizácia 6 okien vault → active_positions.
+    Volá sa na konci každého cyklu, aby cockpit vždy videl rovnaký stav ako core1.
+    """
+    windows = vault.get("windows", {})
+    for key in ("1", "2", "3", "4", "5", "6"):
+        pos = windows.get(key) or {}
+        status = pos.get("status", "WAITING")
+        wid = int(key)
+        if status == "ACTIVE" and pos.get("symbol"):
+            # doplň window_id ak chýba
+            if "window_id" not in pos:
+                pos = dict(pos)
+                pos["window_id"] = wid
+            push_active_position_row(pos, vault)
+        else:
+            push_waiting_window_row(wid, vault)
+
+
 def flush_pending_sync(vault: dict):
     if not vault.get("pending_supabase_sync"):
         return
@@ -1961,10 +2020,15 @@ async def run_core_cycle(vault: dict):
         if is_scan_due:
             await process_global_market_scanning(client, vault, now_ts, ny_lock, klines_cache)
 
-        need_cloud_sync = db_dirty or (now_ts - vault.get("last_db_sync", 0)) >= 10.0
-        if need_cloud_sync:
-            flush_pending_sync(vault)
-            save_vault(vault, sync_cloud=need_cloud_sync)
+        # VŽDY zosúlaď active_positions s vault-om (cockpit musí vidieť rovnaký počet obchodov)
+        try:
+            sync_all_windows_to_db(vault)
+        except Exception:
+            pass
+
+        need_cloud_sync = True  # po sync vždy ulož vault
+        flush_pending_sync(vault)
+        save_vault(vault, sync_cloud=need_cloud_sync)
 
 
 async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict, now_ts: float, ny_lock: bool, klines_cache: dict):
