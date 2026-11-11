@@ -457,27 +457,37 @@ for wid in (1, 2, 3, 4, 5, 6):
             price_low = min(price_low, min(level_prices))
             price_high = max(price_high, max(level_prices))
 
-        # Biela VERTIKÁLNA čiara = otváracia cena / čas vstupu do obchodu (všetky 4 okná)
-        # Preferujeme opened_at / entry_time / created_at; fallback = prvá sviečka v dátach
+        # Biela VERTIKÁLNA čiara = čas otvorenia obchodu (OPEN)
+        # Používame výhradne opened_at (z core1). updated_at / prvá sviečka = klamlivé.
         entry_ts = None
-        for key in ("opened_at", "entry_time", "created_at", "updated_at"):
-            raw_ts = w.get(key)
-            if raw_ts:
-                try:
-                    entry_ts = pd.to_datetime(raw_ts, utc=True)
-                    break
-                except Exception:
-                    continue
-        if entry_ts is None and not df_k.empty:
-            entry_ts = df_k["time"].iloc[0]
+        raw_ts = w.get("opened_at") or w.get("entry_time") or w.get("created_at")
+        if raw_ts:
+            try:
+                entry_ts = pd.to_datetime(raw_ts, utc=True)
+            except Exception:
+                entry_ts = None
 
-        if entry_ts is not None:
+        # Ak máme platný timestamp a spadá do rozsahu grafu, vykreslíme
+        if entry_ts is not None and not df_k.empty:
+            t_min = df_k["time"].min()
+            t_max = df_k["time"].max()
+            # ak je open mimo aktuálneho okna sviečok, posunieme anotáciu na okraj
+            if entry_ts < t_min:
+                x_draw = t_min
+                ann = "OPEN (pred grafom)"
+            elif entry_ts > t_max:
+                x_draw = t_max
+                ann = "OPEN (za grafom)"
+            else:
+                x_draw = entry_ts
+                ann = "OPEN"
+
             fig.add_vline(
-                x=entry_ts,
+                x=x_draw,
                 line_color="white",
                 line_width=2,
                 line_dash="solid",
-                annotation_text="OPEN",
+                annotation_text=ann,
                 annotation_position="top"
             )
 
