@@ -291,10 +291,13 @@ window_titles = {
 for wid in (1, 2, 3, 4, 5, 6):
     w = active_windows.get(wid, {})
     status = w.get("status", "WAITING")
-    # Window 1 defaultne BTCUSDT aj keď WAITING
-    sym = w.get("symbol") or ("BTCUSDT" if wid == 1 else "HĽADÁM...")
+    # Symbol len ak je obchod ACTIVE; inak placeholder
+    if status == "ACTIVE" and w.get("symbol"):
+        sym = w.get("symbol")
+    else:
+        sym = "—" if status != "ACTIVE" else (w.get("symbol") or "—")
 
-    with st.sidebar.expander(f"{window_titles[wid]} | {sym}", expanded=True):
+    with st.sidebar.expander(f"{window_titles[wid]} | {sym}", expanded=(status == "ACTIVE")):
         if status == "ACTIVE":
             dir_icon = "🟢 LONG" if w.get("direction") == "LONG" else "🔴 SHORT"
             st.markdown(f"**Smer:** {dir_icon} | **Režim:** {w.get('regime')} ({w.get('leverage')}x)")
@@ -357,12 +360,16 @@ btc_options = get_btc_options_with_friday_reset()
 for wid in (1, 2, 3, 4, 5, 6):
     w = active_windows.get(wid, {})
     status = w.get("status", "WAITING")
-    sym = w.get("symbol") or ("BTCUSDT" if wid == 1 else None)
+    sym = w.get("symbol") if status == "ACTIVE" else None
 
-    st.markdown(f"### {window_titles[wid]} — `{sym if sym else 'SKENUJEM TRH...'}`")
-    if not sym:
-        st.info("Skener v Cloude 1 momentálne hľadá najlepšiu príležitosť pre toto okno.")
+    # Graf a hladiny SA KRESLIA LEN PRI AKTÍVNOM OBCHODE
+    # (žiadny predvolený BTC graf, keď okno 1 čaká)
+    if status != "ACTIVE" or not sym:
+        with st.expander(f"{window_titles[wid]} — čaká na signál", expanded=False):
+            st.caption("Žiadny aktívny obchod v tomto okne. Graf sa zobrazí po otvorení pozície z Cloudu 1.")
         continue
+
+    st.markdown(f"### {window_titles[wid]} — `{sym}`")
 
     df_k = fetch_visual_klines(sym, timeframe)
     if df_k.empty:
@@ -457,12 +464,12 @@ for wid in (1, 2, 3, 4, 5, 6):
             price_low = min(price_low, min(level_prices))
             price_high = max(price_high, max(level_prices))
 
-        # Biela VERTIKÁLNA čiara = skutočný čas otvorenia obchodu z core1
-        # Priorita: opened_at → (mandate_expires_at - 30 min). Nikdy updated_at / prvá sviečka.
+        # Biela VERTIKÁLNA čiara = moment otvorenia obchodu (z core1)
+        # Priorita: opened_at → mandate_expires_at - 30min. Žiadny updated_at / prvá sviečka.
         entry_ts = None
         source = None
-
         raw_opened = w.get("opened_at")
+
         if raw_opened:
             try:
                 entry_ts = pd.to_datetime(raw_opened, utc=True)
@@ -470,7 +477,6 @@ for wid in (1, 2, 3, 4, 5, 6):
             except Exception:
                 entry_ts = None
 
-        # Fallback: mandate je vždy entry+30min → vieme spätne spočítať open time
         if entry_ts is None:
             raw_mandate = w.get("mandate_expires_at")
             if raw_mandate:
@@ -482,37 +488,45 @@ for wid in (1, 2, 3, 4, 5, 6):
                     entry_ts = None
 
         if entry_ts is not None and not df_k.empty:
-            # Zjednotenie timezone s osou X grafu (UTC)
-            if entry_ts.tzinfo is None:
+            if getattr(entry_ts, "tzinfo", None) is None:
                 entry_ts = entry_ts.tz_localize("UTC")
             else:
                 entry_ts = entry_ts.tz_convert("UTC")
 
+            # Zjednoť typ s osou X (candles sú UTC datetime)
+            if str(df_k["time"].dtype).startswith("datetime64"):
+                x_val = entry_ts
+            else:
+                x_val = entry_ts
+
             t_min = df_k["time"].min()
             t_max = df_k["time"].max()
+            in_range = (entry_ts >= t_min) and (entry_ts <= t_max)
 
-            if entry_ts < t_min:
-                x_draw = t_min
-                ann = f"OPEN ({source}, pred grafom)"
-            elif entry_ts > t_max:
-                x_draw = t_max
-                ann = f"OPEN ({source}, za grafom)"
-            else:
-                x_draw = entry_ts
-                ann = f"OPEN ({source})"
-
-            fig.add_vline(
-                x=x_draw,
-                line_color="white",
-                line_width=2.5,
-                line_dash="solid",
-                annotation_text=ann,
-                annotation_position="top"
+            # Spoľahlivejší vline cez shape (lepšia zhoda datetime s Plotly candlestick)
+            fig.add_shape(
+                type="line",
+                x0=x_val, x1=x_val,
+                y0=0, y1=1,
+                yref="paper",
+                line=dict(color="white", width=2, dash="solid"),
             )
-            # Debug info pod grafom – uvidíš presný čas z DB
-            st.caption(f"OPEN timestamp: `{entry_ts}`  | zdroj: `{source}`  | raw opened_at: `{raw_opened}`")
+            fig.add_annotation(
+                x=x_val,
+                y=1,
+                yref="paper",
+                text="OPEN" if in_range else "OPEN (mimo rozsahu grafu)",
+                showarrow=False,
+                yanchor="bottom",
+                font=dict(color="white", size=12),
+            )
+            st.caption(
+                f"Otvorené: **{entry_ts.strftime('%Y-%m-%d %H:%M:%S')} UTC**"
+                f"  | zdroj: `{source}`"
+                + ("" if in_range else "  | ⚠ čas je mimo načítaných sviečok – priblíž/oddial časovú os")
+            )
         else:
-            st.caption("OPEN čiara: chýba `opened_at` aj `mandate_expires_at` v active_positions – core1 ešte neuložil čas otvorenia.")
+            st.caption("OPEN čiara: chýba `opened_at` v active_positions (core1 musí pri otvorení zapísať čas).")
 
     # Padding okolo ceny, aby sviečky neboli nalepené na okraj
     pad = max((price_high - price_low) * 0.08, price_high * 0.002)
