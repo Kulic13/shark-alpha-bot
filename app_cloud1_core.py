@@ -128,10 +128,20 @@ def save_vault(state: dict, sync_cloud: bool = True):
             st.error(f"Chyba ukladania trezoru do Supabase: {e}")
 
 def safe_supabase_upsert(table: str, data: dict, vault: dict):
+    """
+    Upsert do Supabase.
+    Pre ai_mmr_matrix musí ísť conflict na (regime_x, regime_y),
+    inak vznikajú duplicitné riadky a 'obrovská matica'.
+    """
     try:
-        supabase.table(table).upsert(data).execute()
+        if table == "ai_mmr_matrix":
+            supabase.table(table).upsert(data, on_conflict="regime_x,regime_y").execute()
+        elif table == "active_positions":
+            supabase.table(table).upsert(data, on_conflict="window_id").execute()
+        else:
+            supabase.table(table).upsert(data).execute()
     except Exception:
-        vault["pending_supabase_sync"].append({
+        vault.setdefault("pending_supabase_sync", []).append({
             "table": table,
             "op": "upsert",
             "data": data
@@ -187,7 +197,14 @@ def flush_pending_sync(vault: dict):
     for item in vault["pending_supabase_sync"]:
         try:
             if item["op"] == "upsert":
-                supabase.table(item["table"]).upsert(item["data"]).execute()
+                tbl = item["table"]
+                data = item["data"]
+                if tbl == "ai_mmr_matrix":
+                    supabase.table(tbl).upsert(data, on_conflict="regime_x,regime_y").execute()
+                elif tbl == "active_positions":
+                    supabase.table(tbl).upsert(data, on_conflict="window_id").execute()
+                else:
+                    supabase.table(tbl).upsert(data).execute()
             elif item["op"] == "insert":
                 supabase.table(item["table"]).insert(item["data"]).execute()
         except Exception:
@@ -786,12 +803,16 @@ async def evaluate_candidates(
                 is_15m_green = last_close > last_open
                 ofd = compute_ofd_from_klines(klines)
                 if is_pd_mode:
+                    # UVOĽNENÝ PUMP & DUMP režim (platí pre všetko okrem BTC)
+                    # Pôvodné prahy boli príliš prísne → okno 6 takmer nikdy nevstupovalo.
                     oi_curr = oi_map.get(sym, 0.0) * price
                     oi_avg = float(metrics_24h.get(sym, {}).get("oi_avg_24h", 0.0))
                     if oi_avg <= 0:
                         oi_avg = oi_curr
                     oi_ratio = oi_curr / max(1.0, oi_avg)
-                    if oi_ratio > 1.80 and ofd > 1.60 and is_15m_green:
+
+                    # LONG: pump / OI expand + agresívny buy flow (uvoľnené)
+                    if oi_ratio > 1.25 and ofd > 1.20 and is_15m_green:
                         if btc_veto.get("veto_long"):
                             return None
                         if not check_anti_extreme_shield(klines, "LONG", is_pd=True):
@@ -813,11 +834,14 @@ async def evaluate_candidates(
                             "klines": klines,
                             "exec_price": exec_price
                         }
-                    elif price_change_pct > 15.0 and ofd < 0.80 and not is_15m_green:
+
+                    # SHORT: dump / funding trap (uvoľnené – nižší move + nižší funding práh)
+                    if price_change_pct > 8.0 and ofd < 0.90 and not is_15m_green:
                         if btc_veto.get("veto_short"):
                             return None
                         funding_rate = await fetch_okx_funding(client, sym)
-                        if funding_rate > 0.0020 and check_anti_extreme_shield(klines, "SHORT", is_pd=True):
+                        # Funding trap ALEBO čistý dump orderflow
+                        if (funding_rate > 0.0010 or ofd < 0.70) and check_anti_extreme_shield(klines, "SHORT", is_pd=True):
                             ok_exec, exec_price = await verify_execution_confirmation(
                                 client, sym, "SHORT", klines, ofd, True, klines_cache
                             )
@@ -828,13 +852,59 @@ async def evaluate_candidates(
                                 "symbol": sym,
                                 "direction": "SHORT",
                                 "score": sas_score,
-                                "is_funding_trap": True,
+                                "is_funding_trap": funding_rate > 0.0010,
                                 "is_pd": True,
                                 "sector": sec,
                                 "ofd": ofd,
                                 "klines": klines,
                                 "exec_price": exec_price
                             }
+
+                    # Ďalší uvoľnený vstup: silný OFD bez extrémneho OI (stále PD okno)
+                    if ofd > 1.45 and is_15m_green and price_change_pct > 3.0:
+                        if btc_veto.get("veto_long"):
+                            return None
+                        if not check_anti_extreme_shield(klines, "LONG", is_pd=True):
+                            return None
+                        ok_exec, exec_price = await verify_execution_confirmation(
+                            client, sym, "LONG", klines, ofd, True, klines_cache
+                        )
+                        if not ok_exec:
+                            return None
+                        sas_score = ofd * (abs(price_change_pct) + 1.0) * 40.0
+                        return {
+                            "symbol": sym,
+                            "direction": "LONG",
+                            "score": sas_score,
+                            "is_funding_trap": False,
+                            "is_pd": True,
+                            "sector": sec,
+                            "ofd": ofd,
+                            "klines": klines,
+                            "exec_price": exec_price
+                        }
+                    if ofd < 0.60 and not is_15m_green and price_change_pct < -3.0:
+                        if btc_veto.get("veto_short"):
+                            return None
+                        if not check_anti_extreme_shield(klines, "SHORT", is_pd=True):
+                            return None
+                        ok_exec, exec_price = await verify_execution_confirmation(
+                            client, sym, "SHORT", klines, ofd, True, klines_cache
+                        )
+                        if not ok_exec:
+                            return None
+                        sas_score = (1.0 / max(0.1, ofd)) * (abs(price_change_pct) + 1.0) * 40.0
+                        return {
+                            "symbol": sym,
+                            "direction": "SHORT",
+                            "score": sas_score,
+                            "is_funding_trap": False,
+                            "is_pd": True,
+                            "sector": sec,
+                            "ofd": ofd,
+                            "klines": klines,
+                            "exec_price": exec_price
+                        }
                     return None
                 direction = None
                 is_trap = False
@@ -1573,13 +1643,54 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
             "table": "trade_history", "op": "insert", "data": hist_row
         })
 
-    # uvoľnenie okna
+    # uvoľnenie okna v lokálnom vault-e
     win_key = str(pos["window_id"])
     vault["windows"][win_key] = {
         "status": "WAITING",
         "symbol": "BTCUSDT" if win_key == "1" else None,
         "mandate_until": 0
     }
+
+    # DÔLEŽITÉ: uvoľniť aj riadok v Supabase active_positions
+    # (inak Cloud 2 / cockpit stále vidí starú ACTIVE pozíciu)
+    try:
+        closed_row = {
+            "window_id": int(pos["window_id"]),
+            "status": "WAITING",
+            "symbol": "BTCUSDT" if win_key == "1" else None,
+            "direction": None,
+            "regime": None,
+            "leverage": None,
+            "entry_price": None,
+            "margin_usd": 0.0,
+            "active_margin": 0.0,
+            "dca1_price": 0.0,
+            "dca2_price": 0.0,
+            "dca3_price": 0.0,
+            "dca1_filled": False,
+            "dca2_filled": False,
+            "dca3_filled": False,
+            "tp1_price": 0.0,
+            "tp2_price": 0.0,
+            "tp3_price": 0.0,
+            "tp1_hit": False,
+            "tp2_hit": False,
+            "sl_tsl_price": 0.0,
+            "tsl_active": False,
+            "pnl_usd": 0.0,
+            "pnl_percent": 0.0,
+            "mandate_expires_at": None,
+            "opened_at": None,
+            "updated_at": now_dt.isoformat(),
+            "okx_entry_order_id": None,
+            "okx_sl_order_id": None,
+            "okx_tp1_order_id": None,
+            "okx_tp2_order_id": None,
+            "okx_tp3_order_id": None,
+        }
+        safe_supabase_upsert("active_positions", closed_row, vault)
+    except Exception:
+        pass
 
 
 def is_ny_open_lock(now_dt: datetime) -> bool:
@@ -1977,9 +2088,9 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
                     active_secs.add(c["sector"])
                     break
 
-    # ===== OKNO 6: PUMP & DUMP REŽIM (Objem 1M – 4.99M USD) =====
+    # ===== OKNO 6: PUMP & DUMP REŽIM (uvoľnené, všetko okrem BTC, objem 0.5M – 8M USD) =====
     if vault["windows"]["6"]["status"] == "WAITING":
-        cands_pd = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 1_000_000.0, 4_999_999.0, btc_veto, klines_cache, is_pd_mode=True)
+        cands_pd = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 500_000.0, 8_000_000.0, btc_veto, klines_cache, is_pd_mode=True)
         for c in cands_pd:
             setup = build_trade_setup(c, vault["balance"], 6, vault)
             if setup:
