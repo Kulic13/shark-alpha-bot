@@ -16,7 +16,7 @@ from us_market_engine import (
 )
 
 OKX_API = "https://www.okx.com"
-MIN_CANDLES_HISTORY = 1500  # Anti-listing filter (~15.6 dňa histórie)
+MIN_CANDLES_HISTORY = 1400  # Anti-listing filter (~15.6 dňa histórie)
 TARGET_CANDLES = 2880       # 30 dní 15m sviečok (30 * 96)
 MIN_VOL_24H_USD = 10_000_000.0
 
