@@ -55,6 +55,12 @@ def get_default_vault() -> dict:
             "btc_15m_pct": 0.0
         },
         "natr_history_30d": [],  # Plovoucí 30denní historie pro výpočet invariantních percentilů
+        "vol_prah_low": 1.5,
+        "vol_prah_mid": 2.5,
+        "shield_mode_active": False,
+        "daily_pnl_usd": 0.0,
+        "daily_pnl_date": "",
+        "day_start_balance": 1000.0,
         "pending_supabase_sync": []
     }
 
@@ -69,6 +75,12 @@ def load_vault() -> dict:
                     state.setdefault("last_heartbeat", 0)
                     state.setdefault("pending_supabase_sync", [])
                     state.setdefault("natr_history_30d", [])
+                    state.setdefault("vol_prah_low", 1.5)
+                    state.setdefault("vol_prah_mid", 2.5)
+                    state.setdefault("shield_mode_active", False)
+                    state.setdefault("daily_pnl_usd", 0.0)
+                    state.setdefault("daily_pnl_date", "")
+                    state.setdefault("day_start_balance", float(state.get("balance", 1000.0)))
                     state.setdefault("last_btc_veto", {
                         "veto_long": False,
                         "veto_short": False,
@@ -92,6 +104,12 @@ def load_vault() -> dict:
             state.setdefault("last_heartbeat", 0)
             state.setdefault("pending_supabase_sync", [])
             state.setdefault("natr_history_30d", [])
+            state.setdefault("vol_prah_low", 1.5)
+            state.setdefault("vol_prah_mid", 2.5)
+            state.setdefault("shield_mode_active", False)
+            state.setdefault("daily_pnl_usd", 0.0)
+            state.setdefault("daily_pnl_date", "")
+            state.setdefault("day_start_balance", float(state.get("balance", 1000.0)))
             state.setdefault("last_btc_veto", {
                 "veto_long": False,
                 "veto_short": False,
@@ -354,96 +372,6 @@ def flush_pending_sync(vault: dict):
 
 
 # =========================================================================
-# BLOK 5: INVARIANTNÁ AI MATICA REŽIMOV (MMR) & KNN PROSTOROVÉ VYHLAZOVÁNÍ
-# =========================================================================
-MAPA_SUSEDNOSTI = {
-    (1, 1): [(1, 2), (2, 1)],
-    (1, 2): [(1, 1), (1, 3), (2, 2)],
-    (1, 3): [(1, 2), (2, 3)],
-    (2, 1): [(1, 1), (2, 2), (3, 1)],
-    (2, 2): [(1, 2), (2, 1), (2, 3), (3, 2)],
-    (2, 3): [(1, 3), (2, 2), (3, 3)],
-    (3, 1): [(2, 1), (3, 2)],
-    (3, 2): [(2, 2), (3, 1), (3, 3)],
-    (3, 3): [(3, 2), (2, 3)]
-}
-
-def urci_trend_x(btc_klines: list) -> int:
-    """Osa X (Trendový režim): Diskretizace sklonu regresní přímky do stavů 1 (BEAR), 2 (SIDE), 3 (BULL)"""
-    if len(btc_klines) < 10:
-        return 2
-    closes = [float(get_close(k)) for k in btc_klines[-10:]]
-    x = np.arange(len(closes))
-    slope = np.polyfit(x, closes, 1)[0]
-    norm_slope = slope / closes[0] * 100.0
-    if norm_slope < -0.33:
-        return 1  # BEAR
-    elif norm_slope > 0.33:
-        return 3  # BULL
-    return 2  # SIDE
-
-def urci_volatilitu_y(natr: float, vault: dict) -> int:
-    """Osa Y (Volatilitní index): Dynamické dělení pomocí plovoucích 30denních percentilů (1=LOW, 2=MID, 3=HIGH)"""
-    hist = vault.get("natr_history_30d", [])
-    if len(hist) < 15:
-        # Fallback pokud není naplněna plovoucí historie
-        if natr <= 1.5: return 1
-        elif natr <= 3.0: return 2
-        return 3
-    p33 = np.percentile(hist, 33)
-    p66 = np.percentile(hist, 66)
-    if natr <= p33:
-        return 1  # LOW
-    elif natr <= p66:
-        return 2  # MID
-    return 3  # HIGH
-
-def get_ai_mmr_cell(rx: int, ry: int) -> dict:
-    """Načtení globální statistické buňky z tabulky ai_mmr_matrix namísto separátních mincí"""
-    default_cell = {
-        "regime_x": rx, "regime_y": ry,
-        "win_rate": 52.0, "total_trades": 0,
-        "avg_win_r": 1.5, "avg_loss_r": 1.0,
-        "sl_modifier": 1.00, "tp_modifier": 1.00
-    }
-    try:
-        res = supabase.table("ai_mmr_matrix").select("*").eq("regime_x", rx).eq("regime_y", ry).execute()
-        if res.data and len(res.data) > 0:
-            return res.data[0]
-    except Exception:
-        pass
-    return default_cell
-
-def update_ai_learning_mmr(rx: int, ry: int, is_win: bool, r_multiple: float, vault: dict):
-    """KNN Spatial Smoothing: Výsledek obchodu se zapíše do cílové buňky a s váhou 20% prosákne do sousedů"""
-    bunky_k_aktualizaci = [(rx, ry, 1.0)]  # (rx, ry, vaha_prostory)
-    if (rx, ry) in MAPA_SUSEDNOSTI:
-        for s_rx, s_ry in MAPA_SUSEDNOSTI[(rx, ry)]:
-            bunky_k_aktualizaci.append((s_rx, s_ry, 0.20))
-    for target_x, target_y, vaha_prostory in bunky_k_aktualizaci:
-        cell = get_ai_mmr_cell(target_x, target_y)
-        n = int(cell.get("total_trades", 0))
-        # Adaptivní decay faktor podle zaplnění buňky: rychlé učení na začátku, stabilita v saturaci
-        gamma = 0.05
-        alfa_baze = 1.0 / (1.0 + gamma * n)
-        alfa = alfa_baze * vaha_prostory
-        outcome_wr = 100.0 if is_win else 0.0
-        cell["win_rate"] = float((cell["win_rate"] * (1.0 - alfa)) + (outcome_wr * alfa))
-        if is_win:
-            cell["avg_win_r"] = float((cell["avg_win_r"] * (1.0 - alfa)) + (abs(r_multiple) * alfa))
-            cell["sl_modifier"] = float(np.clip(cell["sl_modifier"] * (1.0 - 0.03 * vaha_prostory), 0.75, 1.45))
-            cell["tp_modifier"] = float(np.clip(cell["tp_modifier"] * (1.0 + 0.02 * vaha_prostory), 0.75, 1.45))
-        else:
-            cell["avg_loss_r"] = float((cell["avg_loss_r"] * (1.0 - alfa)) + (abs(r_multiple) * alfa))
-            cell["sl_modifier"] = float(np.clip(cell["sl_modifier"] * (1.0 + 0.06 * vaha_prostory), 0.75, 1.45))
-            cell["tp_modifier"] = float(np.clip(cell["tp_modifier"] * (1.0 - 0.02 * vaha_prostory), 0.75, 1.45))
-        if vaha_prostory == 1.0:
-            cell["total_trades"] = n + 1
-        cell["updated_at"] = datetime.now(timezone.utc).isoformat()
-        safe_supabase_upsert("ai_mmr_matrix", cell, vault)
-
-
-# =========================================================================
 # BLOK 3A: OKX API KONEKTOR & ODĽAHČENÝ 1s ZBER DÁT
 # =========================================================================
 
@@ -600,13 +528,19 @@ async def fetch_hloubkova_mikrostruktura(client: httpx.AsyncClient, symbol: str)
     - Vážený Order Book (WOB): Exponenciální útlum váhy podle vzdálenosti od středu (1/k).
     - OBI Imbalance: Výsledný tlak pasivních zdí v knize.
     - CVD a VPIN: Výpočet čisté agresivity trhu a toxicity toku objednávek.
+    - best_bid / best_ask / spread_pct / wob_imbalance pre verify_execution bez duplicitného GET.
     """
     inst_id = to_okx_inst_id(symbol)
     res = {
         "obi_hluboke": 1.0,
         "neblizsi_stena_sl": 0.0,
         "cvd_agresivita": 0.0,
-        "vpin_toxicita": 0.20
+        "vpin_toxicita": 0.20,
+        "best_bid": 0.0,
+        "best_ask": 0.0,
+        "spread_pct": 999.0,
+        "wob_imbalance": 0.0,
+        "ok": False,
     }
     try:
         ob_res = await client.get(f"{OKX_API}/api/v5/market/books", params={"instId": inst_id, "sz": "20"})
@@ -616,17 +550,29 @@ async def fetch_hloubkova_mikrostruktura(client: httpx.AsyncClient, symbol: str)
                 book = ob_data["data"][0]
                 bids = book.get("bids", [])
                 asks = book.get("asks", [])
+                if not bids or not asks:
+                    return res
+                best_bid = float(bids[0][0])
+                best_ask = float(asks[0][0])
+                if best_bid <= 0 or best_ask <= 0:
+                    return res
+                res["best_bid"] = best_bid
+                res["best_ask"] = best_ask
+                res["spread_pct"] = ((best_ask - best_bid) / best_bid) * 100.0
+
                 w_bid = sum(float(b[1]) * (1.0 / (k + 1)) for k, b in enumerate(bids[:20]))
                 w_ask = sum(float(a[1]) * (1.0 / (k + 1)) for k, a in enumerate(asks[:20]))
                 res["obi_hluboke"] = w_bid / max(1e-9, w_ask)
+                # Signed WOB imbalance ∈ [-1, 1] (kladné = bid pressure)
+                denom = w_bid + w_ask
+                res["wob_imbalance"] = ((w_bid - w_ask) / denom) if denom > 1e-9 else 0.0
                 # Detekce nejsilnější pasivní zdi pro Shadow OBI Stop Loss Barrier
-                if bids and asks:
-                    if w_bid > w_ask:
-                        max_bid_idx = np.argmax([float(b[1]) for b in bids[:20]])
-                        res["neblizsi_stena_sl"] = float(bids[max_bid_idx][0])
-                    else:
-                        max_ask_idx = np.argmax([float(a[1]) for a in asks[:20]])
-                        res["neblizsi_stena_sl"] = float(asks[max_ask_idx][0])
+                if w_bid > w_ask:
+                    max_bid_idx = int(np.argmax([float(b[1]) for b in bids[:20]]))
+                    res["neblizsi_stena_sl"] = float(bids[max_bid_idx][0])
+                else:
+                    max_ask_idx = int(np.argmax([float(a[1]) for a in asks[:20]]))
+                    res["neblizsi_stena_sl"] = float(asks[max_ask_idx][0])
                 # CVD (Cumulative Volume Delta) za posledních 5 svíček
                 klines = await fetch_okx_klines(client, symbol, "15m", 6)
                 if len(klines) >= 5:
@@ -642,8 +588,9 @@ async def fetch_hloubkova_mikrostruktura(client: httpx.AsyncClient, symbol: str)
                         delta_suma += v * buyer_ratio - v * (1.0 - buyer_ratio)
                         total_v += v
                     res["cvd_agresivita"] = delta_suma
-                    # VPIN (Volume-Synchronized Probability of Toxicity) aproximace přes absolutní delty
+                    # VPIN aproximace přes absolutní delty
                     res["vpin_toxicita"] = abs(delta_suma) / max(1e-9, total_v)
+                res["ok"] = True
     except Exception:
         pass
     return res
@@ -676,6 +623,11 @@ def calculate_natr_14(klines: list) -> float:
 
 
 def compute_ofd_from_klines(klines: list) -> float:
+    """
+    Order-Flow Delta aproximácia z 15m sviečok.
+    Body (open→close) určuje smer agresivity; knôty (wicks) sa delia 50/50,
+    aby pin-bary a dlhé knôty neprevrátili interpretáciu objemu.
+    """
     if not klines:
         return 1.0
     recent = klines[-5:] if len(klines) >= 5 else klines
@@ -684,10 +636,17 @@ def compute_ofd_from_klines(klines: list) -> float:
     for k in recent:
         h = float(get_high(k))
         l = float(get_low(k))
+        o = float(get_open(k))
         c = float(get_close(k))
         v = float(get_vol(k))
         rng = max(1e-12, h - l)
-        buyer_ratio = (c - l) / rng
+        body = abs(c - o)
+        body_frac = min(1.0, body / rng)
+        # Smer z tela sviečky; zvyšok (knôty) neutrálne 50/50
+        if c >= o:
+            buyer_ratio = 0.5 + 0.5 * body_frac
+        else:
+            buyer_ratio = 0.5 - 0.5 * body_frac
         buy_vol += v * buyer_ratio
         sell_vol += v * (1.0 - buyer_ratio)
     return buy_vol / max(1e-9, sell_vol)
@@ -803,9 +762,11 @@ def check_anti_extreme_shield(klines: list, direction: str, is_pd: bool = False,
         rsi_high, rsi_low = 75.0, 25.0
         skip_bb = True
     else:
+        # Štandardný režim: BB filter vypnutý – silné breakouty (OFD > 1.30)
+        # takmer vždy zatvárajú nad horným BB pásmom; ATR + RSI stačia na ochranu.
         max_atr_dist = 2.0
-        rsi_high, rsi_low = 75.0, 25.0
-        skip_bb = False
+        rsi_high, rsi_low = 78.0, 22.0
+        skip_bb = True
     bb_upper = ema_20 + (2.0 * std_20)
     bb_lower = ema_20 - (2.0 * std_20)
     if direction == "LONG":
@@ -1042,24 +1003,40 @@ def compute_roundtrip_cost_rate(window_id: int) -> float:
 def get_mmr_coordinates(natr: float, vault: dict) -> tuple[int, int]:
     """
     Dynamická klasifikace tržního režimu do 3x3 matice (MMR).
-    Osa X (Trend) je určena makro-filtrem z BTC.
-    Osa Y (Volatilita) je počítána přes invariantní 30denní percentily.
+    Osa X (Trend): preferuje regresný sklon z posledných 10×15m BTC sviečok
+    (uložený pri scane ako last_btc_trend_slope); fallback na btc_1h_pct.
+    Osa Y (Volatilita): invariantní 30denní percentily.
     """
-    btc_veto = vault.get("last_btc_veto", {})
-    btc_1h = btc_veto.get("btc_1h_pct", 0.0)
-    
     # Osa X: Trendová klasifikace (BEAR = 1, SIDE = 2, BULL = 3)
-    if btc_1h < -0.33:
-        regime_x = 1
-    elif btc_1h > 0.33:
-        regime_x = 3
+    # Preferuj polyfit sklon (menej citlivý na jednorazový 1h výkyv)
+    norm_slope = vault.get("last_btc_trend_slope", None)
+    if norm_slope is not None:
+        if norm_slope < -0.33:
+            regime_x = 1
+        elif norm_slope > 0.33:
+            regime_x = 3
+        else:
+            regime_x = 2
     else:
-        regime_x = 2
+        btc_veto = vault.get("last_btc_veto", {})
+        btc_1h = btc_veto.get("btc_1h_pct", 0.0)
+        if btc_1h < -0.33:
+            regime_x = 1
+        elif btc_1h > 0.33:
+            regime_x = 3
+        else:
+            regime_x = 2
 
     # Osa Y: Volatilitní invariantní percentily (LOW = 1, MID = 2, HIGH = 3)
-    p_low = vault.get("vol_prah_low", 1.5)
-    p_mid = vault.get("vol_prah_mid", 2.5)
-    
+    # Preferuj natr_history_30d (skutočný TR%), fallback na vol_prah_* z posledného scanu
+    hist = vault.get("natr_history_30d", [])
+    if len(hist) >= 15:
+        p_low = float(np.percentile(hist, 33))
+        p_mid = float(np.percentile(hist, 66))
+    else:
+        p_low = float(vault.get("vol_prah_low", 1.5))
+        p_mid = float(vault.get("vol_prah_mid", 2.5))
+
     if natr <= p_low:
         regime_y = 1
     elif natr <= p_mid:
@@ -1138,16 +1115,14 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
     kelly_margin = min(balance * full_kelly * kelly_fraction, balance * max_risk_pct)
 
     # Ověření reálných limitů OKX burzy
+    # Ak Kellyho marža nestačí na min. notional, obchod NEOTVÁRAME
+    # (žiadne násilné navýšenie nad riziko z Kelly kritéria).
     min_notional = okx_min_notional_usd(sym, price)
     min_margin = min_notional / max(1, leverage)
 
     if kelly_margin < min_margin:
-        if min_margin <= balance * 0.08:
-            margin_usd = min_margin
-        else:
-            return None
-    else:
-        margin_usd = kelly_margin
+        return None
+    margin_usd = kelly_margin
 
     # 7. EXEKUČNÍ DEKOMPOZICE (TWAP TWIN ENTRY VELIKOST)
     # Rozdělení na 60 % pasivní limit (maker) a 40 % aktivní krytí
@@ -1226,6 +1201,9 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
         "tp2_price": tp2, "tp2_hit": False,
         "tp3_price": tp3,
         "sl_tsl_price": sl_price,
+        "initial_sl_price": sl_price,  # pôvodný SL pre správny R-multiple celého obchodu
+        "initial_margin_usd": float(margin_usd),  # celková plánovaná marža pri vstupe
+        "realized_pnl_usd": 0.0,  # kumulovaný PnL z TP1/TP2 scale-outov
         "tsl_active": False,
         "extreme_price": price,
         "cached_ofd": initial_ofd,
@@ -1324,7 +1302,7 @@ def update_mmr_cell_values(rx: int, ry: int, outcome: float, r_multiple: float, 
     if weight == 1.0:
         cell["total_trades"] = trades_n + 1
         
-    cell["last_update"] = datetime.now(timezone.utc).isoformat()
+    cell["updated_at"] = datetime.now(timezone.utc).isoformat()
     safe_supabase_upsert("ai_mmr_matrix", cell, vault)
 
 def update_ai_learning(
@@ -1334,25 +1312,21 @@ def update_ai_learning(
     is_funding_trap: bool,
     is_win: bool,
     r_multiple: float,
-    vault: dict
+    vault: dict,
+    regime_x: int | None = None,
+    regime_y: int | None = None,
 ):
     """
     Hlavní post-trade modul učení 2.0. Kompletně odstraňuje izolované učení mincí.
     Implementuje prostorové přelévání informací (KNN Spatial Smoothing) do okolních režimů.
+    Súradnice (rx, ry) musia prísť priamo z uzatváranej pozície – nie spätným hľadaním podľa symbolu.
     """
-    # Získání souřadnic MMR, ve kterých byl obchod exekuován
-    # Tyto souřadnice si pozice nese ve svém stavu od momentu vstupu
-    active_windows = vault.get("windows", {})
-    
-    # Vyhledáme souřadnice z běžícího setupu (případně fallback na aktuální tržní stav)
-    rx = vault.get("last_active_rx", 2)
-    ry = vault.get("last_active_ry", 2)
-    
-    for win_data in active_windows.values():
-        if win_data.get("symbol") == symbol and "regime_x" in win_data:
-            rx = int(win_data["regime_x"])
-            ry = int(win_data["regime_y"])
-            break
+    if regime_x is not None and regime_y is not None:
+        rx, ry = int(regime_x), int(regime_y)
+    else:
+        # Fallback len ak volajúci neposlal súradnice (nemalo by nastať)
+        rx = int(vault.get("last_active_rx", 2))
+        ry = int(vault.get("last_active_ry", 2))
 
     outcome = 100.0 if is_win else 0.0
 
@@ -1360,7 +1334,6 @@ def update_ai_learning(
     update_mmr_cell_values(rx, ry, outcome, r_multiple, 1.0, vault)
     
     # 2. PROSTOROVÉ PŘELÉVÁNÍ INFORMACÍ (KNN Spatial Smoothing - Sousední buňky = 20 %)
-    # Ztráta/Zisk v jednom režimu preventivně ovlivní chování bota v příbuzných tržních strukturách
     neighbors = get_mmr_neighbors(rx, ry)
     for nx, ny in neighbors:
         update_mmr_cell_values(nx, ny, outcome, r_multiple, 0.20, vault)
@@ -1515,48 +1488,28 @@ async def verify_execution_confirmation(
         if direction == "SHORT" and last_1h_close > ema21_1h and ofd > 0.65:
             return False, 0.0
 
-    # 3. Stažení hloubkové mikrostruktury z OKX (Hloubka 20)
-    inst_id = to_okx_inst_id(symbol)
+    # 3. Hĺbková mikroštruktúra (jedno API volanie cez fetch_hloubkova_mikrostruktura)
     try:
-        ob_res = await client.get(
-            f"{OKX_API}/api/v5/market/books",
-            params={"instId": inst_id, "sz": "20"}
-        )
-        if ob_res.status_code != 200:
-            return False, 0.0
-        ob_json = ob_res.json()
-        if ob_json.get("code") != "0" or not ob_json.get("data"):
+        micro = await fetch_hloubkova_mikrostruktura(client, symbol)
+        if not micro.get("ok"):
             return False, 0.0
 
-        book = ob_json["data"][0]
-        asks = book.get("asks", [])
-        bids = book.get("bids", [])
-        if not asks or not bids:
-            return False, 0.0
-
-        best_ask = float(asks[0][0])
-        best_bid = float(bids[0][0])
-        if best_bid <= 0 or best_ask <= 0:
-            return False, 0.0
-
-        # 4. Kontrola maximálního povoleného spreadu
-        spread_pct = ((best_ask - best_bid) / best_bid) * 100.0
+        best_ask = float(micro["best_ask"])
+        best_bid = float(micro["best_bid"])
+        spread_pct = float(micro["spread_pct"])
         max_spread = 0.30 if is_pd else 0.18
         if spread_pct > max_spread:
             return False, 0.0
 
-        # 5. Výpočet Váženého Order Booku z hloubky 20 (WOB)
-        wob_imbalance = calculate_weighted_order_book_imbalance(book)
-        
-        # 6. Výpočet toxicity toku příkazů přes VPIN Engine
+        # Preferuj VPIN z klines_15m (presnejší bucket výpočet), fallback na micro
         vpin_score = calculate_vpin_toxicity(klines_15m)
-        if vpin_score > 0.80:  # TOXICKÝ ŠTÍT: Blokování vstupu do vysoce toxického orderflow
+        if vpin_score > 0.80:
             return False, 0.0
 
-        # Verifikace směrového tlaku pomocí mikrostruktury zdí (WOB)
-        if direction == "LONG" and wob_imbalance < -0.15:  # Prodejní zdi jsou příliš silné
+        wob_imbalance = float(micro.get("wob_imbalance", 0.0))
+        if direction == "LONG" and wob_imbalance < -0.15:
             return False, 0.0
-        if direction == "SHORT" and wob_imbalance > 0.15:  # Nákupní stěny blokují propad ceny
+        if direction == "SHORT" and wob_imbalance > 0.15:
             return False, 0.0
 
         exec_price = best_ask if direction == "LONG" else best_bid
@@ -1598,45 +1551,24 @@ async def verify_execution_confirmation_btc(
         if direction == "SHORT" and last_1h_close > ema21_1h and ofd > 0.80:
             return False, 0.0
 
-    inst_id = to_okx_inst_id(symbol)
     try:
-        ob_res = await client.get(
-            f"{OKX_API}/api/v5/market/books",
-            params={"instId": inst_id, "sz": "20"}
-        )
-        if ob_res.status_code != 200:
-            return False, 0.0
-        ob_json = ob_res.json()
-        if ob_json.get("code") != "0" or not ob_json.get("data"):
+        micro = await fetch_hloubkova_mikrostruktura(client, symbol)
+        if not micro.get("ok"):
             return False, 0.0
 
-        book = ob_json["data"][0]
-        asks = book.get("asks", [])
-        bids = book.get("bids", [])
-        if not asks or not bids:
+        best_ask = float(micro["best_ask"])
+        best_bid = float(micro["best_bid"])
+        spread_pct = float(micro["spread_pct"])
+        if spread_pct > 0.18:
             return False, 0.0
 
-        best_ask = float(asks[0][0])
-        best_bid = float(bids[0][0])
-        if best_bid <= 0 or best_ask <= 0:
-            return False, 0.0
-
-        spread_pct = ((best_ask - best_bid) / best_bid) * 100.0
-        if spread_pct > 0.18:  # uvoľnené z 0.12
-            return False, 0.0
-
-        wob_imbalance = calculate_weighted_order_book_imbalance(book)
         vpin_score = calculate_vpin_toxicity(klines_15m)
-
-        # Toxicita: stále blokuje extrém, ale nie bežný tok (0.70 → 0.82)
         if vpin_score > 0.82:
             return False, 0.0
 
-        # WOB: už nevyžaduje silnú stenu, len blokuje jasný proti-tlak
-        # LONG: zamietni len ak sú ask steny výrazne silnejšie
+        wob_imbalance = float(micro.get("wob_imbalance", 0.0))
         if direction == "LONG" and wob_imbalance < -0.12:
             return False, 0.0
-        # SHORT: zamietni len ak sú bid steny výrazne silnejšie
         if direction == "SHORT" and wob_imbalance > 0.12:
             return False, 0.0
 
@@ -1657,6 +1589,30 @@ def paper_amend_sl(pos: dict, new_px: float, reason: str = ""):
     # print(f"[PAPER AMEND SL] {pos.get('symbol')} -> {new_px} ({reason})")
 
 
+
+def update_daily_pnl_and_shield(vault: dict, pnl_usd: float, now_dt: datetime | None = None):
+    """
+    Sleduje denný PnL. Pri strate > 3 % day_start_balance aktivuje shield_mode.
+    Pri zmene UTC dňa resetuje denný PnL a vypne štít.
+    """
+    if now_dt is None:
+        now_dt = datetime.now(timezone.utc)
+    today = now_dt.strftime("%Y-%m-%d")
+    stored_date = vault.get("daily_pnl_date") or ""
+    if stored_date != today:
+        vault["daily_pnl_date"] = today
+        vault["daily_pnl_usd"] = 0.0
+        vault["day_start_balance"] = float(vault.get("balance", 1000.0))
+        vault["shield_mode_active"] = False
+    vault["daily_pnl_usd"] = float(vault.get("daily_pnl_usd", 0.0)) + float(pnl_usd)
+    day_start = float(vault.get("day_start_balance") or vault.get("balance") or 1000.0)
+    if day_start > 0 and vault["daily_pnl_usd"] <= -(0.03 * day_start):
+        vault["shield_mode_active"] = True
+    # Ak sa denný PnL zotavil nad -1.5 %, môžeme štít vypnúť (voliteľné uvoľnenie)
+    elif day_start > 0 and vault["daily_pnl_usd"] > -(0.015 * day_start):
+        vault["shield_mode_active"] = False
+
+
 def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
     """
     Paper-trade zatvorenie pozície.
@@ -1674,12 +1630,21 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
     pnl_usd = active_margin * (net_pnl_pct / 100.0)
 
     vault["balance"] = round(float(vault.get("balance", 100.0)) + pnl_usd, 4)
+    update_daily_pnl_and_shield(vault, pnl_usd, now_dt)
 
-    # R-multiple pre učenie (hrubý odhad)
-    sl_dist = abs(entry - float(pos.get("sl_tsl_price", entry))) / entry
-    r_mult = (net_pnl_pct / 100.0) / max(sl_dist, 1e-6) if sl_dist > 0 else 0.0
+    # Celkový PnL obchodu = scale-outy (TP1/TP2) + finálny zvyšok
+    realized_prev = float(pos.get("realized_pnl_usd", 0.0))
+    total_pnl_usd = realized_prev + float(pnl_usd)
 
-    is_win = pnl_usd > 0
+    # R-multiple z celého obchodu voči pôvodnému riziku (initial SL, nie posunutý TSL)
+    initial_sl = float(pos.get("initial_sl_price") or pos.get("sl_tsl_price") or entry)
+    initial_margin = float(pos.get("initial_margin_usd") or pos.get("margin_usd") or active_margin or 1.0)
+    sl_dist = abs(entry - initial_sl) / max(1e-9, entry)
+    # 1R ≈ initial_margin * sl_dist * leverage (USD riziko pri plnej marži)
+    risk_usd = max(1e-9, initial_margin * sl_dist * leverage)
+    r_mult = total_pnl_usd / risk_usd
+
+    is_win = total_pnl_usd > 0
     try:
         update_ai_learning(
             symbol=pos.get("symbol", ""),
@@ -1688,7 +1653,9 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
             is_funding_trap=bool(pos.get("is_funding_trap", False)),
             is_win=is_win,
             r_multiple=r_mult,
-            vault=vault
+            vault=vault,
+            regime_x=pos.get("regime_x"),
+            regime_y=pos.get("regime_y"),
         )
     except Exception:
         pass
@@ -1734,12 +1701,12 @@ def is_ny_open_lock(now_dt: datetime) -> bool:
     Paper-trade verzia – jednoduchý časový filter.
     """
     # NYSE open ~ 14:30 UTC (zimný čas) / 13:30 UTC (letný)
-    # Používame 14:00 – 15:00 UTC ako ochranné okno
+    # Ochranné okno: 14:00 – 15:00 UTC (vrátane 15:00:xx do konca prvej minúty)
     hour = now_dt.hour
     minute = now_dt.minute
-    if hour == 14 and minute >= 0:
+    if hour == 14:
         return True
-    if hour == 15 and minute < 0:  # prakticky len 14:xx
+    if hour == 15 and minute == 0:
         return True
     return False
 
@@ -1753,7 +1720,10 @@ def execute_scale_out(pos: dict, price: float, pct: float, reason: str, vault: d
     closed_margin = pos["active_margin"] * pct
     partial_pnl_usd = closed_margin * (net_pnl_pct / 100.0)
     vault["balance"] = round(vault["balance"] + partial_pnl_usd, 4)
+    update_daily_pnl_and_shield(vault, partial_pnl_usd, now_dt)
     pos["active_margin"] -= closed_margin
+    # Kumuluj realizovaný PnL pre finálny R-multiple celého obchodu
+    pos["realized_pnl_usd"] = float(pos.get("realized_pnl_usd", 0.0)) + float(partial_pnl_usd)
     hist_row = {
         "window_id": pos["window_id"], "symbol": pos["symbol"], "direction": pos["direction"],
         "regime": pos["regime"], "leverage": pos["leverage"], "entry_price": pos["entry_price"],
@@ -1839,6 +1809,9 @@ async def run_core_cycle(vault: dict):
     now_ts = time.time()
     now_dt = datetime.now(timezone.utc)
     db_dirty = False
+
+    # Denný rollover + aktualizácia shield_mode (0 PnL, len dátum)
+    update_daily_pnl_and_shield(vault, 0.0, now_dt)
 
     # Ak appka bola offline > 10 min, zmaž otvorené pozície (bez zápisu do histórie)
     purged = purge_stale_open_positions(vault)
@@ -2079,23 +2052,30 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
     vault["last_main_scan"] = now_ts
     
     # A. VÝPOČET PLOVOUCÍCH PERCENTILŮ VOLATILITY (Osa Y)
-    # Systém si stahováním BTC/USDT historie udržuje invariantní přehled o makrocyklu trhu
+    # Skutočný denný True Range (vrátane gapov) → Normalized TR % → natr_history_30d
+    # Percentily z tejto histórie sa používajú ako vol_prah_low / vol_prah_mid (zhoda s NATR v Risk Engine)
     try:
-        btc_hist_klines = await fetch_okx_klines(client, "BTCUSDT", "1D", 30, klines_cache)
-        if len(btc_hist_klines) >= 15:
+        btc_hist_klines = await fetch_okx_klines(client, "BTCUSDT", "1D", 31, klines_cache)
+        if len(btc_hist_klines) >= 16:
             natr_history = []
+            prev_c = None
             for bar in btc_hist_klines:
-                h, l, c = float(get_high(bar)), float(get_low(bar)), float(get_close(bar))
-                if c > 0:
-                    natr_history.append(((h - l) / c) * 100.0)
-            
-            # Seřazení historických hodnot pro určení empirické distribuční funkce (ECDF)
-            natr_history.sort()
-            n_samples = len(natr_history)
-            
-            # Stanovení dynamických prahů (spodních 33 % = LOW, horních 34 % = HIGH)
-            vault["vol_prah_low"] = float(natr_history[int(n_samples * 0.33)])
-            vault["vol_prah_mid"] = float(natr_history[int(n_samples * 0.66)])
+                h = float(get_high(bar))
+                l = float(get_low(bar))
+                c = float(get_close(bar))
+                if c > 0 and prev_c is not None and prev_c > 0:
+                    # True Range vrátane overnight gapov (abs(high-prev_close), abs(low-prev_close))
+                    tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+                    natr_history.append((tr / c) * 100.0)
+                prev_c = c
+
+            if len(natr_history) >= 15:
+                # Ulož plovúcu históriu pre get_mmr_coordinates / invariantné percentily
+                vault["natr_history_30d"] = natr_history[-30:]
+                hist_sorted = sorted(natr_history)
+                n_samples = len(hist_sorted)
+                vault["vol_prah_low"] = float(hist_sorted[int(n_samples * 0.33)])
+                vault["vol_prah_mid"] = float(hist_sorted[int(n_samples * 0.66)])
     except Exception:
         # Bezpečný fallback, pokud by API selhalo, aby bot nepřestal fungovat
         vault["vol_prah_low"] = vault.get("vol_prah_low", 1.5)
@@ -2111,6 +2091,17 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
     btc_klines = await fetch_okx_klines(client, "BTCUSDT", "15m", 25, klines_cache)
     btc_veto = evaluate_btc_veto(btc_klines)
     vault["last_btc_veto"] = btc_veto
+    # Regresný sklon z posledných 10×15m sviečok → stabilnejšia Os X v MMR
+    try:
+        if len(btc_klines) >= 10:
+            closes = [float(get_close(k)) for k in btc_klines[-10:]]
+            x = np.arange(len(closes))
+            slope = float(np.polyfit(x, closes, 1)[0])
+            vault["last_btc_trend_slope"] = (slope / max(1e-9, closes[0])) * 100.0
+        else:
+            vault["last_btc_trend_slope"] = 0.0
+    except Exception:
+        vault["last_btc_trend_slope"] = vault.get("last_btc_trend_slope", 0.0)
 
     # Sběr aktuálně obsazených mincí a sektorů pro zamezení nežádoucí korelace rizika
     active_syms = {p["symbol"] for p in vault["windows"].values() if p["status"] == "ACTIVE" and p["symbol"]}
