@@ -61,20 +61,21 @@ def get_default_vault() -> dict:
         "daily_pnl_usd": 0.0,
         "daily_pnl_date": "",
         "day_start_balance": 1000.0,
-        # SYSTEM A/B meta-controller & adaptive funnel
-        "strictness_long": 1.0,
-        "strictness_short": 1.0,
+        # SYSTEM A/B meta-controller & adaptive funnel  (RESET + RELAXED)
+        "strictness_long": 0.90,
+        "strictness_short": 0.90,
         "last_trade_opened_ts": 0.0,
         "filter_weights": {
-            "macro": 1.0, "liq": 1.0, "ofd": 1.0,
-            "shield": 1.0, "micro": 1.0, "risk": 1.0,
+            "macro": 0.90, "liq": 0.90, "ofd": 0.90,
+            "shield": 0.90, "micro": 0.90, "risk": 0.90,
         },
         "reject_stats": {
             "macro": 0, "liq": 0, "ofd": 0,
             "shield": 0, "micro": 0, "risk": 0,
         },
         "shadow_pool": [],  # unified incubator (max 100); replaces shadow_trades
-        "pending_supabase_sync": []
+        "pending_supabase_sync": [],
+        "cell_strictness": 0.85
     }
 
 def load_vault() -> dict:
@@ -94,12 +95,12 @@ def load_vault() -> dict:
                     state.setdefault("daily_pnl_usd", 0.0)
                     state.setdefault("daily_pnl_date", "")
                     state.setdefault("day_start_balance", float(state.get("balance", 1000.0)))
-                    state.setdefault("strictness_long", 1.0)
-                    state.setdefault("strictness_short", 1.0)
+                    state.setdefault("strictness_long", 0.90)
+                    state.setdefault("strictness_short", 0.90)
                     state.setdefault("last_trade_opened_ts", 0.0)
                     state.setdefault("filter_weights", {
-                        "macro": 1.0, "liq": 1.0, "ofd": 1.0,
-                        "shield": 1.0, "micro": 1.0, "risk": 1.0,
+                        "macro": 0.90, "liq": 0.90, "ofd": 0.90,
+                        "shield": 0.90, "micro": 0.90, "risk": 0.90,
                     })
                     state.setdefault("reject_stats", {
                         "macro": 0, "liq": 0, "ofd": 0,
@@ -136,12 +137,12 @@ def load_vault() -> dict:
             state.setdefault("daily_pnl_usd", 0.0)
             state.setdefault("daily_pnl_date", "")
             state.setdefault("day_start_balance", float(state.get("balance", 1000.0)))
-            state.setdefault("strictness_long", 1.0)
-            state.setdefault("strictness_short", 1.0)
+            state.setdefault("strictness_long", 0.90)
+            state.setdefault("strictness_short", 0.90)
             state.setdefault("last_trade_opened_ts", 0.0)
             state.setdefault("filter_weights", {
-                "macro": 1.0, "liq": 1.0, "ofd": 1.0,
-                "shield": 1.0, "micro": 1.0, "risk": 1.0,
+                "macro": 0.90, "liq": 0.90, "ofd": 0.90,
+                "shield": 0.90, "micro": 0.90, "risk": 0.90,
             })
             state.setdefault("reject_stats", {
                 "macro": 0, "liq": 0, "ofd": 0,
@@ -1546,7 +1547,7 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
     
     # 1. Výpočet NATR a kontrola extrémních limitů šumu  (OPRAVENÉ: skutočný ATR/NATR z 15m)
     natr = calculate_natr_14(klines)
-    max_natr = 9.0 if is_pd else 5.5
+    max_natr = 9.0 if is_pd else 6.5
     if natr > max_natr or natr < 0.12 or np.isnan(natr):
         return None
 
@@ -1566,7 +1567,7 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
     # 4. DRAWDOWN CONTROL & SHIELD MODE INTERCEPTOR
     # Pokud denní ztráta překročí 3 %, aktivuje se krizový štít
     is_shield_active = vault.get("shield_mode_active", False)
-    veto_threshold = 0.50 if is_shield_active else 0.435
+    veto_threshold = 0.42 if is_shield_active else 0.38
     
     # MATICOVÉ VETO: Pokud je buňka pod limitem úspěšnosti, Risk Engine příkaz zablokuje
     if wr < veto_threshold:
@@ -1599,11 +1600,11 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
     # Adaptivní sázkový zlomek: Shield → polovica; Scout Mode (cell trades < 5) → 0.15
     cell_trades = int(mmr_cell.get("total_trades", 0) or 0)
     if cell_trades < 5:
-        kelly_fraction = 0.15  # Scout Mode – half-ish sizing while learning
+        kelly_fraction = 0.20  # Scout Mode – uvoľnené
     elif is_shield_active:
-        kelly_fraction = 0.175
+        kelly_fraction = 0.20
     else:
-        kelly_fraction = 0.35
+        kelly_fraction = 0.40
     max_risk_pct = 0.015 if is_pd else 0.025
     kelly_margin = min(balance * full_kelly * kelly_fraction, balance * max_risk_pct)
 
@@ -2759,7 +2760,7 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
         cell_n = int(mmr_cell.get("total_trades", 0) or 0)
         # Scout Mode: untrained cell (total_trades < 5) → relax ~18%, half Kelly later
         if cell_n < 5:
-            cell_strictness = 0.82
+            cell_strictness = 0.75
             vault["scout_mode"] = True
         elif cell_n >= 3:
             vault["scout_mode"] = False
@@ -2776,7 +2777,7 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
         vault["last_active_rx"] = int(curr_rx)
         vault["last_active_ry"] = int(curr_ry)
     except Exception:
-        vault.setdefault("cell_strictness", 1.0)
+        vault.setdefault("cell_strictness", 0.85)
 
     # Sběr aktuálně obsazených mincí a sektorů pro zamezení nežádoucí korelace rizika
     active_syms = {p["symbol"] for p in vault["windows"].values() if p["status"] == "ACTIVE" and p["symbol"]}
@@ -2861,7 +2862,7 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
     # ===== OKNA 2 & 3: ELITNÍ ŠAMPIONI (Objem >= 10M USD) =====
     for w_idx in ("2", "3"):
         if vault["windows"][w_idx]["status"] == "WAITING":
-            cands = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 10_000_000.0, 1e12, btc_veto, klines_cache, is_pd_mode=False, vault=vault)
+            cands = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 7_000_000.0, 1e12, btc_veto, klines_cache, is_pd_mode=False, vault=vault)
             for c in cands:
                 setup = build_trade_setup(c, vault["balance"], int(w_idx), vault)
                 if setup:
@@ -2883,7 +2884,7 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
     # ===== OKNA 4 & 5: ŠAMPIONI NÍZKÉ LIKVIDITY (Objem 5M – 9.99M USD) =====
     for w_idx in ("4", "5"):
         if vault["windows"][w_idx]["status"] == "WAITING":
-            cands = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 5_000_000.0, 9_999_999.0, btc_veto, klines_cache, is_pd_mode=False, vault=vault)
+            cands = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 3_500_000.0, 9_999_999.0, btc_veto, klines_cache, is_pd_mode=False, vault=vault)
             for c in cands:
                 setup = build_trade_setup(c, vault["balance"], int(w_idx), vault)
                 if setup:
