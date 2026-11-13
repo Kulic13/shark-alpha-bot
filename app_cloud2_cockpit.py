@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, timezone
+import time
 from supabase import create_client, Client
 
 st.set_page_config(page_title="Shark Alpha Cockpit (Cloud 2)", layout="wide")
@@ -170,6 +171,21 @@ except Exception as e:
     st.error(f"Chyba načítania ai_mmr_matrix: {e}")
     ai_df = pd.DataFrame()
 
+# Live vault JSONB (System F telemetry source – no extra columns)
+vault_state = {}
+try:
+    vs_res = supabase.table("bot_vault_state").select("state_json").eq("id", 1).execute()
+    if vs_res.data:
+        raw = vs_res.data[0].get("state_json", {})
+        if isinstance(raw, str):
+            import json
+            vault_state = json.loads(raw) or {}
+        elif isinstance(raw, dict):
+            vault_state = raw
+except Exception as e:
+    st.caption(f"bot_vault_state nedostupné: {e}")
+    vault_state = {}
+
 # -------------------------------------------------------------------------
 # 1. HORNÁ ČASŤ OBRAZOVKY: DYNAMICKÝ EQUITY DASHBOARD & AI MATICA VÝKONU
 # -------------------------------------------------------------------------
@@ -177,9 +193,12 @@ top_col1, top_col2 = st.columns([1.2, 1.0])
 
 with top_col1:
     st.subheader("📈 Dynamický Equity Dashboard")
+    # Baseline 1000.0 USD – prefer live vault balance, fallback history
+    hist_bal = safe_float(history_df["current_balance"].iloc[-1], 1000.0) if not history_df.empty else 1000.0
+    curr_bal = safe_float(vault_state.get("balance"), hist_bal)
+    total_pnl = curr_bal - 1000.0
+
     if not history_df.empty:
-        curr_bal = safe_float(history_df["current_balance"].iloc[-1], 100.0)
-        total_pnl = curr_bal - 100.0
         win_trades = len(history_df[history_df["pnl_usd"] > 0])
         fail_trades = len(history_df[history_df["pnl_usd"] <= 0])
         total_trades = len(history_df)
@@ -255,7 +274,7 @@ with top_col1:
         fig_eq.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), template="plotly_dark")
         st.plotly_chart(fig_eq, use_container_width=True)
     else:
-        st.metric("Aktuálny Kapitál", "$100.00", "Čaká na prvý uzavretý obchod")
+        st.metric("Aktuálny Kapitál", f"${curr_bal:.2f}", f"{total_pnl:+.2f} USD")
         st.info("Zatiaľ neboli uzavreté žiadne obchody. Equity krivka sa vykreslí automaticky po prvom trejde.")
 
 with top_col2:
@@ -350,6 +369,104 @@ for wid in (1, 2, 3, 4, 5, 6):
                 st.caption(f"Posledný update: {updated}")
         else:
             st.caption("Stav: Čaká na vhodný signál z Cloudu 1...")
+
+# -------------------------------------------------------------------------
+# SYSTEM F: Adaptívna Telemetria & Audit Log
+# -------------------------------------------------------------------------
+st.subheader("🔬 System F: Adaptívna Telemetria & Audit Log")
+tab_meta, tab_mmr, tab_shadow = st.tabs([
+    "Meta-Controller & Váhy filtrov",
+    "3×3 MMR Heatmapa",
+    "Shadow Incubator Audit",
+])
+
+with tab_meta:
+    fw = vault_state.get("filter_weights") or {
+        "macro": 1.0, "liq": 1.0, "ofd": 1.0, "shield": 1.0, "micro": 1.0, "risk": 1.0,
+    }
+    rs = vault_state.get("reject_stats") or {
+        "macro": 0, "liq": 0, "ofd": 0, "shield": 0, "micro": 0, "risk": 0,
+    }
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Strictness LONG", f"{safe_float(vault_state.get('strictness_long'), 1.0):.2f}")
+    c2.metric("Strictness SHORT", f"{safe_float(vault_state.get('strictness_short'), 1.0):.2f}")
+    c3.metric("Daily PnL ($)", f"{safe_float(vault_state.get('daily_pnl_usd'), 0.0):+.2f}")
+    shield_on = bool(vault_state.get("shield_mode_active", False))
+    scout_on = bool(vault_state.get("scout_mode", False))
+    c4.metric("Shield Mode", "AKTÍVNY" if shield_on else "OFF")
+    c5.metric("Scout Mode", "AKTÍVNY" if scout_on else "OFF")
+
+    keys = ["macro", "liq", "ofd", "shield", "micro", "risk"]
+    weights = [safe_float(fw.get(k), 1.0) for k in keys]
+    rejects = [int(rs.get(k, 0) or 0) for k in keys]
+    fig_w = go.Figure()
+    fig_w.add_trace(go.Bar(
+        name="filter_weight",
+        x=keys, y=weights,
+        marker_color="#00ffcc",
+        text=[f"{w:.2f}" for w in weights],
+        textposition="outside",
+    ))
+    fig_w.add_hline(y=1.0, line_dash="dot", line_color="white", annotation_text="baseline 1.0")
+    fig_w.update_layout(
+        height=280, template="plotly_dark",
+        margin=dict(l=10, r=10, t=30, b=10),
+        yaxis=dict(range=[0.7, 1.35], title="weight"),
+        title="Váhy 6-stupňového lievika",
+    )
+    st.plotly_chart(fig_w, use_container_width=True)
+    stats_df = pd.DataFrame({"filter": keys, "weight": weights, "reject_count": rejects})
+    st.dataframe(stats_df, hide_index=True, use_container_width=True)
+
+with tab_mmr:
+    if not ai_df.empty and {"regime_x", "regime_y"}.issubset(set(ai_df.columns)):
+        x_map = {1: "BEAR", 2: "SIDE", 3: "BULL"}
+        y_map = {1: "LOW_VOL", 2: "MID_VOL", 3: "HIGH_VOL"}
+        tmp = ai_df.copy()
+        tmp["rx"] = tmp["regime_x"].map(lambda v: x_map.get(int(v), str(v)))
+        tmp["ry"] = tmp["regime_y"].map(lambda v: y_map.get(int(v), str(v)))
+        # win_rate pivot
+        if "win_rate" in tmp.columns:
+            piv_wr = tmp.pivot_table(index="ry", columns="rx", values="win_rate", aggfunc="mean")
+            # ordered axes
+            piv_wr = piv_wr.reindex(index=["LOW_VOL", "MID_VOL", "HIGH_VOL"], columns=["BEAR", "SIDE", "BULL"])
+            st.markdown("**Win rate (%)**")
+            st.dataframe(piv_wr.round(1), use_container_width=True)
+        if "total_trades" in tmp.columns:
+            piv_n = tmp.pivot_table(index="ry", columns="rx", values="total_trades", aggfunc="sum")
+            piv_n = piv_n.reindex(index=["LOW_VOL", "MID_VOL", "HIGH_VOL"], columns=["BEAR", "SIDE", "BULL"])
+            st.markdown("**Total trades**")
+            st.dataframe(piv_n.fillna(0).astype(int), use_container_width=True)
+        mod_cols = [c for c in ("sl_modifier", "tp_modifier") if c in tmp.columns]
+        if mod_cols:
+            st.markdown("**SL / TP modifiers**")
+            show = tmp[["rx", "ry"] + mod_cols + (["win_rate", "total_trades"] if "win_rate" in tmp.columns else [])]
+            st.dataframe(show, hide_index=True, use_container_width=True)
+    else:
+        st.info("AI Matica ešte neobsahuje dáta pre heatmapu režimov.")
+
+with tab_shadow:
+    pool = vault_state.get("shadow_pool") or vault_state.get("shadow_trades") or []
+    if not pool:
+        st.info("Shadow pool je prázdny – žiadne virtuálne blokované signály.")
+    else:
+        now_ts = time.time()
+        rows = []
+        for sh in pool:
+            ts0 = safe_float(sh.get("ts") or sh.get("opened_ts"), 0.0)
+            age_min = round((now_ts - ts0) / 60.0, 1) if ts0 > 0 else None
+            rows.append({
+                "symbol": sh.get("symbol"),
+                "direction": sh.get("direction"),
+                "blocked_by": sh.get("blocked_by") or sh.get("failed_filter"),
+                "reject_price": safe_float(sh.get("reject_price") or sh.get("entry_price")),
+                "virtual_tp1": safe_float(sh.get("virtual_tp1") or sh.get("tp1_price")),
+                "virtual_sl": safe_float(sh.get("virtual_sl") or sh.get("sl_price")),
+                "age_min": age_min,
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+st.divider()
 
 # -------------------------------------------------------------------------
 # 3. HLAVNÁ PLOCHA: 4 VEĽKÉ SVIEČKOVÉ GRAFY VERTIKÁLNE POD SEBOU
@@ -547,4 +664,4 @@ for wid in (1, 2, 3, 4, 5, 6):
     st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
-st.caption("Shark Alpha Cockpit Cloud 2 • Opravená verzia – y-range okolo ceny (walls mimo default view) / biela OPEN v-line / DCA filled / TP hit stavy")
+st.caption("Shark Alpha Cockpit Cloud 2 • System F telemetry • baseline 1000 USD • y-range okolo ceny / OPEN v-line / DCA & TP stavy")
