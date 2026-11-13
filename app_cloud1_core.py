@@ -61,6 +61,15 @@ def get_default_vault() -> dict:
         "daily_pnl_usd": 0.0,
         "daily_pnl_date": "",
         "day_start_balance": 1000.0,
+        # SYSTEM A/B meta-controller & adaptive funnel
+        "strictness_long": 1.0,
+        "strictness_short": 1.0,
+        "last_trade_opened_ts": 0.0,
+        "filter_weights": {
+            "macro": 1.0, "liq": 1.0, "ofd": 1.0,
+            "shield": 1.0, "micro": 1.0, "risk": 1.0,
+        },
+        "shadow_trades": [],
         "pending_supabase_sync": []
     }
 
@@ -81,6 +90,14 @@ def load_vault() -> dict:
                     state.setdefault("daily_pnl_usd", 0.0)
                     state.setdefault("daily_pnl_date", "")
                     state.setdefault("day_start_balance", float(state.get("balance", 1000.0)))
+                    state.setdefault("strictness_long", 1.0)
+                    state.setdefault("strictness_short", 1.0)
+                    state.setdefault("last_trade_opened_ts", 0.0)
+                    state.setdefault("filter_weights", {
+                        "macro": 1.0, "liq": 1.0, "ofd": 1.0,
+                        "shield": 1.0, "micro": 1.0, "risk": 1.0,
+                    })
+                    state.setdefault("shadow_trades", [])
                     state.setdefault("last_btc_veto", {
                         "veto_long": False,
                         "veto_short": False,
@@ -110,6 +127,14 @@ def load_vault() -> dict:
             state.setdefault("daily_pnl_usd", 0.0)
             state.setdefault("daily_pnl_date", "")
             state.setdefault("day_start_balance", float(state.get("balance", 1000.0)))
+            state.setdefault("strictness_long", 1.0)
+            state.setdefault("strictness_short", 1.0)
+            state.setdefault("last_trade_opened_ts", 0.0)
+            state.setdefault("filter_weights", {
+                "macro": 1.0, "liq": 1.0, "ofd": 1.0,
+                "shield": 1.0, "micro": 1.0, "risk": 1.0,
+            })
+            state.setdefault("shadow_trades", [])
             state.setdefault("last_btc_veto", {
                 "veto_long": False,
                 "veto_short": False,
@@ -522,13 +547,19 @@ async def fetch_okx_funding(client: httpx.AsyncClient, symbol: str) -> float:
 # BLOK 3B / 4: HLOUBKOVÁ MIKROSTRUKTÚRA OKX REST-EMULÁCIA (Knihy Depth-20, CVD-5, VPIN)
 # =========================================================================
 
-async def fetch_hloubkova_mikrostruktura(client: httpx.AsyncClient, symbol: str) -> dict:
+async def fetch_hloubkova_mikrostruktura(
+    client: httpx.AsyncClient,
+    symbol: str,
+    klines_15m: list | None = None,
+    cache: dict | None = None,
+) -> dict:
     """
     Simulace a výpočet asynchronního hloubkového vnímání knihy řádu (Depth 20) z OKX veřejného REST.
     - Vážený Order Book (WOB): Exponenciální útlum váhy podle vzdálenosti od středu (1/k).
     - OBI Imbalance: Výsledný tlak pasivních zdí v knize.
     - CVD a VPIN: Výpočet čisté agresivity trhu a toxicity toku objednávek.
     - best_bid / best_ask / spread_pct / wob_imbalance pre verify_execution bez duplicitného GET.
+    - klines_15m / cache: ak volajúci už má 15m sviečky, nevolá sa znova fetch_okx_klines.
     """
     inst_id = to_okx_inst_id(symbol)
     res = {
@@ -540,6 +571,8 @@ async def fetch_hloubkova_mikrostruktura(client: httpx.AsyncClient, symbol: str)
         "best_ask": 0.0,
         "spread_pct": 999.0,
         "wob_imbalance": 0.0,
+        "bids": [],
+        "asks": [],
         "ok": False,
     }
     try:
@@ -559,6 +592,8 @@ async def fetch_hloubkova_mikrostruktura(client: httpx.AsyncClient, symbol: str)
                 res["best_bid"] = best_bid
                 res["best_ask"] = best_ask
                 res["spread_pct"] = ((best_ask - best_bid) / best_bid) * 100.0
+                res["bids"] = bids[:20]
+                res["asks"] = asks[:20]
 
                 w_bid = sum(float(b[1]) * (1.0 / (k + 1)) for k, b in enumerate(bids[:20]))
                 w_ask = sum(float(a[1]) * (1.0 / (k + 1)) for k, a in enumerate(asks[:20]))
@@ -574,8 +609,11 @@ async def fetch_hloubkova_mikrostruktura(client: httpx.AsyncClient, symbol: str)
                     max_ask_idx = int(np.argmax([float(a[1]) for a in asks[:20]]))
                     res["neblizsi_stena_sl"] = float(asks[max_ask_idx][0])
                 # CVD (Cumulative Volume Delta) za posledních 5 svíček
-                klines = await fetch_okx_klines(client, symbol, "15m", 6)
-                if len(klines) >= 5:
+                # Preferuj klines od volajúceho (verify_*), inak jeden fetch (s cache)
+                klines = klines_15m
+                if not klines or len(klines) < 5:
+                    klines = await fetch_okx_klines(client, symbol, "15m", 6, cache)
+                if klines and len(klines) >= 5:
                     delta_suma = 0.0
                     total_v = 0.0
                     for k in klines[-5:]:
@@ -728,9 +766,271 @@ def calculate_rsi_14(closes: pd.Series) -> float:
     rs = float(gain.iloc[-1]) / last_loss
     return float(100.0 - (100.0 / (1.0 + rs)))
 
-def check_anti_extreme_shield(klines: list, direction: str, is_pd: bool = False, is_btc: bool = False) -> bool:
+
+def _get_filter_ctx(vault: dict | None, direction: str = "LONG") -> dict:
+    """
+    Lightweight adaptive funnel context (SYSTEM A/B + closed-loop System 2).
+    Combines meta strictness_long/short with regime cell_strictness from MMR matrix.
+    """
+    vault = vault or {}
+    weights = vault.get("filter_weights") or {}
+    base = float(
+        vault.get("strictness_long", 1.0) if direction == "LONG"
+        else vault.get("strictness_short", 1.0)
+    )
+    cell_s = float(vault.get("cell_strictness", 1.0))
+    strictness = float(np.clip(base * cell_s, 0.80, 1.30))
+    w = lambda k, d=1.0: float(weights.get(k, d))
+    return {
+        "strictness": strictness,
+        "cell_strictness": cell_s,
+        "w_macro": w("macro"),
+        "w_liq": w("liq"),
+        "w_ofd": w("ofd"),
+        "w_shield": w("shield"),
+        "w_micro": w("micro"),
+        "w_risk": w("risk"),
+        "ofd_long_thr": 1.30 * strictness * w("ofd"),
+        "ofd_short_thr": 0.70 / max(1e-9, strictness * w("ofd")),
+        "rsi_high": 78.0 - (strictness * w("shield") - 1.0) * 15.0,
+        "rsi_low": 22.0 + (strictness * w("shield") - 1.0) * 15.0,
+        "vpin_max": 0.80 / max(1e-9, strictness * w("micro")),
+    }
+
+
+def record_shadow_trade(vault: dict, cand: dict, failed_filter: str, tp1_price: float = 0.0, sl_price: float = 0.0):
+    """SYSTEM A – Shadow Incubator: virtual trade when Filters 5/6 reject a candidate.
+    Thread/async-safe append via vault-local list rebuild (max 10).
+    """
+    entry = float(cand.get("exec_price") or 0.0)
+    if entry <= 0 and cand.get("klines"):
+        try:
+            entry = float(get_close(cand["klines"][-1]))
+        except Exception:
+            entry = 0.0
+    if entry <= 0:
+        return
+    if tp1_price <= 0 or sl_price <= 0:
+        natr = float(cand.get("natr") or 2.0)
+        dir_mult = 1.0 if cand.get("direction") == "LONG" else -1.0
+        if tp1_price <= 0:
+            tp1_price = entry * (1.0 + dir_mult * (natr * 1.0 / 100.0))
+        if sl_price <= 0:
+            sl_price = entry * (1.0 - dir_mult * (natr * 2.0 / 100.0))
+    item = {
+        "symbol": cand.get("symbol"),
+        "direction": cand.get("direction"),
+        "entry_price": entry,
+        "tp1_price": float(tp1_price),
+        "sl_price": float(sl_price),
+        "failed_filter": failed_filter,
+        "opened_ts": time.time(),
+        "status": "ACTIVE",
+    }
+    # Atomický zápis: skopíruj, append, orez, priraď späť (minimal race window)
+    shadows = list(vault.get("shadow_trades") or [])
+    shadows.append(item)
+    vault["shadow_trades"] = shadows[-10:]
+
+
+
+
+def process_shadow_trades(vault: dict, price_tickers: dict, now_ts: float):
+    """SYSTEM A – evaluate shadow incubator outcomes (expire 4h).
+    price_tickers: map symbol -> ticker dict with 'last' (ACTIVE okná + shadow symboly).
+    """
+    shadows = list(vault.get("shadow_trades") or [])
+    if not shadows:
+        return
+    remaining = []
+    for sh in shadows:
+        if sh.get("status") != "ACTIVE":
+            continue
+        if (now_ts - float(sh.get("opened_ts", 0))) > 14400:
+            continue  # expired – bez feedbacku (nedostatočné dáta, nie falošný LOSS)
+        sym = sh.get("symbol")
+        if not sym or not price_tickers or sym not in price_tickers:
+            remaining.append(sh)
+            continue
+        try:
+            px = float(price_tickers[sym]["last"])
+        except Exception:
+            remaining.append(sh)
+            continue
+        is_long = sh.get("direction") == "LONG"
+        tp1 = float(sh.get("tp1_price", 0))
+        sl = float(sh.get("sl_price", 0))
+        hit_tp = (is_long and px >= tp1) or (not is_long and px <= tp1)
+        hit_sl = (is_long and px <= sl) or (not is_long and px >= sl)
+        if hit_tp and not hit_sl:
+            # virtual WIN – filter that rejected was too strict
+            try:
+                update_filter_weights_from_outcome(
+                    {"failed_filter": sh.get("failed_filter"), "direction": sh.get("direction")},
+                    True, f"SHADOW_WIN_{sh.get('failed_filter')}", vault
+                )
+            except Exception:
+                pass
+            continue
+        if hit_sl:
+            try:
+                update_filter_weights_from_outcome(
+                    {"failed_filter": sh.get("failed_filter"), "direction": sh.get("direction")},
+                    False, f"SHADOW_LOSS_{sh.get('failed_filter')}", vault
+                )
+            except Exception:
+                pass
+            continue
+        remaining.append(sh)
+    vault["shadow_trades"] = remaining[:10]
+
+
+def update_meta_controller(vault: dict, now_ts: float | None = None):
+    """SYSTEM B – Autonomous Meta-Controller for strictness_long/short."""
+    if now_ts is None:
+        now_ts = time.time()
+    s_long = float(vault.get("strictness_long", 1.0))
+    s_short = float(vault.get("strictness_short", 1.0))
+
+    if vault.get("shield_mode_active"):
+        s_long += 0.10
+        s_short += 0.10
+
+    last_open = float(vault.get("last_trade_opened_ts") or 0.0)
+    ny_lock = bool(vault.get("ny_open_lock", False))
+    if last_open > 0 and (now_ts - last_open) > 14400 and not ny_lock:
+        # Anti-Deadlock Time Decay: 2% toward 1.0
+        s_long = s_long * 0.98 + 1.0 * 0.02
+        s_short = s_short * 0.98 + 1.0 * 0.02
+
+    vault["strictness_long"] = float(np.clip(s_long, 0.80, 1.30))
+    vault["strictness_short"] = float(np.clip(s_short, 0.80, 1.30))
+
+
+def simulate_depth20_vwap(levels: list, notional_usd: float, fallback_px: float) -> float:
+    """
+    SYSTEM C – walk Depth-20 book levels [price, size, ...] to estimate realistic VWAP fill.
+    levels: bids (for sell/exit SHORT cover) or asks (for buy/LONG entry).
+    size is in contracts; without ctVal we treat size as notional-fraction proxy via price*size.
+    """
+    if not levels or notional_usd <= 0 or fallback_px <= 0:
+        return float(fallback_px)
+    remaining = float(notional_usd)
+    cost = 0.0
+    filled = 0.0
+    for lvl in levels[:20]:
+        try:
+            px = float(lvl[0])
+            sz = float(lvl[1])
+        except Exception:
+            continue
+        if px <= 0 or sz <= 0:
+            continue
+        level_notional = px * sz  # proxy notional
+        take = min(remaining, level_notional)
+        cost += take
+        filled += take / px
+        remaining -= take
+        if remaining <= 1e-9:
+            break
+    if filled <= 1e-12:
+        return float(fallback_px)
+    return cost / filled
+
+
+def update_filter_weights_from_outcome(pos: dict, is_win: bool, reason: str, vault: dict):
+    """
+    Closed-loop System 1 <-> System 2 credit assignment.
+    Uses entry_fingerprint on real trades + failed_filter on shadow trades.
+    Weights always clamped to [0.80, 1.25].
+    """
+    weights = vault.setdefault("filter_weights", {
+        "macro": 1.0, "liq": 1.0, "ofd": 1.0,
+        "shield": 1.0, "micro": 1.0, "risk": 1.0,
+    })
+    reason_u = (reason or "").upper()
+    failed = (pos.get("failed_filter") or "").upper() if pos else ""
+    fp = (pos.get("entry_fingerprint") or {}) if pos else {}
+    direction = (pos.get("direction") or "").upper() if pos else ""
+
+    def adj(key: str, delta: float):
+        weights[key] = float(np.clip(float(weights.get(key, 1.0)) + delta, 0.80, 1.25))
+
+    def clamp_all():
+        for k in list(weights.keys()):
+            weights[k] = float(np.clip(float(weights.get(k, 1.0)), 0.80, 1.25))
+        vault["filter_weights"] = weights
+
+    # --- Shadow incubator feedback ---
+    if "SHADOW_WIN" in reason_u:
+        # Overly restrictive filter that blocked a winner → loosen it
+        if "MICRO" in reason_u or "VERIFY" in reason_u or "FILTER_5" in failed or "MICRO" in failed:
+            adj("micro", -0.015)
+        if "RISK" in reason_u or "MMR" in reason_u or "FILTER_6" in failed or "RISK" in failed:
+            adj("risk", -0.015)
+        if "SHIELD" in reason_u or "SHIELD" in failed:
+            adj("shield", -0.015)
+        # Slightly reduce directional strictness
+        if direction == "SHORT":
+            vault["strictness_short"] = float(np.clip(float(vault.get("strictness_short", 1.0)) - 0.02, 0.80, 1.30))
+        else:
+            vault["strictness_long"] = float(np.clip(float(vault.get("strictness_long", 1.0)) - 0.02, 0.80, 1.30))
+        clamp_all()
+        return
+
+    if "SHADOW_LOSS" in reason_u:
+        if "MICRO" in reason_u or "VERIFY" in reason_u or "FILTER_5" in failed:
+            adj("micro", +0.02)
+        if "RISK" in reason_u or "FILTER_6" in failed:
+            adj("risk", +0.02)
+        clamp_all()
+        return
+
+    # --- Real trade: WIN → gently relax all weights toward 1.0 ---
+    if is_win:
+        for k in list(weights.keys()):
+            w0 = float(weights.get(k, 1.0))
+            weights[k] = float(np.clip(w0 * 0.98 + 1.0 * 0.02, 0.80, 1.25))
+        clamp_all()
+        return
+
+    # --- Real trade: LOSS → credit assignment via entry_fingerprint ---
+    if reason_u == "VPIN_EMERGENCY_ESCAPE" or float(fp.get("micro_vpin", 0.0) or 0.0) > 0.65:
+        adj("micro", +0.03)
+    if direction == "LONG" and float(fp.get("shield_rsi", 50.0) or 50.0) > 70.0:
+        adj("shield", +0.03)
+    if direction == "SHORT" and float(fp.get("shield_rsi", 50.0) or 50.0) < 30.0:
+        adj("shield", +0.03)
+    if direction == "LONG" and float(fp.get("ofd_val", 1.3) or 1.3) < 1.38:
+        adj("ofd", +0.03)
+    if direction == "SHORT" and float(fp.get("ofd_val", 0.7) or 0.7) > 0.65:
+        adj("ofd", +0.03)
+    wob = float(fp.get("micro_wob", 0.0) or 0.0)
+    # Against trade direction: LONG with negative WOB (ask pressure) or SHORT with positive WOB
+    if direction == "LONG" and wob < -0.08:
+        adj("micro", +0.02)
+    if direction == "SHORT" and wob > 0.08:
+        adj("micro", +0.02)
+    if "LIQUIDATION" in reason_u:
+        adj("risk", +0.04)
+    if "ORDERFLOW" in reason_u:
+        adj("ofd", +0.02)
+    if "HARD_SL" in reason_u or reason_u == "HARD_SL_HIT":
+        adj("shield", +0.02)
+
+    clamp_all()
+
+
+def check_anti_extreme_shield(
+    klines: list,
+    direction: str,
+    is_pd: bool = False,
+    is_btc: bool = False,
+    filter_ctx: dict | None = None,
+) -> bool:
     if len(klines) < 20:
         return False
+    ctx = filter_ctx or {}
     df = pd.DataFrame(klines, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "cf"])
     for col in ("o", "h", "l", "c"):
         df[col] = df[col].astype(float)
@@ -753,19 +1053,21 @@ def check_anti_extreme_shield(klines: list, direction: str, is_pd: bool = False,
     std_20 = float(df["c"].rolling(20).std().iloc[-1])
     if atr_14 <= 0 or np.isnan(atr_14) or np.isnan(std_20):
         return False
+    # SYSTEM A: adaptive RSI from filter_ctx (strictness × w_shield)
+    ctx_rsi_high = float(ctx.get("rsi_high", 78.0))
+    ctx_rsi_low = float(ctx.get("rsi_low", 22.0))
     if is_pd:
         max_atr_dist = 2.2
-        rsi_high, rsi_low = 78.0, 22.0
+        rsi_high, rsi_low = max(ctx_rsi_high, 78.0), min(ctx_rsi_low, 22.0)
         skip_bb = True
     elif is_btc:
         max_atr_dist = 1.8
-        rsi_high, rsi_low = 75.0, 25.0
+        rsi_high, rsi_low = min(75.0, ctx_rsi_high), max(25.0, ctx_rsi_low)
         skip_bb = True
     else:
-        # Štandardný režim: BB filter vypnutý – silné breakouty (OFD > 1.30)
-        # takmer vždy zatvárajú nad horným BB pásmom; ATR + RSI stačia na ochranu.
+        # Štandardný režim: BB filter vypnutý; ATR + adaptive RSI
         max_atr_dist = 2.0
-        rsi_high, rsi_low = 78.0, 22.0
+        rsi_high, rsi_low = ctx_rsi_high, ctx_rsi_low
         skip_bb = True
     bb_upper = ema_20 + (2.0 * std_20)
     bb_lower = ema_20 - (2.0 * std_20)
@@ -797,7 +1099,8 @@ async def evaluate_candidates(
     max_vol: float,
     btc_veto: dict,
     klines_cache: dict,
-    is_pd_mode: bool = False
+    is_pd_mode: bool = False,
+    vault: dict | None = None,
 ):
     sectors_map = get_sectors_map()
     metrics_24h = get_24h_metrics()
@@ -860,7 +1163,16 @@ async def evaluate_candidates(
                             "sector": sec,
                             "ofd": ofd,
                             "klines": klines,
-                            "exec_price": exec_price
+                            "exec_price": exec_price,
+                            "entry_fingerprint": {
+                                "macro_btc_1h": float(btc_veto.get("btc_1h_pct", 0.0)),
+                                "liq_vol_24h": float(vol),
+                                "ofd_val": float(ofd),
+                                "shield_rsi": float(calculate_rsi_14(pd.Series([float(get_close(k)) for k in klines]))) if len(klines) >= 15 else 50.0,
+                                "micro_wob": 0.0,
+                                "micro_vpin": float(calculate_vpin_toxicity(klines)) if len(klines) >= 10 else 0.0,
+                                "risk_wr": 52.0,
+                            },
                         }
 
                     # SHORT: dump / funding trap (uvoľnené – nižší move + nižší funding práh)
@@ -909,7 +1221,16 @@ async def evaluate_candidates(
                             "sector": sec,
                             "ofd": ofd,
                             "klines": klines,
-                            "exec_price": exec_price
+                            "exec_price": exec_price,
+                            "entry_fingerprint": {
+                                "macro_btc_1h": float(btc_veto.get("btc_1h_pct", 0.0)),
+                                "liq_vol_24h": float(vol),
+                                "ofd_val": float(ofd),
+                                "shield_rsi": float(calculate_rsi_14(pd.Series([float(get_close(k)) for k in klines]))) if len(klines) >= 15 else 50.0,
+                                "micro_wob": 0.0,
+                                "micro_vpin": float(calculate_vpin_toxicity(klines)) if len(klines) >= 10 else 0.0,
+                                "risk_wr": 52.0,
+                            },
                         }
                     if ofd < 0.60 and not is_15m_green and price_change_pct < -3.0:
                         if btc_veto.get("veto_short"):
@@ -931,7 +1252,16 @@ async def evaluate_candidates(
                             "sector": sec,
                             "ofd": ofd,
                             "klines": klines,
-                            "exec_price": exec_price
+                            "exec_price": exec_price,
+                            "entry_fingerprint": {
+                                "macro_btc_1h": float(btc_veto.get("btc_1h_pct", 0.0)),
+                                "liq_vol_24h": float(vol),
+                                "ofd_val": float(ofd),
+                                "shield_rsi": float(calculate_rsi_14(pd.Series([float(get_close(k)) for k in klines]))) if len(klines) >= 15 else 50.0,
+                                "micro_wob": 0.0,
+                                "micro_vpin": float(calculate_vpin_toxicity(klines)) if len(klines) >= 10 else 0.0,
+                                "risk_wr": 52.0,
+                            },
                         }
                     return None
                 direction = None
@@ -946,25 +1276,61 @@ async def evaluate_candidates(
                     if funding_rate < -0.0050:
                         direction = "LONG"
                         is_trap = True
+                fctx_long = _get_filter_ctx(vault, "LONG")
+                fctx_short = _get_filter_ctx(vault, "SHORT")
+                ofd_long_thr = float(fctx_long.get("ofd_long_thr", 1.30))
+                ofd_short_thr = float(fctx_short.get("ofd_short_thr", 0.70))
                 if direction is None:
-                    if ofd > 1.30 and is_15m_green:
+                    if ofd > ofd_long_thr and is_15m_green:
                         direction = "LONG"
-                    elif ofd < 0.70 and not is_15m_green:
+                    elif ofd < ofd_short_thr and not is_15m_green:
                         direction = "SHORT"
                 if direction:
                     if direction == "LONG" and btc_veto.get("veto_long"):
                         return None
                     if direction == "SHORT" and btc_veto.get("veto_short"):
                         return None
-                    if not check_anti_extreme_shield(klines, direction, is_pd=False):
+                    fctx = fctx_long if direction == "LONG" else fctx_short
+                    if not check_anti_extreme_shield(klines, direction, is_pd=False, filter_ctx=fctx):
                         return None
                     ok_exec, exec_price = await verify_execution_confirmation(
-                        client, sym, direction, klines, ofd, False, klines_cache
+                        client, sym, direction, klines, ofd, False, klines_cache, filter_ctx=fctx
                     )
                     if not ok_exec:
+                        # SYSTEM A shadow: passed 1-4, failed filter 5 (micro)
+                        if vault is not None:
+                            record_shadow_trade(
+                                vault,
+                                {"symbol": sym, "direction": direction, "exec_price": float(get_close(klines[-1])),
+                                 "klines": klines, "natr": calculate_natr_14(klines)},
+                                failed_filter="FILTER_5_MICRO",
+                            )
                         return None
                     vol_norm = np.log1p(vol)
                     sas_score = (abs(price_change_pct) + 1.0) * (ofd if direction == "LONG" else (1.0 / max(0.1, ofd))) * (10.0 / vol_norm)
+                    # Entry fingerprint for closed-loop credit assignment
+                    # micro_* musia byť reálne z verify (inak credit assignment skresľuje MMR/filtre)
+                    try:
+                        rsi_fp = float(calculate_rsi_14(pd.Series([float(get_close(k)) for k in klines])))
+                    except Exception:
+                        rsi_fp = 50.0
+                    micro_wob = float((fctx or {}).get("last_wob", 0.0) or 0.0)
+                    micro_vpin = float((fctx or {}).get("last_vpin", 0.0) or 0.0)
+                    # Fallback: ak verify nevystavil VPIN, spočítaj z klines (bez extra API)
+                    if micro_vpin == 0.0 and klines:
+                        try:
+                            micro_vpin = float(calculate_vpin_toxicity(klines))
+                        except Exception:
+                            pass
+                    entry_fingerprint = {
+                        "macro_btc_1h": float(btc_veto.get("btc_1h_pct", 0.0)),
+                        "liq_vol_24h": float(vol),
+                        "ofd_val": float(ofd),
+                        "shield_rsi": float(rsi_fp),
+                        "micro_wob": micro_wob,
+                        "micro_vpin": micro_vpin,
+                        "risk_wr": 52.0,  # filled in build_trade_setup from MMR cell
+                    }
                     return {
                         "symbol": sym,
                         "direction": direction,
@@ -974,7 +1340,8 @@ async def evaluate_candidates(
                         "sector": sec,
                         "ofd": ofd,
                         "klines": klines,
-                        "exec_price": exec_price
+                        "exec_price": exec_price,
+                        "entry_fingerprint": entry_fingerprint,
                     }
             except Exception:
                 return None
@@ -1084,6 +1451,7 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
     
     # MATICOVÉ VETO: Pokud je buňka pod limitem úspěšnosti, Risk Engine příkaz zablokuje
     if wr < veto_threshold:
+        cand["_failed_filter"] = "FILTER_6_RISK_MMR"
         return None
 
     # 5. DYNAMICKÁ VOLBA REGIMU A LEVERAGE PODLE OSY Y
@@ -1124,14 +1492,9 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
         return None
     margin_usd = kelly_margin
 
-    # 7. EXEKUČNÍ DEKOMPOZICE (TWAP TWIN ENTRY VELIKOST)
-    # Rozdělení na 60 % pasivní limit (maker) a 40 % aktivní krytí
-    if is_pd:
-        active_margin = margin_usd
-    else:
-        active_margin = margin_usd * 0.30
-        if (active_margin * max(1, leverage)) < min_notional:
-            active_margin = min(min_margin, margin_usd)
+    # 7. EXEKUČNÍ DEKOMPOZICE – placeholder; finálne active_margin nastaví SYSTEM C TWAP 40/60 nižšie
+    # (zámerne tu neprepisujeme percentá, aby nevznikol konflikt 30% vs 40%)
+    active_margin = margin_usd  # dočasne plná; SYSTEM C upraví non-PD na 40% market leg
 
     # Sestavení cenových hladin risk managementu
     dir_mult = 1.0 if direction == "LONG" else -1.0
@@ -1173,6 +1536,27 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
         raw_tp3 = liq_ref * 0.995
         tp3 = min(raw_tp3, tp2 * (1.0 - min_tp3_gap))
 
+    # SYSTEM C – TWAP 40/60 (non-P&D): 40% market now (taker), 60% pending limit (maker)
+    # Jediný zdroj pravdy pre active_margin pri vstupe (žiadny starý 30% split).
+    pending_limit_margin = 0.0
+    pending_limit_price = 0.0
+    if not is_pd:
+        market_frac = 0.40
+        filled_margin = margin_usd * market_frac
+        # Ak by 40% leg neprešiel min notional, daj celú maržu marketom (bez pending)
+        if (filled_margin * max(1, leverage)) < min_notional:
+            if margin_usd * max(1, leverage) < min_notional:
+                return None  # celý setup pod minimom OKX
+            active_margin = margin_usd
+            pending_limit_margin = 0.0
+            pending_limit_price = 0.0
+        else:
+            active_margin = filled_margin
+            pending_limit_margin = margin_usd * (1.0 - market_frac)
+            pending_limit_price = price
+    else:
+        active_margin = margin_usd
+
     # Generování unikátních klientských ID (clOrdId) pro bleskové AMEND operace
     tx_id = f"sk_{int(time.time()*1000)}"
     initial_ofd = compute_ofd_from_klines(klines)
@@ -1193,6 +1577,9 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
         "tp_mod": tp_mod,
         "margin_usd": margin_usd,
         "active_margin": active_margin,
+        "pending_limit_margin": float(pending_limit_margin),
+        "pending_limit_price": float(pending_limit_price),
+        "last_funding_hour": -1,
         "entry_price": price,
         "dca1_price": dca1, "dca1_filled": False,
         "dca2_price": dca2, "dca2_filled": False,
@@ -1203,6 +1590,8 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
         "sl_tsl_price": sl_price,
         "initial_sl_price": sl_price,  # pôvodný SL pre správny R-multiple celého obchodu
         "initial_margin_usd": float(margin_usd),  # celková plánovaná marža pri vstupe
+        "max_deployed_margin": float(margin_usd),  # plánovaný plný kapitál; rastie len ak DCA > plán
+        "initial_entry_price": float(price),  # fixný vstup pre R-multiple (DCA nemení risk base)
         "realized_pnl_usd": 0.0,  # kumulovaný PnL z TP1/TP2 scale-outov
         "tsl_active": False,
         "extreme_price": price,
@@ -1216,7 +1605,8 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
         "okx_sl_order_id": f"{tx_id}_sl_{window_id}",
         "okx_tp1_order_id": f"{tx_id}_tp1_{window_id}",
         "okx_tp2_order_id": f"{tx_id}_tp2_{window_id}",
-        "okx_tp3_order_id": f"{tx_id}_tp3_{window_id}"
+        "okx_tp3_order_id": f"{tx_id}_tp3_{window_id}",
+        "entry_fingerprint": _build_entry_fingerprint(cand, vault, mmr_cell, initial_ofd),
     }
 
 
@@ -1461,7 +1851,8 @@ async def verify_execution_confirmation(
     klines_15m: list,
     ofd: float,
     is_pd: bool,
-    cache: dict
+    cache: dict,
+    filter_ctx: dict | None = None,
 ) -> tuple[bool, float]:
     """
     Verifikace exekuce 2.0: Spojuje asynchronní datové mikroskopy z OKX hloubky 20.
@@ -1490,7 +1881,7 @@ async def verify_execution_confirmation(
 
     # 3. Hĺbková mikroštruktúra (jedno API volanie cez fetch_hloubkova_mikrostruktura)
     try:
-        micro = await fetch_hloubkova_mikrostruktura(client, symbol)
+        micro = await fetch_hloubkova_mikrostruktura(client, symbol, klines_15m=klines_15m, cache=cache)
         if not micro.get("ok"):
             return False, 0.0
 
@@ -1501,9 +1892,10 @@ async def verify_execution_confirmation(
         if spread_pct > max_spread:
             return False, 0.0
 
-        # Preferuj VPIN z klines_15m (presnejší bucket výpočet), fallback na micro
+        # Preferuj VPIN z klines_15m; adaptive max from filter_ctx (SYSTEM A)
         vpin_score = calculate_vpin_toxicity(klines_15m)
-        if vpin_score > 0.80:
+        vpin_max = float((filter_ctx or {}).get("vpin_max", 0.80))
+        if vpin_score > vpin_max:
             return False, 0.0
 
         wob_imbalance = float(micro.get("wob_imbalance", 0.0))
@@ -1512,7 +1904,14 @@ async def verify_execution_confirmation(
         if direction == "SHORT" and wob_imbalance > 0.15:
             return False, 0.0
 
-        exec_price = best_ask if direction == "LONG" else best_bid
+        # SYSTEM C – Depth-20 VWAP estimate for entry (reuse already-fetched book)
+        levels = (micro.get("asks") or []) if direction == "LONG" else (micro.get("bids") or [])
+        fallback = best_ask if direction == "LONG" else best_bid
+        exec_price = simulate_depth20_vwap(levels, notional_usd=50.0, fallback_px=fallback)
+        # Stash microstructure metrics on filter_ctx for entry_fingerprint
+        if filter_ctx is not None:
+            filter_ctx["last_wob"] = float(wob_imbalance)
+            filter_ctx["last_vpin"] = float(vpin_score)
         return True, exec_price
     except Exception:
         return False, 0.0
@@ -1552,7 +1951,7 @@ async def verify_execution_confirmation_btc(
             return False, 0.0
 
     try:
-        micro = await fetch_hloubkova_mikrostruktura(client, symbol)
+        micro = await fetch_hloubkova_mikrostruktura(client, symbol, klines_15m=klines_15m, cache=cache)
         if not micro.get("ok"):
             return False, 0.0
 
@@ -1572,7 +1971,9 @@ async def verify_execution_confirmation_btc(
         if direction == "SHORT" and wob_imbalance > 0.12:
             return False, 0.0
 
-        exec_price = best_ask if direction == "LONG" else best_bid
+        levels = (micro.get("asks") or []) if direction == "LONG" else (micro.get("bids") or [])
+        fallback = best_ask if direction == "LONG" else best_bid
+        exec_price = simulate_depth20_vwap(levels, notional_usd=100.0, fallback_px=fallback)
         return True, exec_price
     except Exception:
         return False, 0.0
@@ -1625,9 +2026,14 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
     active_margin = float(pos.get("active_margin", 0.0))
     entry = float(pos.get("entry_price", exit_price))
 
-    gross_pnl_pct = ((exit_price - entry) / entry) * dir_mult * leverage * 100.0
-    net_pnl_pct = gross_pnl_pct - (cost_rate * leverage * 100.0)
-    pnl_usd = active_margin * (net_pnl_pct / 100.0)
+    # Liquidation: zvyšok marže je stratený celý (nie lineárny % z liq_price)
+    if pos.get("_force_full_margin_loss") or reason == "LIQUIDATION_HIT":
+        pnl_usd = -abs(active_margin)
+        net_pnl_pct = -100.0 * leverage if active_margin > 0 else 0.0
+    else:
+        gross_pnl_pct = ((exit_price - entry) / max(1e-9, entry)) * dir_mult * leverage * 100.0
+        net_pnl_pct = gross_pnl_pct - (cost_rate * leverage * 100.0)
+        pnl_usd = active_margin * (net_pnl_pct / 100.0)
 
     vault["balance"] = round(float(vault.get("balance", 100.0)) + pnl_usd, 4)
     update_daily_pnl_and_shield(vault, pnl_usd, now_dt)
@@ -1636,12 +2042,19 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
     realized_prev = float(pos.get("realized_pnl_usd", 0.0))
     total_pnl_usd = realized_prev + float(pnl_usd)
 
-    # R-multiple z celého obchodu voči pôvodnému riziku (initial SL, nie posunutý TSL)
-    initial_sl = float(pos.get("initial_sl_price") or pos.get("sl_tsl_price") or entry)
-    initial_margin = float(pos.get("initial_margin_usd") or pos.get("margin_usd") or active_margin or 1.0)
-    sl_dist = abs(entry - initial_sl) / max(1e-9, entry)
-    # 1R ≈ initial_margin * sl_dist * leverage (USD riziko pri plnej marži)
-    risk_usd = max(1e-9, initial_margin * sl_dist * leverage)
+    # R-multiple: risk base = max nasadená marža × |initial_entry − initial_sl| / initial_entry
+    # initial_entry sa NEPREPISUJE pri DCA (priemerný entry by skreslil 1R v MMR matici)
+    initial_entry = float(pos.get("initial_entry_price") or entry)
+    initial_sl = float(pos.get("initial_sl_price") or pos.get("sl_tsl_price") or initial_entry)
+    deployed_margin = float(
+        pos.get("max_deployed_margin")
+        or pos.get("initial_margin_usd")
+        or pos.get("margin_usd")
+        or active_margin
+        or 1.0
+    )
+    sl_dist = abs(initial_entry - initial_sl) / max(1e-9, initial_entry)
+    risk_usd = max(1e-9, deployed_margin * sl_dist * leverage)
     r_mult = total_pnl_usd / risk_usd
 
     is_win = total_pnl_usd > 0
@@ -1657,6 +2070,10 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
             regime_x=pos.get("regime_x"),
             regime_y=pos.get("regime_y"),
         )
+    except Exception:
+        pass
+    try:
+        update_filter_weights_from_outcome(pos, is_win, reason, vault)
     except Exception:
         pass
 
@@ -1839,7 +2256,13 @@ async def run_core_cycle(vault: dict):
 
     async with httpx.AsyncClient(http2=True, timeout=8.0) as client:
         active_syms_list = [pos["symbol"] for _, pos in active_windows]
-        active_tickers = await fetch_active_tickers_only(client, active_syms_list) if active_syms_list else {}
+        # Shadow incubator potrebuje ceny aj pre symboly mimo ACTIVE okien
+        shadow_syms = [
+            s.get("symbol") for s in (vault.get("shadow_trades") or [])
+            if s.get("status") == "ACTIVE" and s.get("symbol")
+        ]
+        ticker_syms = list({*active_syms_list, *[x for x in shadow_syms if x]})
+        active_tickers = await fetch_active_tickers_only(client, ticker_syms) if ticker_syms else {}
         klines_cache = {}
 
         for win_key, pos in active_windows:
@@ -1875,6 +2298,80 @@ async def run_core_cycle(vault: dict):
                     pass
 
             ofd = pos.get("cached_ofd", 1.0)
+
+            # SYSTEM D – intrabar wick levels from latest 15m candle
+            candle_high = curr_price
+            candle_low = curr_price
+            if klines and len(klines) > 0:
+                try:
+                    candle_high = float(get_high(klines[-1]))
+                    candle_low = float(get_low(klines[-1]))
+                except Exception:
+                    pass
+
+            # SYSTEM D – FUTURES liquidation price (90% of margin at leverage)
+            # Jeden path: close_position spočíta PnL; žiadne manuálne double-write balance/realized.
+            if pos.get("regime") == "FUTURES" and int(pos.get("leverage") or 1) > 1:
+                lev = max(1, int(pos.get("leverage", 1)))
+                entry_px = float(pos.get("entry_price") or curr_price)
+                liq_price = entry_px * (1.0 - dir_mult * (0.90 / lev))
+                hit_liq = (
+                    (is_long and (curr_price <= liq_price or candle_low <= liq_price))
+                    or (not is_long and (curr_price >= liq_price or candle_high >= liq_price))
+                )
+                if hit_liq:
+                    # Flag pre close_position: full remaining margin loss (nie mark-to-market %)
+                    pos["_force_full_margin_loss"] = True
+                    close_position(pos, liq_price, "LIQUIDATION_HIT", vault)
+                    db_dirty = True
+                    continue
+
+            # SYSTEM D – Funding settlement at 00/08/16 UTC
+            if now_dt.hour in (0, 8, 16) and int(pos.get("last_funding_hour", -1)) != now_dt.hour:
+                try:
+                    funding_rate = await fetch_okx_funding(client, sym)
+                    # LONG pays when funding > 0; SHORT receives (sign via dir_mult)
+                    notional = float(pos.get("active_margin") or 0.0) * float(pos.get("leverage") or 1)
+                    funding_fee_usd = notional * float(funding_rate) * dir_mult
+                    vault["balance"] = round(float(vault.get("balance", 0.0)) - funding_fee_usd, 4)
+                    pos["realized_pnl_usd"] = float(pos.get("realized_pnl_usd", 0.0)) - funding_fee_usd
+                    pos["last_funding_hour"] = now_dt.hour
+                    db_dirty = True
+                except Exception:
+                    pass
+
+            # SYSTEM C – TWAP pending limit fill (60% remainder)
+            pending_m = float(pos.get("pending_limit_margin") or 0.0)
+            pending_px = float(pos.get("pending_limit_price") or 0.0)
+            if pending_m > 0 and pending_px > 0:
+                touched = (
+                    (is_long and curr_price <= pending_px)
+                    or (not is_long and curr_price >= pending_px)
+                )
+                # Cancel if price ran away > 0.5 * NATR
+                away = abs(curr_price - pending_px) / max(1e-9, pending_px) * 100.0
+                if away > 0.5 * float(natr or 1.0):
+                    pos["pending_limit_margin"] = 0.0
+                    pos["pending_limit_price"] = 0.0
+                    db_dirty = True
+                elif touched:
+                    # Maker fill 0.02% fee; blend average entry
+                    old_am = float(pos.get("active_margin") or 0.0)
+                    old_entry = float(pos.get("entry_price") or pending_px)
+                    fill_px = pending_px  # limit price
+                    new_am = old_am + pending_m
+                    if new_am > 0:
+                        pos["entry_price"] = (old_am * old_entry + pending_m * fill_px) / new_am
+                    pos["active_margin"] = new_am
+                    pos["max_deployed_margin"] = max(
+                        float(pos.get("max_deployed_margin", new_am)), new_am
+                    )
+                    # Maker fee
+                    maker_fee = pending_m * float(pos.get("leverage") or 1) * 0.0002
+                    vault["balance"] = round(float(vault.get("balance", 0.0)) - maker_fee, 4)
+                    pos["pending_limit_margin"] = 0.0
+                    pos["pending_limit_price"] = 0.0
+                    db_dirty = True
 
             # A. VPIN EMERGENCY ESCAPE (Toxický štít v protisměru)
             if vpin_score > 0.85:
@@ -1935,6 +2432,10 @@ async def run_core_cycle(vault: dict):
                             new_qty = (added_m * pos["leverage"]) / dca_p
                             pos["entry_price"] = ((old_qty * pos["entry_price"]) + (new_qty * dca_p)) / (old_qty + new_qty)
                             pos["active_margin"] += added_m
+                            pos["max_deployed_margin"] = max(
+                                float(pos.get("max_deployed_margin", pos["active_margin"])),
+                                float(pos["active_margin"]),
+                            )
                             pos[f"dca{idx}_filled"] = True
                             db_dirty = True
 
@@ -1943,7 +2444,7 @@ async def run_core_cycle(vault: dict):
 
             # D. FÁZOVANÝ SCALE-OUT (TP1 & TP2) S REŽIMOVÝM TSL
             if not pos.get("tp1_hit", False):
-                if (is_long and curr_price >= pos["tp1_price"]) or (not is_long and curr_price <= pos["tp1_price"]):
+                if (is_long and (curr_price >= pos["tp1_price"] or candle_high >= pos["tp1_price"])) or (not is_long and (curr_price <= pos["tp1_price"] or candle_low <= pos["tp1_price"])):
                     # Odprodej 50 % pozice tržním scale-outem
                     execute_scale_out(pos, curr_price, 0.50, "TP1_SCALE_OUT", vault, now_dt)
                     pos["tp1_hit"] = True
@@ -1974,7 +2475,7 @@ async def run_core_cycle(vault: dict):
                     paper_amend_sl(pos, new_tsl, "REGIME_TSL")
                     db_dirty = True
 
-                if (is_long and curr_price >= pos["tp2_price"]) or (not is_long and curr_price <= pos["tp2_price"]):
+                if (is_long and (curr_price >= pos["tp2_price"] or candle_high >= pos["tp2_price"])) or (not is_long and (curr_price <= pos["tp2_price"] or candle_low <= pos["tp2_price"])):
                     execute_scale_out(pos, curr_price, 0.60, "TP2_SCALE_OUT", vault, now_dt)
                     pos["tp2_hit"] = True
                     pos["extreme_price"] = curr_price
@@ -2016,11 +2517,17 @@ async def run_core_cycle(vault: dict):
                         paper_amend_sl(pos, new_tsl, "POST_TP2_TSL")
                         db_dirty = True
 
-            # F. VYHODNOCENÍ ZÁSAHU TVRDÉHO SL / TSL NA BURZE (paper)
-            hit_sl_tsl = (is_long and curr_price <= pos["sl_tsl_price"]) or (not is_long and curr_price >= pos["sl_tsl_price"])
+            # F. VYHODNOCENÍ ZÁSAHU TVRDÉHO SL / TSL NA BURZE (paper + intrabar wick)
+            sl_px = float(pos["sl_tsl_price"])
+            hit_sl_tsl = (
+                (is_long and (curr_price <= sl_px or candle_low <= sl_px))
+                or (not is_long and (curr_price >= sl_px or candle_high >= sl_px))
+            )
             if hit_sl_tsl:
                 reason = "TRAILING_SL_PROFIT" if pos["tsl_active"] else "HARD_SL_HIT"
-                close_position(pos, curr_price, reason, vault)
+                # Exit at SL level (wick fill), not necessarily last trade price
+                exit_px = sl_px
+                close_position(pos, exit_px, reason, vault)
                 db_dirty = True
                 continue
 
@@ -2034,6 +2541,18 @@ async def run_core_cycle(vault: dict):
         # VŽDY zosúlaď active_positions s vault-om (cockpit musí vidieť rovnaký počet obchodov)
         try:
             sync_all_windows_to_db(vault)
+        except Exception:
+            pass
+
+        # SYSTEM A – shadow incubator mark-to-market
+        try:
+            process_shadow_trades(vault, active_tickers, now_ts)
+        except Exception:
+            pass
+
+        # SYSTEM B – meta-controller strictness update
+        try:
+            update_meta_controller(vault, now_ts)
         except Exception:
             pass
 
@@ -2052,30 +2571,22 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
     vault["last_main_scan"] = now_ts
     
     # A. VÝPOČET PLOVOUCÍCH PERCENTILŮ VOLATILITY (Osa Y)
-    # Skutočný denný True Range (vrátane gapov) → Normalized TR % → natr_history_30d
-    # Percentily z tejto histórie sa používajú ako vol_prah_low / vol_prah_mid (zhoda s NATR v Risk Engine)
+    # 15m NATR (calculate_natr_14) na každom scane → rolling ~30 dní (2880 × 15m barov).
+    # Trade NATR aj percentily sú na rovnakom timeframe (15m).
     try:
-        btc_hist_klines = await fetch_okx_klines(client, "BTCUSDT", "1D", 31, klines_cache)
-        if len(btc_hist_klines) >= 16:
-            natr_history = []
-            prev_c = None
-            for bar in btc_hist_klines:
-                h = float(get_high(bar))
-                l = float(get_low(bar))
-                c = float(get_close(bar))
-                if c > 0 and prev_c is not None and prev_c > 0:
-                    # True Range vrátane overnight gapov (abs(high-prev_close), abs(low-prev_close))
-                    tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
-                    natr_history.append((tr / c) * 100.0)
-                prev_c = c
-
-            if len(natr_history) >= 15:
-                # Ulož plovúcu históriu pre get_mmr_coordinates / invariantné percentily
-                vault["natr_history_30d"] = natr_history[-30:]
-                hist_sorted = sorted(natr_history)
-                n_samples = len(hist_sorted)
-                vault["vol_prah_low"] = float(hist_sorted[int(n_samples * 0.33)])
-                vault["vol_prah_mid"] = float(hist_sorted[int(n_samples * 0.66)])
+        btc_15m = await fetch_okx_klines(client, "BTCUSDT", "15m", 25, klines_cache)
+        if len(btc_15m) >= 15:
+            natr_15m = float(calculate_natr_14(btc_15m))
+            hist = list(vault.get("natr_history_30d") or [])
+            hist.append(natr_15m)
+            # Rolling window: 2880 × 15m ≈ 30 dní
+            if len(hist) > 2880:
+                hist = hist[-2880:]
+            vault["natr_history_30d"] = hist
+            if len(hist) >= 15:
+                hist_arr = np.asarray(hist, dtype=float)
+                vault["vol_prah_low"] = float(np.percentile(hist_arr, 33))
+                vault["vol_prah_mid"] = float(np.percentile(hist_arr, 66))
     except Exception:
         # Bezpečný fallback, pokud by API selhalo, aby bot nepřestal fungovat
         vault["vol_prah_low"] = vault.get("vol_prah_low", 1.5)
@@ -2102,6 +2613,29 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
             vault["last_btc_trend_slope"] = 0.0
     except Exception:
         vault["last_btc_trend_slope"] = vault.get("last_btc_trend_slope", 0.0)
+
+    # ----- CLOSED-LOOP FORWARD PASS: MMR cell → filter strictness -----
+    # Determine current regime from BTC 15m NATR and apply cell_strictness
+    try:
+        btc_natr = float(calculate_natr_14(btc_klines)) if len(btc_klines) >= 15 else 2.0
+        curr_rx, curr_ry = get_mmr_coordinates(btc_natr, vault)
+        mmr_cell = get_mmr_cell(curr_rx, curr_ry)
+        cell_wr = float(mmr_cell.get("win_rate", 52.0))
+        cell_n = int(mmr_cell.get("total_trades", 0) or 0)
+        if cell_n >= 3:
+            if cell_wr > 58.0:
+                cell_strictness = 0.90  # profitable regime → loosen
+            elif cell_wr < 48.0:
+                cell_strictness = 1.20  # struggling regime → tighten
+            else:
+                cell_strictness = 1.0
+        else:
+            cell_strictness = 1.0
+        vault["cell_strictness"] = float(cell_strictness)
+        vault["last_active_rx"] = int(curr_rx)
+        vault["last_active_ry"] = int(curr_ry)
+    except Exception:
+        vault.setdefault("cell_strictness", 1.0)
 
     # Sběr aktuálně obsazených mincí a sektorů pro zamezení nežádoucí korelace rizika
     active_syms = {p["symbol"] for p in vault["windows"].values() if p["status"] == "ACTIVE" and p["symbol"]}
@@ -2142,6 +2676,10 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
         if direction and check_anti_extreme_shield(btc_klines, direction, is_pd=False, is_btc=True):
             ok_exec, exec_price = await verify_execution_confirmation_btc(client, "BTCUSDT", direction, btc_klines, btc_ofd, klines_cache)
             if ok_exec:
+                try:
+                    btc_rsi_fp = float(calculate_rsi_14(pd.Series([float(get_close(k)) for k in btc_klines])))
+                except Exception:
+                    btc_rsi_fp = 50.0
                 setup = build_trade_setup(
                     {
                         "symbol": "BTCUSDT",
@@ -2149,50 +2687,99 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
                         "is_pd": False,
                         "is_funding_trap": is_trap,
                         "klines": btc_klines,
-                        "exec_price": exec_price
+                        "exec_price": exec_price,
+                        "entry_fingerprint": {
+                            "macro_btc_1h": float(btc_veto.get("btc_1h_pct", 0.0)),
+                            "liq_vol_24h": 0.0,
+                            "ofd_val": float(btc_ofd),
+                            "shield_rsi": btc_rsi_fp,
+                            "micro_wob": 0.0,
+                            "micro_vpin": 0.0,
+                            "risk_wr": 52.0,
+                        },
                     },
                     vault["balance"], 1, vault
                 )
                 if setup:
                     vault["windows"]["1"] = setup
+                    vault["last_trade_opened_ts"] = time.time()
+                    # SYSTEM C: taker 0.05% on market leg notional
+                    mkt_notional = float(setup.get("active_margin") or 0.0) * float(setup.get("leverage") or 1)
+                    vault["balance"] = round(float(vault["balance"]) - mkt_notional * 0.0005, 4)
                     push_active_position_row(setup, vault)
                     active_syms.add("BTCUSDT")
+                else:
+                    # Filter 6 MMR veto shadow
+                    record_shadow_trade(
+                        vault,
+                        {"symbol": "BTCUSDT", "direction": direction, "exec_price": exec_price,
+                         "klines": btc_klines, "natr": calculate_natr_14(btc_klines)},
+                        failed_filter="FILTER_6_RISK_MMR",
+                    )
 
     # ===== OKNA 2 & 3: ELITNÍ ŠAMPIONI (Objem >= 10M USD) =====
     for w_idx in ("2", "3"):
         if vault["windows"][w_idx]["status"] == "WAITING":
-            cands = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 10_000_000.0, 1e12, btc_veto, klines_cache, is_pd_mode=False)
+            cands = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 10_000_000.0, 1e12, btc_veto, klines_cache, is_pd_mode=False, vault=vault)
             for c in cands:
                 setup = build_trade_setup(c, vault["balance"], int(w_idx), vault)
                 if setup:
                     vault["windows"][w_idx] = setup
+                    vault["last_trade_opened_ts"] = time.time()
+                    mkt_notional = float(setup.get("active_margin") or 0.0) * float(setup.get("leverage") or 1)
+                    vault["balance"] = round(float(vault["balance"]) - mkt_notional * 0.0005, 4)
                     push_active_position_row(setup, vault)
                     active_syms.add(c["symbol"])
                     active_secs.add(c["sector"])
                     break
+                else:
+                    record_shadow_trade(
+                        vault,
+                        {**c, "natr": calculate_natr_14(c["klines"]) if c.get("klines") else 2.0},
+                        failed_filter=c.get("_failed_filter", "FILTER_6_RISK_MMR"),
+                    )
 
     # ===== OKNA 4 & 5: ŠAMPIONI NÍZKÉ LIKVIDITY (Objem 5M – 9.99M USD) =====
     for w_idx in ("4", "5"):
         if vault["windows"][w_idx]["status"] == "WAITING":
-            cands = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 5_000_000.0, 9_999_999.0, btc_veto, klines_cache, is_pd_mode=False)
+            cands = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 5_000_000.0, 9_999_999.0, btc_veto, klines_cache, is_pd_mode=False, vault=vault)
             for c in cands:
                 setup = build_trade_setup(c, vault["balance"], int(w_idx), vault)
                 if setup:
                     vault["windows"][w_idx] = setup
+                    vault["last_trade_opened_ts"] = time.time()
+                    mkt_notional = float(setup.get("active_margin") or 0.0) * float(setup.get("leverage") or 1)
+                    vault["balance"] = round(float(vault["balance"]) - mkt_notional * 0.0005, 4)
                     push_active_position_row(setup, vault)
                     active_syms.add(c["symbol"])
                     active_secs.add(c["sector"])
                     break
+                else:
+                    record_shadow_trade(
+                        vault,
+                        {**c, "natr": calculate_natr_14(c["klines"]) if c.get("klines") else 2.0},
+                        failed_filter=c.get("_failed_filter", "FILTER_6_RISK_MMR"),
+                    )
 
     # ===== OKNO 6: PUMP & DUMP REŽIM (uvoľnené, všetko okrem BTC, objem 0.5M – 8M USD) =====
     if vault["windows"]["6"]["status"] == "WAITING":
-        cands_pd = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 500_000.0, 8_000_000.0, btc_veto, klines_cache, is_pd_mode=True)
+        cands_pd = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 500_000.0, 8_000_000.0, btc_veto, klines_cache, is_pd_mode=True, vault=vault)
         for c in cands_pd:
             setup = build_trade_setup(c, vault["balance"], 6, vault)
             if setup:
                 vault["windows"]["6"] = setup
+                vault["last_trade_opened_ts"] = time.time()
+                # P&D enters 100% market – taker on full active margin
+                mkt_notional = float(setup.get("active_margin") or 0.0) * float(setup.get("leverage") or 1)
+                vault["balance"] = round(float(vault["balance"]) - mkt_notional * 0.0005, 4)
                 push_active_position_row(setup, vault)
                 break
+            else:
+                record_shadow_trade(
+                    vault,
+                    {**c, "natr": calculate_natr_14(c["klines"]) if c.get("klines") else 2.0},
+                    failed_filter=c.get("_failed_filter", "FILTER_6_RISK_MMR"),
+                )
 
 
 # =========================================================================
