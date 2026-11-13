@@ -69,7 +69,11 @@ def get_default_vault() -> dict:
             "macro": 1.0, "liq": 1.0, "ofd": 1.0,
             "shield": 1.0, "micro": 1.0, "risk": 1.0,
         },
-        "shadow_trades": [],
+        "reject_stats": {
+            "macro": 0, "liq": 0, "ofd": 0,
+            "shield": 0, "micro": 0, "risk": 0,
+        },
+        "shadow_pool": [],  # unified incubator (max 100); replaces shadow_trades
         "pending_supabase_sync": []
     }
 
@@ -97,7 +101,12 @@ def load_vault() -> dict:
                         "macro": 1.0, "liq": 1.0, "ofd": 1.0,
                         "shield": 1.0, "micro": 1.0, "risk": 1.0,
                     })
-                    state.setdefault("shadow_trades", [])
+                    state.setdefault("reject_stats", {
+                        "macro": 0, "liq": 0, "ofd": 0,
+                        "shield": 0, "micro": 0, "risk": 0,
+                    })
+                    state.setdefault("shadow_pool", list(state.get("shadow_trades") or []))  # migrate old key
+                    state.setdefault("shadow_trades", [])  # legacy no-op list
                     state.setdefault("last_btc_veto", {
                         "veto_long": False,
                         "veto_short": False,
@@ -134,7 +143,12 @@ def load_vault() -> dict:
                 "macro": 1.0, "liq": 1.0, "ofd": 1.0,
                 "shield": 1.0, "micro": 1.0, "risk": 1.0,
             })
-            state.setdefault("shadow_trades", [])
+            state.setdefault("reject_stats", {
+                "macro": 0, "liq": 0, "ofd": 0,
+                "shield": 0, "micro": 0, "risk": 0,
+            })
+            state.setdefault("shadow_pool", list(state.get("shadow_trades") or []))  # migrate old key
+            state.setdefault("shadow_trades", [])  # legacy no-op list
             state.setdefault("last_btc_veto", {
                 "veto_long": False,
                 "veto_short": False,
@@ -798,11 +812,39 @@ def _get_filter_ctx(vault: dict | None, direction: str = "LONG") -> dict:
     }
 
 
+def _bump_reject_stat(vault: dict, key: str):
+    """Increment bottleneck counter for filter stage (vault-only, no DB columns)."""
+    stats = vault.setdefault("reject_stats", {
+        "macro": 0, "liq": 0, "ofd": 0, "shield": 0, "micro": 0, "risk": 0,
+    })
+    if key in stats:
+        stats[key] = int(stats.get(key, 0)) + 1
+
+
+def _map_failed_filter_key(failed_filter: str) -> str:
+    """Normalize failed_filter labels to filter_weights / reject_stats keys."""
+    u = (failed_filter or "").upper()
+    if "MACRO" in u or "VETO" in u or "BTC" in u:
+        return "macro"
+    if "LIQ" in u or "VOL" in u:
+        return "liq"
+    if "OFD" in u or "ORDERFLOW" in u:
+        return "ofd"
+    if "SHIELD" in u or "EXTREME" in u or "RSI" in u:
+        return "shield"
+    if "MICRO" in u or "VERIFY" in u or "FILTER_5" in u or "VPIN" in u or "WOB" in u:
+        return "micro"
+    if "RISK" in u or "MMR" in u or "FILTER_6" in u or "KELLY" in u:
+        return "risk"
+    return "risk"
+
+
 def record_shadow_trade(vault: dict, cand: dict, failed_filter: str, tp1_price: float = 0.0, sl_price: float = 0.0):
-    """SYSTEM A – Shadow Incubator: virtual trade when Filters 5/6 reject a candidate.
-    Thread/async-safe append via vault-local list rebuild (max 10).
     """
-    entry = float(cand.get("exec_price") or 0.0)
+    Unified Shadow Pool (max 100): candidate passed liquidity but blocked by a later filter.
+    Backward-compatible name; writes to vault["shadow_pool"].
+    """
+    entry = float(cand.get("exec_price") or cand.get("reject_price") or 0.0)
     if entry <= 0 and cand.get("klines"):
         try:
             entry = float(get_close(cand["klines"][-1]))
@@ -810,6 +852,9 @@ def record_shadow_trade(vault: dict, cand: dict, failed_filter: str, tp1_price: 
             entry = 0.0
     if entry <= 0:
         return
+    filter_key = _map_failed_filter_key(failed_filter)
+    _bump_reject_stat(vault, filter_key)
+
     if tp1_price <= 0 or sl_price <= 0:
         natr = float(cand.get("natr") or 2.0)
         dir_mult = 1.0 if cand.get("direction") == "LONG" else -1.0
@@ -817,9 +862,16 @@ def record_shadow_trade(vault: dict, cand: dict, failed_filter: str, tp1_price: 
             tp1_price = entry * (1.0 + dir_mult * (natr * 1.0 / 100.0))
         if sl_price <= 0:
             sl_price = entry * (1.0 - dir_mult * (natr * 2.0 / 100.0))
+
     item = {
         "symbol": cand.get("symbol"),
         "direction": cand.get("direction"),
+        "reject_price": entry,
+        "blocked_by": filter_key,
+        "virtual_tp1": float(tp1_price),
+        "virtual_sl": float(sl_price),
+        "ts": time.time(),
+        # legacy aliases for older process paths
         "entry_price": entry,
         "tp1_price": float(tp1_price),
         "sl_price": float(sl_price),
@@ -827,62 +879,69 @@ def record_shadow_trade(vault: dict, cand: dict, failed_filter: str, tp1_price: 
         "opened_ts": time.time(),
         "status": "ACTIVE",
     }
-    # Atomický zápis: skopíruj, append, orez, priraď späť (minimal race window)
-    shadows = list(vault.get("shadow_trades") or [])
-    shadows.append(item)
-    vault["shadow_trades"] = shadows[-10:]
+    pool = list(vault.get("shadow_pool") or vault.get("shadow_trades") or [])
+    pool.append(item)
+    vault["shadow_pool"] = pool[-100:]
 
 
-
-
-def process_shadow_trades(vault: dict, price_tickers: dict, now_ts: float):
-    """SYSTEM A – evaluate shadow incubator outcomes (expire 4h).
-    price_tickers: map symbol -> ticker dict with 'last' (ACTIVE okná + shadow symboly).
+def process_shadow_pool(vault: dict, tickers: dict, now_ts: float):
     """
-    shadows = list(vault.get("shadow_trades") or [])
-    if not shadows:
+    Evaluate unified shadow_pool during 3-min scan using already-fetched tickers (0 extra API).
+    Age window: [900s, 3600s]. TP1 first → loosen filter; SL first → tighten.
+    """
+    pool = list(vault.get("shadow_pool") or [])
+    if not pool:
         return
+    weights = vault.setdefault("filter_weights", {
+        "macro": 1.0, "liq": 1.0, "ofd": 1.0, "shield": 1.0, "micro": 1.0, "risk": 1.0,
+    })
     remaining = []
-    for sh in shadows:
-        if sh.get("status") != "ACTIVE":
+    for sh in pool:
+        ts0 = float(sh.get("ts") or sh.get("opened_ts") or 0.0)
+        age = now_ts - ts0
+        if age > 3600:
+            continue  # expired
+        if age < 900:
+            remaining.append(sh)  # too young
             continue
-        if (now_ts - float(sh.get("opened_ts", 0))) > 14400:
-            continue  # expired – bez feedbacku (nedostatočné dáta, nie falošný LOSS)
         sym = sh.get("symbol")
-        if not sym or not price_tickers or sym not in price_tickers:
+        if not sym or not tickers or sym not in tickers:
             remaining.append(sh)
             continue
         try:
-            px = float(price_tickers[sym]["last"])
+            t = tickers[sym]
+            px = float(t.get("last") if isinstance(t, dict) else t)
         except Exception:
             remaining.append(sh)
             continue
         is_long = sh.get("direction") == "LONG"
-        tp1 = float(sh.get("tp1_price", 0))
-        sl = float(sh.get("sl_price", 0))
+        tp1 = float(sh.get("virtual_tp1") or sh.get("tp1_price") or 0.0)
+        sl = float(sh.get("virtual_sl") or sh.get("sl_price") or 0.0)
+        key = sh.get("blocked_by") or _map_failed_filter_key(sh.get("failed_filter", "risk"))
         hit_tp = (is_long and px >= tp1) or (not is_long and px <= tp1)
         hit_sl = (is_long and px <= sl) or (not is_long and px >= sl)
+        if hit_sl and not hit_tp:
+            w = float(weights.get(key, 1.0))
+            weights[key] = float(np.clip(w + 0.01, 0.80, 1.25))
+            continue  # evaluated out
         if hit_tp and not hit_sl:
-            # virtual WIN – filter that rejected was too strict
-            try:
-                update_filter_weights_from_outcome(
-                    {"failed_filter": sh.get("failed_filter"), "direction": sh.get("direction")},
-                    True, f"SHADOW_WIN_{sh.get('failed_filter')}", vault
-                )
-            except Exception:
-                pass
-            continue
-        if hit_sl:
-            try:
-                update_filter_weights_from_outcome(
-                    {"failed_filter": sh.get("failed_filter"), "direction": sh.get("direction")},
-                    False, f"SHADOW_LOSS_{sh.get('failed_filter')}", vault
-                )
-            except Exception:
-                pass
-            continue
+            w = float(weights.get(key, 1.0))
+            weights[key] = float(np.clip(w - 0.015, 0.80, 1.25))
+            if is_long:
+                vault["strictness_long"] = float(np.clip(float(vault.get("strictness_long", 1.0)) - 0.01, 0.80, 1.30))
+            else:
+                vault["strictness_short"] = float(np.clip(float(vault.get("strictness_short", 1.0)) - 0.01, 0.80, 1.30))
+            continue  # evaluated out
         remaining.append(sh)
-    vault["shadow_trades"] = remaining[:10]
+    vault["filter_weights"] = weights
+    vault["shadow_pool"] = remaining[-100:]
+
+
+# Backward-compatible alias used by older call sites
+def process_shadow_trades(vault: dict, price_tickers: dict, now_ts: float):
+    process_shadow_pool(vault, price_tickers, now_ts)
+
+
 
 
 def update_meta_controller(vault: dict, now_ts: float | None = None):
@@ -1197,7 +1256,16 @@ async def evaluate_candidates(
                                 "sector": sec,
                                 "ofd": ofd,
                                 "klines": klines,
-                                "exec_price": exec_price
+                                "exec_price": exec_price,
+                                "entry_fingerprint": {
+                                    "macro_btc_1h": float(btc_veto.get("btc_1h_pct", 0.0)),
+                                    "liq_vol_24h": float(vol),
+                                    "ofd_val": float(ofd),
+                                    "shield_rsi": float(calculate_rsi_14(pd.Series([float(get_close(k)) for k in klines]))) if len(klines) >= 15 else 50.0,
+                                    "micro_wob": 0.0,
+                                    "micro_vpin": float(calculate_vpin_toxicity(klines)) if len(klines) >= 10 else 0.0,
+                                    "risk_wr": 52.0,
+                                },
                             }
 
                     # Ďalší uvoľnený vstup: silný OFD bez extrémneho OI (stále PD okno)
@@ -1287,21 +1355,47 @@ async def evaluate_candidates(
                         direction = "SHORT"
                 if direction:
                     if direction == "LONG" and btc_veto.get("veto_long"):
+                        if vault is not None:
+                            _bump_reject_stat(vault, "macro")
+                            record_shadow_trade(
+                                vault,
+                                {"symbol": sym, "direction": direction,
+                                 "exec_price": float(get_close(klines[-1])),
+                                 "klines": klines, "natr": calculate_natr_14(klines)},
+                                failed_filter="MACRO_BTC_VETO",
+                            )
                         return None
                     if direction == "SHORT" and btc_veto.get("veto_short"):
+                        if vault is not None:
+                            _bump_reject_stat(vault, "macro")
+                            record_shadow_trade(
+                                vault,
+                                {"symbol": sym, "direction": direction,
+                                 "exec_price": float(get_close(klines[-1])),
+                                 "klines": klines, "natr": calculate_natr_14(klines)},
+                                failed_filter="MACRO_BTC_VETO",
+                            )
                         return None
                     fctx = fctx_long if direction == "LONG" else fctx_short
                     if not check_anti_extreme_shield(klines, direction, is_pd=False, filter_ctx=fctx):
+                        if vault is not None:
+                            record_shadow_trade(
+                                vault,
+                                {"symbol": sym, "direction": direction,
+                                 "exec_price": float(get_close(klines[-1])),
+                                 "klines": klines, "natr": calculate_natr_14(klines)},
+                                failed_filter="SHIELD_ANTI_EXTREME",
+                            )
                         return None
                     ok_exec, exec_price = await verify_execution_confirmation(
                         client, sym, direction, klines, ofd, False, klines_cache, filter_ctx=fctx
                     )
                     if not ok_exec:
-                        # SYSTEM A shadow: passed 1-4, failed filter 5 (micro)
                         if vault is not None:
                             record_shadow_trade(
                                 vault,
-                                {"symbol": sym, "direction": direction, "exec_price": float(get_close(klines[-1])),
+                                {"symbol": sym, "direction": direction,
+                                 "exec_price": float(get_close(klines[-1])),
                                  "klines": klines, "natr": calculate_natr_14(klines)},
                                 failed_filter="FILTER_5_MICRO",
                             )
@@ -1342,6 +1436,7 @@ async def evaluate_candidates(
                         "klines": klines,
                         "exec_price": exec_price,
                         "entry_fingerprint": entry_fingerprint,
+                        "book_levels": list((fctx or {}).get("book_levels") or []),
                     }
             except Exception:
                 return None
@@ -1355,6 +1450,18 @@ async def evaluate_candidates(
 # =========================================================================
 # BLOK 4: ADAPTÍVNY RISK ENGINE, VETO FILTR, DRAWDOWN CONTROL & TWAP ENTRY
 # =========================================================================
+
+def exit_cost_rate(window_id: int, cost_rate: float | None = None) -> float:
+    """
+    Exit leg only: taker 0.0005 + half of non-fee slippage.
+    Entry fees are already booked at open / limit-fill — do not double-count.
+    cost_rate = exchange_fees(0.0010) + slippage; so slippage = cost_rate - 0.0010.
+    """
+    if cost_rate is None:
+        cost_rate = compute_roundtrip_cost_rate(window_id)
+    slippage = max(0.0, float(cost_rate) - 0.0010)
+    return 0.0005 + 0.5 * slippage
+
 
 def compute_roundtrip_cost_rate(window_id: int) -> float:
     exchange_fees = 0.0010
@@ -1412,6 +1519,18 @@ def get_mmr_coordinates(natr: float, vault: dict) -> tuple[int, int]:
         regime_y = 3
         
     return regime_x, regime_y
+
+def _build_entry_fingerprint(cand: dict, vault: dict, mmr_cell: dict, initial_ofd: float) -> dict:
+    fp = dict(cand.get("entry_fingerprint") or {})
+    fp.setdefault("macro_btc_1h", float((vault.get("last_btc_veto") or {}).get("btc_1h_pct", 0.0)))
+    fp.setdefault("liq_vol_24h", 0.0)
+    fp["ofd_val"] = float(fp.get("ofd_val") or initial_ofd)
+    fp.setdefault("shield_rsi", 50.0)
+    fp.setdefault("micro_wob", 0.0)
+    fp.setdefault("micro_vpin", 0.0)
+    fp["risk_wr"] = float(mmr_cell.get("win_rate", 52.0))
+    return fp
+
 
 def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -> dict | None:
     """
@@ -1477,8 +1596,14 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
     if full_kelly <= 0:
         return None
 
-    # Adaptivní sázkový zlomek: V Shield Mode snižujeme alokaci na polovinu
-    kelly_fraction = 0.175 if is_shield_active else 0.35
+    # Adaptivní sázkový zlomek: Shield → polovica; Scout Mode (cell trades < 5) → 0.15
+    cell_trades = int(mmr_cell.get("total_trades", 0) or 0)
+    if cell_trades < 5:
+        kelly_fraction = 0.15  # Scout Mode – half-ish sizing while learning
+    elif is_shield_active:
+        kelly_fraction = 0.175
+    else:
+        kelly_fraction = 0.35
     max_risk_pct = 0.015 if is_pd else 0.025
     kelly_margin = min(balance * full_kelly * kelly_fraction, balance * max_risk_pct)
 
@@ -1491,6 +1616,14 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
     if kelly_margin < min_margin:
         return None
     margin_usd = kelly_margin
+
+    # Exact size-dependent VWAP from Depth-20 levels captured at verify (0 extra API)
+    book_levels = cand.get("book_levels") or []
+    if book_levels and margin_usd > 0 and leverage > 0:
+        notional = float(margin_usd) * float(leverage)
+        price = float(simulate_depth20_vwap(book_levels, notional, price))
+        # refresh exec on cand for fingerprint consistency
+        cand["exec_price"] = price
 
     # 7. EXEKUČNÍ DEKOMPOZICE – placeholder; finálne active_margin nastaví SYSTEM C TWAP 40/60 nižšie
     # (zámerne tu neprepisujeme percentá, aby nevznikol konflikt 30% vs 40%)
@@ -1908,10 +2041,11 @@ async def verify_execution_confirmation(
         levels = (micro.get("asks") or []) if direction == "LONG" else (micro.get("bids") or [])
         fallback = best_ask if direction == "LONG" else best_bid
         exec_price = simulate_depth20_vwap(levels, notional_usd=50.0, fallback_px=fallback)
-        # Stash microstructure metrics on filter_ctx for entry_fingerprint
+        # Stash microstructure + raw book for exact size-dependent VWAP in build_trade_setup
         if filter_ctx is not None:
             filter_ctx["last_wob"] = float(wob_imbalance)
             filter_ctx["last_vpin"] = float(vpin_score)
+            filter_ctx["book_levels"] = levels
         return True, exec_price
     except Exception:
         return False, 0.0
@@ -2032,7 +2166,9 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
         net_pnl_pct = -100.0 * leverage if active_margin > 0 else 0.0
     else:
         gross_pnl_pct = ((exit_price - entry) / max(1e-9, entry)) * dir_mult * leverage * 100.0
-        net_pnl_pct = gross_pnl_pct - (cost_rate * leverage * 100.0)
+        # Len exit leg (entry fee už strhnutá pri otvorení / limit fill)
+        xcost = exit_cost_rate(pos["window_id"], cost_rate)
+        net_pnl_pct = gross_pnl_pct - (xcost * leverage * 100.0)
         pnl_usd = active_margin * (net_pnl_pct / 100.0)
 
     vault["balance"] = round(float(vault.get("balance", 100.0)) + pnl_usd, 4)
@@ -2133,7 +2269,9 @@ def execute_scale_out(pos: dict, price: float, pct: float, reason: str, vault: d
     dir_mult = 1.0 if pos["direction"] == "LONG" else -1.0
     cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(pos["window_id"]))
     gross_pnl = ((price - pos["entry_price"]) / pos["entry_price"]) * dir_mult * pos["leverage"] * 100.0
-    net_pnl_pct = gross_pnl - (cost_rate * pos["leverage"] * 100.0)
+    # Len exit leg — entry fees už zaúčtované
+    xcost = exit_cost_rate(pos["window_id"], cost_rate)
+    net_pnl_pct = gross_pnl - (xcost * pos["leverage"] * 100.0)
     closed_margin = pos["active_margin"] * pct
     partial_pnl_usd = closed_margin * (net_pnl_pct / 100.0)
     vault["balance"] = round(vault["balance"] + partial_pnl_usd, 4)
@@ -2256,13 +2394,8 @@ async def run_core_cycle(vault: dict):
 
     async with httpx.AsyncClient(http2=True, timeout=8.0) as client:
         active_syms_list = [pos["symbol"] for _, pos in active_windows]
-        # Shadow incubator potrebuje ceny aj pre symboly mimo ACTIVE okien
-        shadow_syms = [
-            s.get("symbol") for s in (vault.get("shadow_trades") or [])
-            if s.get("status") == "ACTIVE" and s.get("symbol")
-        ]
-        ticker_syms = list({*active_syms_list, *[x for x in shadow_syms if x]})
-        active_tickers = await fetch_active_tickers_only(client, ticker_syms) if ticker_syms else {}
+        # Shadow pool sa vyhodnocuje v 3min scane (process_shadow_pool) – tu len ACTIVE tickery
+        active_tickers = await fetch_active_tickers_only(client, active_syms_list) if active_syms_list else {}
         klines_cache = {}
 
         for win_key, pos in active_windows:
@@ -2544,11 +2677,8 @@ async def run_core_cycle(vault: dict):
         except Exception:
             pass
 
-        # SYSTEM A – shadow incubator mark-to-market
-        try:
-            process_shadow_trades(vault, active_tickers, now_ts)
-        except Exception:
-            pass
+        # Shadow pool MTM: process_shadow_pool v process_global_market_scanning (3min, full tickers)
+        # — žiadne extra API ani duplicitné volanie tu.
 
         # SYSTEM B – meta-controller strictness update
         try:
@@ -2598,6 +2728,11 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
     # B. SBĚR MARKET DATA A VETO FILTRACE
     tickers, oi_map = await fetch_market_snapshot(client)
     update_24h_oi_metrics(tickers, oi_map)
+    # Unified shadow pool MTM on already-fetched tickers (zero extra API)
+    try:
+        process_shadow_pool(vault, tickers, now_ts)
+    except Exception:
+        pass
 
     btc_klines = await fetch_okx_klines(client, "BTCUSDT", "15m", 25, klines_cache)
     btc_veto = evaluate_btc_veto(btc_klines)
@@ -2622,7 +2757,12 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
         mmr_cell = get_mmr_cell(curr_rx, curr_ry)
         cell_wr = float(mmr_cell.get("win_rate", 52.0))
         cell_n = int(mmr_cell.get("total_trades", 0) or 0)
-        if cell_n >= 3:
+        # Scout Mode: untrained cell (total_trades < 5) → relax ~18%, half Kelly later
+        if cell_n < 5:
+            cell_strictness = 0.82
+            vault["scout_mode"] = True
+        elif cell_n >= 3:
+            vault["scout_mode"] = False
             if cell_wr > 58.0:
                 cell_strictness = 0.90  # profitable regime → loosen
             elif cell_wr < 48.0:
@@ -2630,6 +2770,7 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
             else:
                 cell_strictness = 1.0
         else:
+            vault["scout_mode"] = False
             cell_strictness = 1.0
         vault["cell_strictness"] = float(cell_strictness)
         vault["last_active_rx"] = int(curr_rx)
@@ -2817,6 +2958,367 @@ def render_window_card(win_key: str, pos: dict):
             st.caption("Čaká na signál…")
 
 
+
+# =========================================================================
+# MODULE 4: ISOLATED HISTORICAL DRY-RUN PRE-TRAINER
+# =========================================================================
+# Sandbox ONLY updates ai_mmr_matrix + vault filter_weights / natr_history_30d.
+# NEVER touches vault balance, windows, active_positions, or trade_history.
+
+_PRETRAIN_SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+    "BNBUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT", "PEPEUSDT",
+]
+
+
+async def _fetch_klines_paginated(
+    client: httpx.AsyncClient,
+    symbol: str,
+    bar: str = "15m",
+    target: int = 672,
+    sem: asyncio.Semaphore | None = None,
+) -> list:
+    """Fetch up to `target` historical candles; OKX max ~300 per request via `after`."""
+    all_rows: list = []
+    after_ts: str | None = None
+    remaining = target
+    while remaining > 0:
+        limit = min(300, remaining)
+        params = {"instId": to_okx_inst_id(symbol), "bar": bar, "limit": str(limit)}
+        if after_ts is not None:
+            params["after"] = after_ts
+        if sem is not None:
+            async with sem:
+                res = await client.get(f"{OKX_API}/api/v5/market/candles", params=params)
+                await asyncio.sleep(0.15)
+        else:
+            res = await client.get(f"{OKX_API}/api/v5/market/candles", params=params)
+            await asyncio.sleep(0.15)
+        if res.status_code != 200:
+            break
+        data = res.json()
+        if data.get("code") != "0" or not data.get("data"):
+            break
+        chunk = data["data"]  # newest first from OKX
+        if not chunk:
+            break
+        all_rows.extend(chunk)
+        # next page: older than oldest in this chunk (ts is index 0)
+        after_ts = str(chunk[-1][0])
+        remaining = target - len(all_rows)
+        if len(chunk) < limit:
+            break
+    # chronological oldest → newest
+    klines = list(reversed(all_rows))
+    # dedupe by ts
+    seen = set()
+    uniq = []
+    for k in klines:
+        ts = k[0]
+        if ts in seen:
+            continue
+        seen.add(ts)
+        uniq.append(k)
+    return uniq[-target:]
+
+
+def _sim_verify_hist(klines_15m: list, direction: str, ofd: float) -> tuple[bool, float]:
+    """
+    Historical execution confirmation WITHOUT order book API.
+    Uses VPIN, OFD, volume ratio; neutral WOB; fixed tight spread.
+    """
+    if len(klines_15m) < 12:
+        return False, 0.0
+    vols = [float(get_vol(k)) for k in klines_15m[-11:]]
+    avg_prev = float(np.mean(vols[:-1])) if len(vols) > 1 else 0.0
+    curr_vol = vols[-1]
+    if avg_prev > 0 and (curr_vol / avg_prev) < 1.10:
+        return False, 0.0
+    vpin = float(calculate_vpin_toxicity(klines_15m))
+    if vpin > 0.80:
+        return False, 0.0
+    # Neutral book assumption
+    wob_imbalance = 0.0
+    spread_pct = 0.05
+    if spread_pct > 0.18:
+        return False, 0.0
+    if direction == "LONG" and wob_imbalance < -0.15:
+        return False, 0.0
+    if direction == "SHORT" and wob_imbalance > 0.15:
+        return False, 0.0
+    # weak OFD vs direction
+    if direction == "LONG" and ofd < 1.05:
+        return False, 0.0
+    if direction == "SHORT" and ofd > 0.95:
+        return False, 0.0
+    px = float(get_close(klines_15m[-1]))
+    return True, px
+
+
+def _sandbox_close(pos: dict, exit_price: float, reason: str, sandbox: dict, vault: dict):
+    """Close virtual position: update ai_mmr + filter_weights only (no real balance/windows)."""
+    dir_mult = 1.0 if pos["direction"] == "LONG" else -1.0
+    leverage = float(pos.get("leverage", 1))
+    active_margin = float(pos.get("active_margin", 0.0))
+    entry = float(pos.get("entry_price", exit_price))
+    cost_rate = float(pos.get("cost_rate", 0.0015))
+    gross = ((exit_price - entry) / max(1e-9, entry)) * dir_mult * leverage * 100.0
+    xcost = 0.0005 + 0.5 * max(0.0, cost_rate - 0.0010)
+    net = gross - (xcost * leverage * 100.0)
+    pnl_usd = active_margin * (net / 100.0)
+    sandbox["balance"] = round(float(sandbox["balance"]) + pnl_usd, 4)
+    realized = float(pos.get("realized_pnl_usd", 0.0)) + pnl_usd
+    initial_entry = float(pos.get("initial_entry_price") or entry)
+    initial_sl = float(pos.get("initial_sl_price") or entry)
+    deployed = float(pos.get("max_deployed_margin") or pos.get("margin_usd") or active_margin or 1.0)
+    sl_dist = abs(initial_entry - initial_sl) / max(1e-9, initial_entry)
+    risk_usd = max(1e-9, deployed * sl_dist * leverage)
+    r_mult = realized / risk_usd
+    is_win = realized > 0
+    try:
+        update_ai_learning(
+            symbol=pos.get("symbol", ""),
+            direction=pos.get("direction", ""),
+            regime=pos.get("regime", "FUTURES"),
+            is_funding_trap=bool(pos.get("is_funding_trap", False)),
+            is_win=is_win,
+            r_multiple=r_mult,
+            vault=vault,
+            regime_x=pos.get("regime_x"),
+            regime_y=pos.get("regime_y"),
+        )
+    except Exception:
+        pass
+    try:
+        update_filter_weights_from_outcome(pos, is_win, reason, vault)
+    except Exception:
+        pass
+
+
+def _sandbox_manage(pos: dict, bar: list, sandbox: dict, vault: dict) -> bool:
+    """
+    Manage one sandbox position on a historical bar.
+    Returns True if position still open, False if closed.
+    """
+    hi = float(get_high(bar))
+    lo = float(get_low(bar))
+    cl = float(get_close(bar))
+    is_long = pos["direction"] == "LONG"
+    dir_mult = 1.0 if is_long else -1.0
+    entry = float(pos["entry_price"])
+    lev = max(1, int(pos.get("leverage") or 1))
+
+    # Liquidation
+    if pos.get("regime") == "FUTURES" and lev > 1:
+        liq = entry * (1.0 - dir_mult * (0.90 / lev))
+        if (is_long and lo <= liq) or (not is_long and hi >= liq):
+            pos["_force_full_margin_loss"] = True
+            _sandbox_close(pos, liq, "LIQUIDATION_HIT", sandbox, vault)
+            return False
+
+    # SL / TSL
+    sl = float(pos.get("sl_tsl_price") or 0.0)
+    if sl > 0:
+        hit_sl = (is_long and lo <= sl) or (not is_long and hi >= sl)
+        if hit_sl:
+            reason = "TRAILING_SL_PROFIT" if pos.get("tsl_active") else "HARD_SL_HIT"
+            _sandbox_close(pos, sl, reason, sandbox, vault)
+            return False
+
+    # TP1 scale-out 50% + BE lock
+    if not pos.get("tp1_hit"):
+        tp1 = float(pos.get("tp1_price") or 0.0)
+        hit_tp1 = (is_long and hi >= tp1) or (not is_long and lo <= tp1)
+        if hit_tp1 and tp1 > 0:
+            # virtual partial
+            cost_rate = float(pos.get("cost_rate", 0.0015))
+            gross = ((tp1 - entry) / max(1e-9, entry)) * dir_mult * lev * 100.0
+            xcost = 0.0005 + 0.5 * max(0.0, cost_rate - 0.0010)
+            net = gross - (xcost * lev * 100.0)
+            closed_m = float(pos["active_margin"]) * 0.50
+            partial = closed_m * (net / 100.0)
+            sandbox["balance"] = round(float(sandbox["balance"]) + partial, 4)
+            pos["active_margin"] = float(pos["active_margin"]) - closed_m
+            pos["realized_pnl_usd"] = float(pos.get("realized_pnl_usd", 0.0)) + partial
+            pos["tp1_hit"] = True
+            pos["tsl_active"] = True
+            pos["extreme_price"] = tp1
+            be = entry * (1.0 + dir_mult * (cost_rate + 0.0010))
+            pos["sl_tsl_price"] = be
+
+    # TP2 close remainder
+    if pos.get("tp1_hit") and not pos.get("tp2_hit"):
+        tp2 = float(pos.get("tp2_price") or 0.0)
+        hit_tp2 = (is_long and hi >= tp2) or (not is_long and lo <= tp2)
+        if hit_tp2 and tp2 > 0:
+            _sandbox_close(pos, tp2, "TP2_SCALE_OUT", sandbox, vault)
+            return False
+        # trail extreme
+        if is_long:
+            pos["extreme_price"] = max(float(pos.get("extreme_price", cl)), hi)
+        else:
+            pos["extreme_price"] = min(float(pos.get("extreme_price", cl)), lo)
+        natr = float(pos.get("natr") or 2.0)
+        step = (0.65 * natr) / 100.0
+        new_tsl = float(pos["extreme_price"]) * (1.0 - dir_mult * step)
+        if (is_long and new_tsl > pos["sl_tsl_price"]) or (not is_long and new_tsl < pos["sl_tsl_price"]):
+            pos["sl_tsl_price"] = new_tsl
+
+    return True
+
+
+async def run_historical_pretrain(vault: dict):
+    """
+    7-day 15m dry-run pre-trainer.
+    Sandbox balance starts at 100.0 — never writes vault balance/windows/history.
+    Only trains ai_mmr_matrix + vault filter_weights (+ natr_history_30d warm-up).
+    """
+    sem = asyncio.Semaphore(4)
+    hist: dict[str, list] = {}
+    async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
+        async def load_one(sym: str):
+            rows = await _fetch_klines_paginated(client, sym, "15m", 672, sem)
+            return sym, rows
+
+        results = await asyncio.gather(*(load_one(s) for s in _PRETRAIN_SYMBOLS))
+        for sym, rows in results:
+            if rows and len(rows) >= 40:
+                hist[sym] = rows
+
+    if "BTCUSDT" not in hist or len(hist["BTCUSDT"]) < 40:
+        return  # insufficient data
+
+    btc = hist["BTCUSDT"]
+    n = len(btc)
+    # Align other symbols by timestamp intersection when possible
+    sandbox = {"balance": 100.0, "positions": []}  # max 3 concurrent
+    # Warm-up NATR history from BTC (sandbox → vault natr_history only)
+    natr_hist = list(vault.get("natr_history_30d") or [])
+
+    alts = [s for s in _PRETRAIN_SYMBOLS if s != "BTCUSDT" and s in hist]
+
+    for i in range(30, n):
+        btc_window = btc[max(0, i - 24): i + 1]
+        if len(btc_window) < 15:
+            continue
+        # NATR history + percentiles
+        try:
+            n15 = float(calculate_natr_14(btc_window))
+            natr_hist.append(n15)
+            if len(natr_hist) > 2880:
+                natr_hist = natr_hist[-2880:]
+            vault["natr_history_30d"] = natr_hist
+            if len(natr_hist) >= 15:
+                arr = np.asarray(natr_hist, dtype=float)
+                vault["vol_prah_low"] = float(np.percentile(arr, 33))
+                vault["vol_prah_mid"] = float(np.percentile(arr, 66))
+        except Exception:
+            n15 = 2.0
+
+        btc_veto = evaluate_btc_veto(btc_window)
+        try:
+            if len(btc_window) >= 10:
+                closes = [float(get_close(k)) for k in btc_window[-10:]]
+                slope = float(np.polyfit(np.arange(len(closes)), closes, 1)[0])
+                vault["last_btc_trend_slope"] = (slope / max(1e-9, closes[0])) * 100.0
+        except Exception:
+            pass
+        vault["last_btc_veto"] = btc_veto
+
+        # Manage existing sandbox positions on this bar (BTC bar time approx)
+        still = []
+        for pos in sandbox["positions"]:
+            sym = pos["symbol"]
+            series = hist.get(sym) or []
+            # use bar at same index if lengths match, else last bar <= i
+            bar = series[i] if i < len(series) else (series[-1] if series else None)
+            if bar is None:
+                still.append(pos)
+                continue
+            if _sandbox_manage(pos, bar, sandbox, vault):
+                still.append(pos)
+        sandbox["positions"] = still
+
+        # Entry screening if capacity
+        if len(sandbox["positions"]) >= 3:
+            continue
+
+        # Build candidate universe for this step
+        for sym in (["BTCUSDT"] + alts):
+            if len(sandbox["positions"]) >= 3:
+                break
+            if any(p.get("symbol") == sym for p in sandbox["positions"]):
+                continue
+            series = hist.get(sym)
+            if not series or i >= len(series) or i < 20:
+                continue
+            klines = series[max(0, i - 24): i + 1]
+            if len(klines) < 20:
+                continue
+            last = klines[-1]
+            ofd = compute_ofd_from_klines(klines)
+            is_green = float(get_close(last)) > float(get_open(last))
+            fctx_long = _get_filter_ctx(vault, "LONG")
+            fctx_short = _get_filter_ctx(vault, "SHORT")
+            ofd_long_thr = float(fctx_long.get("ofd_long_thr", 1.30))
+            ofd_short_thr = float(fctx_short.get("ofd_short_thr", 0.70))
+            direction = None
+            if ofd > ofd_long_thr and is_green:
+                direction = "LONG"
+            elif ofd < ofd_short_thr and not is_green:
+                direction = "SHORT"
+            if not direction:
+                continue
+            if direction == "LONG" and btc_veto.get("veto_long"):
+                continue
+            if direction == "SHORT" and btc_veto.get("veto_short"):
+                continue
+            fctx = fctx_long if direction == "LONG" else fctx_short
+            if not check_anti_extreme_shield(klines, direction, is_pd=False, is_btc=(sym == "BTCUSDT"), filter_ctx=fctx):
+                continue
+            ok, px = _sim_verify_hist(klines, direction, ofd)
+            if not ok:
+                continue
+            cand = {
+                "symbol": sym,
+                "direction": direction,
+                "is_pd": False,
+                "is_funding_trap": False,
+                "klines": klines,
+                "exec_price": px,
+                "entry_fingerprint": {
+                    "macro_btc_1h": float(btc_veto.get("btc_1h_pct", 0.0)),
+                    "liq_vol_24h": 0.0,
+                    "ofd_val": float(ofd),
+                    "shield_rsi": 50.0,
+                    "micro_wob": 0.0,
+                    "micro_vpin": float(calculate_vpin_toxicity(klines)) if len(klines) >= 10 else 0.0,
+                    "risk_wr": 52.0,
+                },
+                "book_levels": [],
+            }
+            # Sandbox balance only — never vault["balance"]
+            setup = build_trade_setup(cand, float(sandbox["balance"]), window_id=1, vault=vault)
+            if not setup:
+                continue
+            # Strip live-order IDs noise; keep learning fields
+            setup["realized_pnl_usd"] = 0.0
+            setup["tp1_hit"] = False
+            setup["tp2_hit"] = False
+            setup["tsl_active"] = False
+            sandbox["positions"].append(setup)
+            # Scout/small open fee on sandbox only
+            mkt_notional = float(setup.get("active_margin") or 0.0) * float(setup.get("leverage") or 1)
+            sandbox["balance"] = round(float(sandbox["balance"]) - mkt_notional * 0.0005, 4)
+
+    # Persist trained weights + natr history (NOT sandbox balance)
+    vault["natr_history_30d"] = natr_hist[-2880:]
+    vault["pretrain_last_ts"] = time.time()
+    vault["pretrain_sandbox_end_balance"] = float(sandbox["balance"])  # diagnostic only
+    save_vault(vault, sync_cloud=True)
+
+
+
 def main_ui():
     st.title("Shark Alpha Core – Paper Trade")
     st.caption("Cloud 1 · OKX public data · Fiktívne obchody")
@@ -2896,6 +3398,36 @@ def main_ui():
         st.metric("Veto LONG", "ÁNO" if btc_veto.get("veto_long") else "nie")
     with v4:
         st.metric("Veto SHORT", "ÁNO" if btc_veto.get("veto_short") else "nie")
+
+    # ----- MODULE 4: Historické učenie (izolovaný sandbox) -----
+    st.divider()
+    st.subheader("Kalibrácia & Historické učenie")
+    has_active_trades = any(
+        (w or {}).get("status") == "ACTIVE"
+        for w in (vault.get("windows") or {}).values()
+    )
+    if has_active_trades:
+        st.info(
+            "Historické učenie je uzamknuté, kým prebieha aktívny obchod. "
+            "Odomkne sa automaticky po uzavretí všetkých pozícií."
+        )
+    pretrain_btn = st.button(
+        "Spustiť historické učenie (posledných 7 dní)",
+        disabled=has_active_trades,
+        use_container_width=True,
+    )
+    if pretrain_btn and not has_active_trades:
+        with st.spinner("Prebieha 7-dňová historická simulácia a kalibrácia matice..."):
+            try:
+                asyncio.run(run_historical_pretrain(st.session_state.vault))
+                st.success(
+                    "Historické učenie dokončené. "
+                    "Aktualizované: ai_mmr_matrix + filter_weights (+ NATR história). "
+                    "Live balance a okná neboli zmenené."
+                )
+            except Exception as e:
+                st.error(f"Historické učenie zlyhalo: {e}")
+        st.rerun()
 
     # Auto-refresh
     if auto_refresh:
