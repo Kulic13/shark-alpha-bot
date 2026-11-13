@@ -1547,7 +1547,7 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
     
     # 1. Výpočet NATR a kontrola extrémních limitů šumu  (OPRAVENÉ: skutočný ATR/NATR z 15m)
     natr = calculate_natr_14(klines)
-    max_natr = 9.0 if is_pd else 6.5
+    max_natr = 9.0 if is_pd else 5.0
     if natr > max_natr or natr < 0.12 or np.isnan(natr):
         return None
 
@@ -1638,7 +1638,8 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
 
     if is_pd:
         dca1 = dca2 = dca3 = 0.0
-        sl_pct = (natr * 1.8 * sl_mod) / 100.0
+        # P&D: širší SL, hard floor 1.6 %
+        sl_pct = max(0.016, (natr * 2.2 * sl_mod) / 100.0)
         tp1 = price * (1.0 + dir_mult * ((natr * 1.0 * tp_mod) / 100.0 + cost_rate))
         tp2 = price * (1.0 + dir_mult * ((natr * 1.8 * tp_mod) / 100.0 + cost_rate))
     else:
@@ -1646,8 +1647,9 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
         dca2 = price * (1.0 - dir_mult * ((1.2 * natr) / 100.0))
         dca3 = price * (1.0 - dir_mult * ((2.0 * natr) / 100.0))
         
-        raw_sl_mult = max(2.25, 2.5 * sl_mod)
-        sl_pct = (raw_sl_mult * natr) / 100.0
+        # Širší SL multiplier + hard floor 1.4 % (ochrana pred okamžitým wick SL)
+        raw_sl_mult = max(3.2, 3.5 * sl_mod)
+        sl_pct = max(0.014, (raw_sl_mult * natr) / 100.0)
         
         tp1 = price * (1.0 + dir_mult * ((1.0 * natr * tp_mod) / 100.0 + cost_rate))
         tp2 = price * (1.0 + dir_mult * ((1.8 * natr * tp_mod) / 100.0 + cost_rate))
@@ -2665,18 +2667,37 @@ async def run_core_cycle(vault: dict):
                         db_dirty = True
 
             # F. VYHODNOCENÍ ZÁSAHU TVRDÉHO SL / TSL NA BURZE (paper + intrabar wick)
+            # Ochrana: Hard SL sa nekontroluje prvých 120 s po otvorení (proti okamžitému wick-out)
             sl_px = float(pos["sl_tsl_price"])
+            opened_ts = 0.0
+            try:
+                oa = pos.get("opened_at")
+                if oa:
+                    opened_ts = datetime.fromisoformat(str(oa).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                opened_ts = 0.0
+            age_sec = (now_ts - opened_ts) if opened_ts > 0 else 9999.0
+            min_hold_sec = 120.0  # min. čas v pozícii pred povolením Hard SL
+
             hit_sl_tsl = (
                 (is_long and (curr_price <= sl_px or candle_low <= sl_px))
                 or (not is_long and (curr_price >= sl_px or candle_high >= sl_px))
             )
+            # Trailing SL (po TP1) môže zatvárať hneď; počiatočný Hard SL až po min_hold_sec
             if hit_sl_tsl:
-                reason = "TRAILING_SL_PROFIT" if pos["tsl_active"] else "HARD_SL_HIT"
-                # Exit at SL level (wick fill), not necessarily last trade price
-                exit_px = sl_px
-                close_position(pos, exit_px, reason, vault)
-                db_dirty = True
-                continue
+                if pos.get("tsl_active"):
+                    reason = "TRAILING_SL_PROFIT"
+                    exit_px = sl_px
+                    close_position(pos, exit_px, reason, vault)
+                    db_dirty = True
+                    continue
+                elif age_sec >= min_hold_sec:
+                    reason = "HARD_SL_HIT"
+                    exit_px = sl_px
+                    close_position(pos, exit_px, reason, vault)
+                    db_dirty = True
+                    continue
+                # else: ešte v ochrannej dobe → ignoruj wick, nechaj pozíciu bežať
 
             # UI synchronizační vrstva pro paměť Streamlitu
             update_live_pnl_metrics(pos, curr_price, dir_mult, win_id)
