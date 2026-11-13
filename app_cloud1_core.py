@@ -1560,14 +1560,14 @@ def build_trade_setup(cand: dict, balance: float, window_id: int, vault: dict) -
     trades_n = int(mmr_cell["total_trades"])
     
     # Bayesovské vyhlazení pravděpodobnosti (Prior síla = 10 vzorků, Prior WR = 52%)
-    prior_strength = 10.0
-    prior_wr = 0.52
+    prior_strength = 14.0
+    prior_wr = 0.48
     wr = ((cell_wr * trades_n) + (prior_wr * prior_strength)) / (trades_n + prior_strength)
 
     # 4. DRAWDOWN CONTROL & SHIELD MODE INTERCEPTOR
     # Pokud denní ztráta překročí 3 %, aktivuje se krizový štít
     is_shield_active = vault.get("shield_mode_active", False)
-    veto_threshold = 0.42 if is_shield_active else 0.38
+    veto_threshold = 0.34 if is_shield_active else 0.30
     
     # MATICOVÉ VETO: Pokud je buňka pod limitem úspěšnosti, Risk Engine příkaz zablokuje
     if wr < veto_threshold:
@@ -1792,35 +1792,48 @@ def get_mmr_neighbors(rx: int, ry: int) -> list[tuple[int, int]]:
 def update_mmr_cell_values(rx: int, ry: int, outcome: float, r_multiple: float, weight: float, vault: dict):
     """
     Matematické jádro učení buňky s adaptivním decay faktorem a prostorovou vahou.
+    VERZIA SLOW-LEARN: výrazne pomalšie učenie (gamma↑, asymetrický alpha pri WIN/FAIL),
+    hard-floor na win_rate, aby 10–20 failov ešte úplne nezablokovalo vstupy.
     """
     cell = get_mmr_cell(rx, ry)
     trades_n = int(cell.get("total_trades", 0))
     
-    # Adaptivní rychlost učení (alpha) s koeficientem sytosti gamma = 0.05
-    # Prázdná buňka se učí skokově, plná dat reaguje stabilně a filtruje šum
-    gamma = 0.05
+    # Pomalšia saturácia: gamma 0.05 → 0.18 (base_alpha klesá rýchlejšie s počtom tradeov)
+    gamma = 0.18
     base_alpha = 1.0 / (1.0 + gamma * trades_n)
     
     # Finální rychlost učení modifikovaná prostorovou vahou (1.0 pro cíl, 0.20 pro sousedy)
     alpha = base_alpha * weight
+
+    # Asymetrické spomalenie: FAIL sa učí ešte pomalšie ako WIN
+    # (aby séria Hard SL maticu nezničila, ale stále sa učila)
+    if outcome == 100.0:          # WIN
+        alpha *= 0.55
+    else:                         # FAIL / LOSS
+        alpha *= 0.28
+
+    # Horný strop alpha (aj pri prázdnej bunke)
+    alpha = float(np.clip(alpha, 0.0, 0.22))
     
     # Výpočet inverzního decay (retence paměti)
     decay = 1.0 - alpha
     
     # 1. Update Win Rate
-    cell["win_rate"] = float((cell["win_rate"] * decay) + (outcome * alpha))
+    new_wr = float((cell["win_rate"] * decay) + (outcome * alpha))
+    # Hard-floor: win_rate nikdy neklesne pod 28 % (stále pod priorom, ale neblokuje veto)
+    cell["win_rate"] = float(max(28.0, new_wr))
     
     # 2. Update R-Multiples a asymetrických modifikátorů řízení rizik
     if outcome == 100.0:  # WIN
         cell["avg_win_r"] = float((cell["avg_win_r"] * decay) + (abs(r_multiple) * alpha))
-        # Zvýšení ziskovosti utažením SL a mírným roztažením TP
-        cell["sl_modifier"] = float(np.clip(cell["sl_modifier"] * (1.0 - 0.03 * weight), 0.75, 1.45))
-        cell["tp_modifier"] = float(np.clip(cell["tp_modifier"] * (1.0 + 0.02 * weight), 0.75, 1.45))
+        # Jemnejšie utiahnutie SL / roztiahnutie TP
+        cell["sl_modifier"] = float(np.clip(cell["sl_modifier"] * (1.0 - 0.015 * weight), 0.75, 1.45))
+        cell["tp_modifier"] = float(np.clip(cell["tp_modifier"] * (1.0 + 0.012 * weight), 0.75, 1.45))
     else:  # LOSS
         cell["avg_loss_r"] = float((cell["avg_loss_r"] * decay) + (abs(r_multiple) * alpha))
-        # Preventivní utažení risk managementu při inkasování ztráty
-        cell["sl_modifier"] = float(np.clip(cell["sl_modifier"] * (1.0 + 0.06 * weight), 0.75, 1.45))
-        cell["tp_modifier"] = float(np.clip(cell["tp_modifier"] * (1.0 - 0.02 * weight), 0.75, 1.45))
+        # Menej agresívne sprísňovanie risk managementu pri failoch
+        cell["sl_modifier"] = float(np.clip(cell["sl_modifier"] * (1.0 + 0.025 * weight), 0.75, 1.45))
+        cell["tp_modifier"] = float(np.clip(cell["tp_modifier"] * (1.0 - 0.010 * weight), 0.75, 1.45))
         
     # Počet obchodů zvyšujeme pouze v cílové buňce, kde reálně k exekuci došlo
     if weight == 1.0:
