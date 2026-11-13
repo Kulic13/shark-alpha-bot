@@ -362,6 +362,11 @@ for wid in (1, 2, 3, 4, 5, 6):
             pnl_u = safe_float(w.get("pnl_usd"))
             pnl_p = safe_float(w.get("pnl_percent"))
             st.metric("Live PnL", f"${pnl_u:+.3f} USD", f"{pnl_p:+.2f} %")
+            # Vstupný kapitál (Marža)
+            act_m = safe_float(w.get("active_margin"))
+            tot_m = safe_float(w.get("margin_usd"))
+            lev = max(1, int(safe_float(w.get("leverage"), 1)))
+            st.markdown(f"**Vstupný kapitál:** `${act_m:.2f}` / `${tot_m:.2f} USD` *(pozícia: ${act_m * lev:.2f})*")
 
             # Updated_at ak existuje
             updated = w.get("updated_at")
