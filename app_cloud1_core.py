@@ -2448,7 +2448,9 @@ async def run_core_cycle(vault: dict):
 
             ofd = pos.get("cached_ofd", 1.0)
 
-            # SYSTEM D – intrabar wick levels from latest 15m candle
+            # SYSTEM D – intrabar wick levels z aktuálnej 15m sviečky
+            # DÔLEŽITÉ: wick pred opened_at sa NESMIE použiť na Hard SL / Liquidation
+            # (inak LONG/SHORT vyhodí historický knôt ešte pred vstupom).
             candle_high = curr_price
             candle_low = curr_price
             if klines and len(klines) > 0:
@@ -2458,18 +2460,33 @@ async def run_core_cycle(vault: dict):
                 except Exception:
                     pass
 
+            # Čas otvorenia pozície (pre filtrovanie pre-entry wickov)
+            opened_ts = 0.0
+            try:
+                oa = pos.get("opened_at")
+                if oa:
+                    opened_ts = datetime.fromisoformat(str(oa).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                opened_ts = 0.0
+            age_sec = (now_ts - opened_ts) if opened_ts > 0 else 9999.0
+
+            # Pre-entry wick guard:
+            # Ak sme v pozícii kratšie než 1×15m bar (900s), candle_low/high môžu obsahovať
+            # pohyb PRED vstupom → pre Hard SL a Liquidation použiť len curr_price.
+            use_wick_for_exit = age_sec >= 900.0
+            eff_low = candle_low if use_wick_for_exit else curr_price
+            eff_high = candle_high if use_wick_for_exit else curr_price
+
             # SYSTEM D – FUTURES liquidation price (90% of margin at leverage)
-            # Jeden path: close_position spočíta PnL; žiadne manuálne double-write balance/realized.
             if pos.get("regime") == "FUTURES" and int(pos.get("leverage") or 1) > 1:
                 lev = max(1, int(pos.get("leverage", 1)))
                 entry_px = float(pos.get("entry_price") or curr_price)
                 liq_price = entry_px * (1.0 - dir_mult * (0.90 / lev))
                 hit_liq = (
-                    (is_long and (curr_price <= liq_price or candle_low <= liq_price))
-                    or (not is_long and (curr_price >= liq_price or candle_high >= liq_price))
+                    (is_long and (curr_price <= liq_price or eff_low <= liq_price))
+                    or (not is_long and (curr_price >= liq_price or eff_high >= liq_price))
                 )
                 if hit_liq:
-                    # Flag pre close_position: full remaining margin loss (nie mark-to-market %)
                     pos["_force_full_margin_loss"] = True
                     close_position(pos, liq_price, "LIQUIDATION_HIT", vault)
                     db_dirty = True
@@ -2522,42 +2539,56 @@ async def run_core_cycle(vault: dict):
                     pos["pending_limit_price"] = 0.0
                     db_dirty = True
 
-            # A. VPIN EMERGENCY ESCAPE (Toxický štít v protisměru)
+            # A. VPIN EMERGENCY ESCAPE – len ak je pozícia už v strate (LONG aj SHORT)
+            # Nevyhadzuje ziskové / break-even pozície pri toxickom flow
             if vpin_score > 0.85:
-                close_position(pos, curr_price, "VPIN_EMERGENCY_ESCAPE", vault)
-                db_dirty = True
-                continue
+                entry_px = float(pos.get("entry_price") or curr_price)
+                in_loss = (
+                    (is_long and curr_price < entry_px * 0.998)
+                    or ((not is_long) and curr_price > entry_px * 1.002)
+                )
+                if in_loss:
+                    close_position(pos, curr_price, "VPIN_EMERGENCY_ESCAPE", vault)
+                    db_dirty = True
+                    continue
 
-            # B. SHADOW OBI BARRIER (Dynamické schovávání SL za stěny hloubky 20) - PAPER
+            # B. SHADOW OBI BARRIER (PAPER) – LONG aj SHORT
+            # SL smie posunúť len smerom k zisku a max na 40 % vzdialenosti k aktuálnej cene
+            # (zabraňuje utiahnutiu SL tesne pod/nad cenu → okamžitý wick-out)
             if book_data and not pos.get("tp1_hit", False):
                 bids = book_data.get("bids", [])
                 asks = book_data.get("asks", [])
-                
-                # Hledání nejsilnější pasivní zdi v knize
-                if is_long and bids:
+                cur_sl = float(pos.get("sl_tsl_price") or 0.0)
+                entry_px = float(pos.get("entry_price") or curr_price)
+
+                if is_long and bids and cur_sl > 0:
                     best_wall_px = float(bids[0][0])
                     max_wall_vol = 0.0
                     for b in bids[:20]:
                         if float(b[1]) > max_wall_vol:
                             max_wall_vol = float(b[1])
                             best_wall_px = float(b[0])
-                    
-                    # Stop Loss schováme přesně 1 tick pod nalezenou zeď
                     shadow_sl = best_wall_px - 0.0001
-                    if shadow_sl > pos["sl_tsl_price"] and shadow_sl < curr_price:
+                    # max povolený SL = 40 % cesty od pôvodného SL k cene
+                    max_allowed_sl = cur_sl + 0.40 * (curr_price - cur_sl)
+                    if (shadow_sl > cur_sl and shadow_sl < curr_price
+                            and shadow_sl <= max_allowed_sl
+                            and shadow_sl < entry_px):  # SL musí ostať pod entry pri LONGu
                         paper_amend_sl(pos, shadow_sl, "SHADOW_OBI_LONG")
                         db_dirty = True
-                
-                elif not is_long and asks:
+
+                elif (not is_long) and asks and cur_sl > 0:
                     best_wall_px = float(asks[0][0])
                     max_wall_vol = 0.0
                     for a in asks[:20]:
                         if float(a[1]) > max_wall_vol:
                             max_wall_vol = float(a[1])
                             best_wall_px = float(a[0])
-                            
                     shadow_sl = best_wall_px + 0.0001
-                    if shadow_sl < pos["sl_tsl_price"] and shadow_sl > curr_price:
+                    max_allowed_sl = cur_sl - 0.40 * (cur_sl - curr_price)
+                    if (shadow_sl < cur_sl and shadow_sl > curr_price
+                            and shadow_sl >= max_allowed_sl
+                            and shadow_sl > entry_px):  # SL musí ostať nad entry pri SHORTe
                         paper_amend_sl(pos, shadow_sl, "SHADOW_OBI_SHORT")
                         db_dirty = True
 
@@ -2666,26 +2697,20 @@ async def run_core_cycle(vault: dict):
                         paper_amend_sl(pos, new_tsl, "POST_TP2_TSL")
                         db_dirty = True
 
-            # F. VYHODNOCENÍ ZÁSAHU TVRDÉHO SL / TSL NA BURZE (paper + intrabar wick)
-            # Ochrana: Hard SL sa nekontroluje prvých 120 s po otvorení (proti okamžitému wick-out)
+            # F. VYHODNOCENÍ ZÁSAHU TVRDÉHO SL / TSL NA BURZE (paper)
+            # LONG:  hit ak curr_price/eff_low  <= SL
+            # SHORT: hit ak curr_price/eff_high >= SL
+            # eff_* ignoruje pre-entry wick prvé 15 min; min_hold 120s pre počiatočný Hard SL
             sl_px = float(pos["sl_tsl_price"])
-            opened_ts = 0.0
-            try:
-                oa = pos.get("opened_at")
-                if oa:
-                    opened_ts = datetime.fromisoformat(str(oa).replace("Z", "+00:00")).timestamp()
-            except Exception:
-                opened_ts = 0.0
-            age_sec = (now_ts - opened_ts) if opened_ts > 0 else 9999.0
-            min_hold_sec = 120.0  # min. čas v pozícii pred povolením Hard SL
+            min_hold_sec = 120.0
 
             hit_sl_tsl = (
-                (is_long and (curr_price <= sl_px or candle_low <= sl_px))
-                or (not is_long and (curr_price >= sl_px or candle_high >= sl_px))
+                (is_long and (curr_price <= sl_px or eff_low <= sl_px))
+                or (not is_long and (curr_price >= sl_px or eff_high >= sl_px))
             )
-            # Trailing SL (po TP1) môže zatvárať hneď; počiatočný Hard SL až po min_hold_sec
             if hit_sl_tsl:
                 if pos.get("tsl_active"):
+                    # Trailing po TP1 – môže zatvárať okamžite (obe strany)
                     reason = "TRAILING_SL_PROFIT"
                     exit_px = sl_px
                     close_position(pos, exit_px, reason, vault)
@@ -2697,7 +2722,7 @@ async def run_core_cycle(vault: dict):
                     close_position(pos, exit_px, reason, vault)
                     db_dirty = True
                     continue
-                # else: ešte v ochrannej dobe → ignoruj wick, nechaj pozíciu bežať
+                # else: ochranná doba – ignoruj, pozícia beží ďalej
 
             # UI synchronizační vrstva pro paměť Streamlitu
             update_live_pnl_metrics(pos, curr_price, dir_mult, win_id)
