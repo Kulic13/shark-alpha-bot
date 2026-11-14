@@ -1,170 +1,277 @@
 import time
+import base64
+import pickle
 import asyncio
 import httpx
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone
-from us_market_engine import (
-    AI_FEATURES,
-    is_us_trading_window,
-    attach_institutional_context,
-    load_cloud_ai_model
-)
+from supabase import Client
 
 OKX_API = "https://okx.com"
-MIN_HISTORY_BARS = 1400
-MIN_VOL_24H_USD = 10_000_000.0
-AI_CONFIDENCE_THRESHOLD = 0.65
+
+_MODEL_CACHE = None
+_FEATURES_CACHE = None
+_MODEL_CACHE_TS = 0.0
+_MODEL_CACHE_TTL = 1800.0  # Obnoviť model zo Supabase každých 30 minút
 
 
-async def _fetch_candles_async(client: httpx.AsyncClient, symbol: str, limit: int = 100) -> pd.DataFrame | None:
-    """Rýchlo stiahne posledných 100 uzavretých 15m sviečok pre výpočet US VWAP a indikátorov."""
-    inst_id = symbol.replace("USDT", "-USDT-SWAP")
+def _load_xgboost_v3(supabase: Client):
+    """Načíta a kešuje natrénovaný XGBoost V3 model a jeho zoznam príznakov zo Supabase."""
+    global _MODEL_CACHE, _FEATURES_CACHE, _MODEL_CACHE_TS
+    now = time.time()
+    if _MODEL_CACHE is not None and (now - _MODEL_CACHE_TS) < _MODEL_CACHE_TTL:
+        return _MODEL_CACHE, _FEATURES_CACHE
+
     try:
-        res = await client.get(
-            f"{OKX_API}/api/v5/market/candles",
-            params={"instId": inst_id, "bar": "15m", "limit": str(limit)}
-        )
-        if res.status_code != 200:
-            return None
-        data = res.json().get("data", [])
-        if not data or len(data) < 35:
-            return None
-        # Zoradíme od najstaršej po najnovšiu (vynecháme poslednú neuzavretú sviečku)
-        closed_rows = list(reversed(data))[:-1]
-        df = pd.DataFrame(closed_rows, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "cf"])
-        return df[["ts", "o", "h", "l", "c", "v"]]
+        res = supabase.table("ai_models").select("model_base64, features_list").eq("id", 1).execute()
+        if res.data and len(res.data) > 0 and res.data[0].get("model_base64"):
+            row = res.data[0]
+            raw_bytes = base64.b64decode(row["model_base64"])
+            model = pickle.loads(raw_bytes)
+            feats = row.get("features_list") or [
+                "natr", "rsi", "ofd", "vpin", "vol_ratio", "ema_dist_atr",
+                "z_us_vwap", "rel_btc_2h", "market_breadth", "market_dispersion"
+            ]
+            _MODEL_CACHE = model
+            _FEATURES_CACHE = list(feats)
+            _MODEL_CACHE_TS = now
+            return model, _FEATURES_CACHE
     except Exception:
-        return None
+        pass
+    return _MODEL_CACHE, _FEATURES_CACHE
 
 
-async def _verify_min_history(client: httpx.AsyncClient, symbol: str) -> bool:
-    """Anti-listing poistka: overí, či minca existuje na OKX aspoň ~14.6 dňa (1400 sviečok)."""
-    inst_id = symbol.replace("USDT", "-USDT-SWAP")
-    target_past_ms = int((time.time() - (MIN_HISTORY_BARS * 15 * 60)) * 1000)
-    try:
-        res = await client.get(
-            f"{OKX_API}/api/v5/market/candles",
-            params={"instId": inst_id, "bar": "15m", "after": str(target_past_ms), "limit": "5"}
-        )
-        data = res.json().get("data", [])
-        return len(data) > 0
-    except Exception:
-        return False
-
-
-async def scan_ai_champion_window6(supabase_client, tickers: list, active_syms: set) -> dict | None:
-    """
-    Hlavný motor pre Okno 6 (AI Lovec Šampiónov):
-    1. Povolí hľadanie iba v Zlatom okne US seansy (15:00 – 20:30 UTC, Po–Pia).
-    2. Načíta cloudový model zo Supabase.
-    3. Vyberie top likvidné altcoiny, overí anti-listing limit a spočíta inštitucionálny kontext.
-    4. Vyberie absolútneho Šampióna s AI istotou >= 65 %.
-    """
-    now_utc = datetime.now(timezone.utc)
-    if not is_us_trading_window(now_utc):
-        return None
-
-    model, cached_thresh = load_cloud_ai_model(supabase_client)
-    if model is None:
-        return None
-
-    threshold = max(AI_CONFIDENCE_THRESHOLD, float(cached_thresh))
-
-    raw_candidates = []
-    for it in tickers:
-        inst_id = it.get("instId", "")
-        if not inst_id.endswith("-USDT-SWAP") or inst_id == "BTC-USDT-SWAP":
+def _compute_market_regime_metrics(tickers_list: list) -> tuple[float, float]:
+    """Vypočíta market_breadth (podiel rastúcich mincí) a market_dispersion (rozptyl zmien)."""
+    changes = []
+    for t in tickers_list:
+        inst_id = t.get("instId", "")
+        if not inst_id.endswith("-USDT-SWAP"):
             continue
-        sym = inst_id.replace("-USDT-SWAP", "USDT")
-        if sym in active_syms:
-            continue
-        vol_usd = float(it.get("volCcy24h") or 0.0)
-        last_px = float(it.get("last") or 0.0)
-        open_24h = float(it.get("open24h") or last_px)
-        if vol_usd >= MIN_VOL_24H_USD and last_px > 0:
-            pct_24h = abs((last_px - open_24h) / max(1e-9, open_24h)) * 100.0
-            raw_candidates.append({
-                "sym": sym,
-                "vol_usd": vol_usd,
-                "pct_24h": pct_24h,
-                "last_px": last_px
-            })
+        last_px = float(t.get("last") or 0.0)
+        open_24h = float(t.get("open24h") or 0.0)
+        if last_px > 0 and open_24h > 0:
+            pct = ((last_px - open_24h) / open_24h) * 100.0
+            changes.append(pct)
 
-    if not raw_candidates:
+    if not changes:
+        return 0.5, 2.0
+
+    arr = np.asarray(changes, dtype=float)
+    breadth = float(np.mean(arr > 0.0))
+    dispersion = float(np.std(arr))
+    return breadth, dispersion
+
+
+def _compute_us_vwap_zscore(df: pd.DataFrame) -> float:
+    """
+    Vypočíta Z-skóre aktuálnej ceny voči objemovo váženému priemeru (VWAP)
+    od začiatku aktuálnej/poslednej US obchodnej seansy (14:30 UTC).
+    """
+    times_utc = pd.to_datetime(df["ts"].astype(np.int64), unit="ms", utc=True)
+    now_utc = times_utc.iloc[-1]
+
+    us_open_today = now_utc.replace(hour=14, minute=30, second=0, microsecond=0)
+    if now_utc < us_open_today:
+        us_start = us_open_today - pd.Timedelta(days=1)
+    else:
+        us_start = us_open_today
+
+    session_df = df[times_utc >= us_start]
+    if len(session_df) < 3:
+        session_df = df.tail(20)
+
+    typical_px = (session_df["h"] + session_df["l"] + session_df["c"]) / 3.0
+    vol = session_df["v"].replace(0, 1e-9)
+    cum_vol = vol.cumsum()
+    vwap_series = (typical_px * vol).cumsum() / cum_vol
+
+    current_vwap = float(vwap_series.iloc[-1])
+    std_dev = float((typical_px - vwap_series).std())
+    if std_dev <= 1e-9 or np.isnan(std_dev):
+        return 0.0
+
+    z_score = (float(df["c"].iloc[-1]) - current_vwap) / std_dev
+    return float(np.clip(z_score, -5.0, 5.0))
+
+
+def _compute_features_v3(
+    klines: list,
+    btc_2h_pct: float,
+    market_breadth: float,
+    market_dispersion: float,
+) -> dict | None:
+    """Vypočíta všetkých 10 príznakov pre model xgboost_us_champion_v3."""
+    if len(klines) < 25:
         return None
 
-    # Zoradíme podľa kombinácie likvidity a pohybu, vezmeme top 15 do hĺbkového AI skenu
-    raw_candidates.sort(key=lambda x: (x["vol_usd"] * (1.0 + x["pct_24h"] / 10.0)), reverse=True)
-    top_pool = raw_candidates[:15]
+    df = pd.DataFrame(klines, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "cf"])
+    for col in ["o", "h", "l", "c", "v"]:
+        df[col] = df[col].astype(float)
 
-    headers = {"User-Agent": "SharkAlphaWindow6/3.0"}
-    async with httpx.AsyncClient(headers=headers, timeout=8.0) as client:
-        tasks = [_fetch_candles_async(client, "BTCUSDT", 100)]
-        for item in top_pool:
-            tasks.append(_fetch_candles_async(client, item["sym"], 100))
+    prev_c = df["c"].shift(1)
+    tr = pd.concat([df["h"] - df["l"], (df["h"] - prev_c).abs(), (df["l"] - prev_c).abs()], axis=1).max(axis=1)
+    atr_14 = tr.rolling(14).mean()
+    df["natr"] = (atr_14 / df["c"]) * 100.0
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+    delta = df["c"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, 1e-9)
+    df["rsi"] = 100.0 - (100.0 / (1.0 + rs))
 
-        btc_df = results.pop(0)
-        if isinstance(btc_df, Exception) or btc_df is None or btc_df.empty:
-            return None
+    rng = (df["h"] - df["l"]).replace(0, 1e-9)
+    body_frac = (df["c"] - df["o"]).abs() / rng
+    buyer_ratio = np.where(df["c"] >= df["o"], 0.5 + 0.5 * body_frac, 0.5 - 0.5 * body_frac)
+    buy_vol = (df["v"] * buyer_ratio).rolling(5).sum()
+    sell_vol = (df["v"] * (1.0 - buyer_ratio)).rolling(5).sum().replace(0, 1e-9)
+    df["ofd"] = buy_vol / sell_vol
 
-        coins_dict = {}
-        price_map = {}
-        for item, res_df in zip(top_pool, results):
-            sym = item["sym"]
-            if not isinstance(res_df, Exception) and res_df is not None and not res_df.empty:
-                coins_dict[sym] = res_df
-                price_map[sym] = item["last_px"]
+    c_ratio = (df["c"] - df["l"]) / rng
+    b_v = df["v"] * c_ratio
+    s_v = df["v"] * (1.0 - c_ratio)
+    df["vpin"] = (b_v - s_v).abs().rolling(10).sum() / (b_v + s_v).rolling(10).sum().replace(0, 1e-9)
 
-        if not coins_dict:
-            return None
+    df["vol_ratio"] = df["v"] / df["v"].rolling(10).mean().replace(0, 1e-9)
 
-        # Výpočet spoločného inštitucionálneho kontextu (US VWAP, Breadth, Dispersion)
-        enriched_dict = attach_institutional_context(coins_dict, btc_df)
-        if not enriched_dict:
-            return None
+    ema_20 = df["c"].ewm(span=20, adjust=False).mean()
+    df["ema_dist_atr"] = (df["c"] - ema_20) / atr_14.replace(0, 1e-9)
 
-        best_champion = None
-        best_prob = 0.0
+    # 2-hodinová relatívna výkonnosť voči BTC (8 × 15m sviečok)
+    c_now = float(df["c"].iloc[-1])
+    c_2h_ago = float(df["c"].iloc[-9]) if len(df) >= 9 else float(df["c"].iloc[0])
+    coin_2h_pct = ((c_now - c_2h_ago) / max(1e-9, c_2h_ago)) * 100.0
+    rel_btc_2h = coin_2h_pct - btc_2h_pct
 
-        for sym, df in enriched_dict.items():
-            last_row = df.iloc[-1]
-            if any(pd.isna(last_row[f]) for f in AI_FEATURES):
-                continue
+    z_us_vwap = _compute_us_vwap_zscore(df)
 
-            X_live = pd.DataFrame([last_row[AI_FEATURES].to_dict()])
-            probs_row = model.predict_proba(X_live).tolist().pop(0)
-            # Index 0 = WAIT, Index 1 = LONG, Index 2 = SHORT
-            prob_long = float(probs_row.pop(1))
-            prob_short = float(probs_row.pop(1))
+    last = df.iloc[-1]
+    result = {
+        "natr": float(last["natr"]),
+        "rsi": float(last["rsi"]),
+        "ofd": float(last["ofd"]),
+        "vpin": float(last["vpin"]),
+        "vol_ratio": float(last["vol_ratio"]),
+        "ema_dist_atr": float(last["ema_dist_atr"]),
+        "z_us_vwap": float(z_us_vwap),
+        "rel_btc_2h": float(rel_btc_2h),
+        "market_breadth": float(market_breadth),
+        "market_dispersion": float(market_dispersion),
+    }
 
-            if prob_long >= threshold and prob_long > best_prob:
-                best_prob = prob_long
-                best_champion = (sym, "LONG", prob_long, last_row, price_map[sym])
-            elif prob_short >= threshold and prob_short > best_prob:
-                best_prob = prob_short
-                best_champion = (sym, "SHORT", prob_short, last_row, price_map[sym])
+    if any(np.isnan(v) or np.isinf(v) for v in result.values()):
+        return None
+    return result
 
-        if best_champion is None:
-            return None
 
-        champ_sym, direction, conf_prob, feat_row, live_price = best_champion
+async def scan_ai_champion_window6(
+    supabase: Client,
+    tickers_list: list,
+    excluded_symbols: set,
+    min_confidence: float = 0.55,
+) -> dict | None:
+    """
+    Asynchrónny AI skener pre Okno 6 (XGBoost V3).
+    Vyhodnotí top 20 likvidných párov s využitím US VWAP a korelácie voči BTC.
+    """
+    model, feature_order = _load_xgboost_v3(supabase)
+    if model is None or not feature_order:
+        return None
 
-        # Finálna anti-listing kontrola iba pre víťazného Šampióna
-        is_mature = await _verify_min_history(client, champ_sym)
-        if not is_mature:
-            return None
+    market_breadth, market_dispersion = _compute_market_regime_metrics(tickers_list)
 
-        return {
-            "symbol": champ_sym,
-            "direction": direction,
-            "price": live_price,
-            "natr": float(feat_row["natr"]),
-            "rsi": float(feat_row["rsi"]),
-            "ofd": float(feat_row["ofd"]),
-            "vpin": float(feat_row["vpin"]),
-            "ai_confidence": round(conf_prob * 100.0, 1),
-            "source": "AI_CHAMPION_US_V3"
-        }
+    candidates = []
+    for t in tickers_list:
+        inst_id = t.get("instId", "")
+        if not inst_id.endswith("-USDT-SWAP"):
+            continue
+        sym = f"{inst_id.split('-')[0]}USDT"
+        if sym == "BTCUSDT" or sym in excluded_symbols:
+            continue
+        vol = float(t.get("volCcy24h") or 0.0)
+        price = float(t.get("last") or 0.0)
+        if vol >= 1_000_000.0 and price > 0:
+            candidates.append((sym, inst_id, vol, price))
+
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    top_candidates = candidates[:20]
+    if not top_candidates:
+        return None
+
+    sem = asyncio.Semaphore(6)
+    best_pick = None
+
+    async with httpx.AsyncClient(http2=True, timeout=8.0) as client:
+        # Najprv stiahneme 15m sviečky BTC pre výpočet rel_btc_2h
+        btc_2h_pct = 0.0
+        try:
+            btc_res = await client.get(
+                f"{OKX_API}/api/v5/market/candles",
+                params={"instId": "BTC-USDT-SWAP", "bar": "15m", "limit": "12"}
+            )
+            if btc_res.status_code == 200:
+                b_data = btc_res.json().get("data", [])
+                if len(b_data) >= 9:
+                    b_klines = list(reversed(b_data))
+                    b_now = float(b_klines[-1][4])
+                    b_2h = float(b_klines[-9][4])
+                    btc_2h_pct = ((b_now - b_2h) / max(1e-9, b_2h)) * 100.0
+        except Exception:
+            pass
+
+        async def evaluate_one(item):
+            sym, inst_id, vol, price = item
+            async with sem:
+                try:
+                    res = await client.get(
+                        f"{OKX_API}/api/v5/market/candles",
+                        params={"instId": inst_id, "bar": "15m", "limit": "60"}
+                    )
+                    if res.status_code != 200:
+                        return None
+                    payload = res.json()
+                    if payload.get("code") != "0" or not payload.get("data"):
+                        return None
+
+                    klines = list(reversed(payload["data"]))
+                    feats = _compute_features_v3(klines, btc_2h_pct, market_breadth, market_dispersion)
+                    if feats is None:
+                        return None
+
+                    X_row = pd.DataFrame([[feats.get(k, 0.0) for k in feature_order]], columns=feature_order)
+
+                    # Predikcia pravdepodobností: [0 = WAIT, 1 = LONG, 2 = SHORT]
+                    probs = model.predict_proba(X_row)[0]
+                    prob_long = float(probs[1])
+                    prob_short = float(probs[2])
+
+                    direction = None
+                    conf = 0.0
+                    if prob_long >= min_confidence and prob_long > prob_short:
+                        direction = "LONG"
+                        conf = prob_long
+                    elif prob_short >= min_confidence and prob_short > prob_long:
+                        direction = "SHORT"
+                        conf = prob_short
+
+                    if direction:
+                        return {
+                            "symbol": sym,
+                            "direction": direction,
+                            "price": price,
+                            "ai_confidence": round(conf, 4),
+                            "ofd": feats["ofd"],
+                            "rsi": feats["rsi"],
+                            "vpin": feats["vpin"],
+                            "source": "AI_CHAMPION_US_V3",
+                        }
+                except Exception:
+                    return None
+                return None
+
+        results = await asyncio.gather(*(evaluate_one(c) for c in top_candidates))
+        valid = [r for r in results if r is not None]
+        if valid:
+            valid.sort(key=lambda x: x["ai_confidence"], reverse=True)
+            best_pick = valid[0]
+        return best_pick
