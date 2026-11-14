@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from supabase import create_client, Client
+from ai_window6 import scan_ai_champion_window6
 
 st.set_page_config(page_title="Shark Alpha Core (Cloud 1 - OKX)", layout="centered")
 
@@ -2210,24 +2211,25 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
     r_mult = total_pnl_usd / risk_usd
 
     is_win = total_pnl_usd > 0
-    try:
-        update_ai_learning(
-            symbol=pos.get("symbol", ""),
-            direction=pos.get("direction", ""),
-            regime=pos.get("regime", "FUTURES"),
-            is_funding_trap=bool(pos.get("is_funding_trap", False)),
-            is_win=is_win,
-            r_multiple=r_mult,
-            vault=vault,
-            regime_x=pos.get("regime_x"),
-            regime_y=pos.get("regime_y"),
-        )
-    except Exception:
-        pass
-    try:
-        update_filter_weights_from_outcome(pos, is_win, reason, vault)
-    except Exception:
-        pass
+    if int(pos.get("window_id", 0)) != 6:
+        try:
+            update_ai_learning(
+                symbol=pos.get("symbol", ""),
+                direction=pos.get("direction", ""),
+                regime=pos.get("regime", "FUTURES"),
+                is_funding_trap=bool(pos.get("is_funding_trap", False)),
+                is_win=is_win,
+                r_multiple=r_mult,
+                vault=vault,
+                regime_x=pos.get("regime_x"),
+                regime_y=pos.get("regime_y"),
+            )
+        except Exception:
+            pass
+        try:
+            update_filter_weights_from_outcome(pos, is_win, reason, vault)
+        except Exception:
+            pass
 
     hist_row = {
         "window_id": pos["window_id"],
@@ -2962,25 +2964,42 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
                         failed_filter=c.get("_failed_filter", "FILTER_6_RISK_MMR"),
                     )
 
-    # ===== OKNO 6: PUMP & DUMP REŽIM (uvoľnené, všetko okrem BTC, objem 0.5M – 8M USD) =====
+    # ===== OKNO 6: AI LOVEC ŠAMPIÓNOV (US SESSION - XGBOOST V3) =====
     if vault["windows"]["6"]["status"] == "WAITING":
-        cands_pd = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 500_000.0, 8_000_000.0, btc_veto, klines_cache, is_pd_mode=True, vault=vault)
-        for c in cands_pd:
-            setup = build_trade_setup(c, vault["balance"], 6, vault)
-            if setup:
-                vault["windows"]["6"] = setup
-                vault["last_trade_opened_ts"] = time.time()
-                # P&D enters 100% market – taker on full active margin
-                mkt_notional = float(setup.get("active_margin") or 0.0) * float(setup.get("leverage") or 1)
-                vault["balance"] = round(float(vault["balance"]) - mkt_notional * 0.0005, 4)
-                push_active_position_row(setup, vault)
-                break
-            else:
-                record_shadow_trade(
-                    vault,
-                    {**c, "natr": calculate_natr_14(c["klines"]) if c.get("klines") else 2.0},
-                    failed_filter=c.get("_failed_filter", "FILTER_6_RISK_MMR"),
-                )
+        tickers_list = list(tickers.values()) if isinstance(tickers, dict) else list(tickers)
+        ai_cand = await scan_ai_champion_window6(supabase, tickers_list, active_syms)
+        if ai_cand:
+            sym_6 = ai_cand["symbol"]
+            klines_6 = await fetch_okx_klines(client, sym_6, "15m", 25, klines_cache)
+            if len(klines_6) >= 20:
+                cand_payload = {
+                    "symbol": sym_6,
+                    "direction": ai_cand["direction"],
+                    "is_pd": False,
+                    "is_funding_trap": False,
+                    "klines": klines_6,
+                    "exec_price": float(ai_cand["price"]),
+                    "entry_fingerprint": {
+                        "macro_btc_1h": float(btc_veto.get("btc_1h_pct", 0.0)),
+                        "liq_vol_24h": float((tickers.get(sym_6) or {}).get("volCcy24h", 0.0)),
+                        "ofd_val": float(ai_cand.get("ofd", 1.0)),
+                        "shield_rsi": float(ai_cand.get("rsi", 50.0)),
+                        "micro_wob": 0.0,
+                        "micro_vpin": float(ai_cand.get("vpin", 0.0)),
+                        "risk_wr": 52.0,
+                    },
+                    "book_levels": [],
+                }
+                setup = build_trade_setup(cand_payload, vault["balance"], 6, vault)
+                if setup:
+                    setup["ai_confidence"] = ai_cand.get("ai_confidence", 0.0)
+                    setup["source"] = ai_cand.get("source", "AI_CHAMPION_US_V3")
+                    vault["windows"]["6"] = setup
+                    vault["last_trade_opened_ts"] = time.time()
+                    mkt_notional = float(setup.get("active_margin") or 0.0) * float(setup.get("leverage") or 1)
+                    vault["balance"] = round(float(vault["balance"]) - mkt_notional * 0.0005, 4)
+                    push_active_position_row(setup, vault)
+                    active_syms.add(sym_6)
 
 
 # =========================================================================

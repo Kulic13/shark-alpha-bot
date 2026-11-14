@@ -97,7 +97,7 @@ def compute_single_coin_features(df: pd.DataFrame) -> pd.DataFrame:
     # 7. US Session VWAP Anchor (reset každý deň o 14:30 UTC)
     dt_utc = pd.to_datetime(data["ts"], unit="ms", utc=True)
     # Posunieme čas o 14h 30m dozadu, aby sa "session_day" lámal presne o 14:30 UTC
-    session_day = (dt_utc - pd.Timedelta(hours=14, minutes=30)).date
+    session_day = (dt_utc - pd.Timedelta(hours=14, minutes=30)).dt.date
     typ_price = (data["h"] + data["l"] + data["c"]) / 3.0
     pv = typ_price * data["v"]
 

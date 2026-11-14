@@ -2,8 +2,8 @@ name: Daily AI Brain Training (US Champion)
 
 on:
   schedule:
-    - cron: '0 2 * * *'
-  workflow_dispatch:
+    - cron: '0 2 * * *'  # Spustí sa automaticky každý deň o 02:00 UTC
+  workflow_dispatch:     # Umožní spustiť tréning kedykoľvek ručne jedným kliknutím
 
 jobs:
   train-model:
