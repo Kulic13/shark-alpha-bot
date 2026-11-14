@@ -144,6 +144,66 @@ def safe_float(val, default=0.0) -> float:
         return default
 
 
+def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
+    """3-stĺpcový breakdown: Take Profit hits / DCA fills / Dôvod zatvorenia pre daný subset histórie."""
+    n_total = len(df_subset)
+    if n_total == 0:
+        st.info(f"{title_prefix}: Zatiaľ žiadne uzavreté obchody.")
+        return
+
+    if "exit_reason" in df_subset.columns:
+        reasons = df_subset["exit_reason"].fillna("").astype(str)
+    else:
+        reasons = pd.Series([""] * n_total)
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.markdown("**Take Profit hits**")
+        tp1_cnt = int((reasons == "TP1_SCALE_OUT").sum())
+        tp2_cnt = int((reasons == "TP2_SCALE_OUT").sum())
+        tp3_cnt = int(reasons.str.contains("LIQUIDATION_CLIMAX|TP3", regex=True, na=False).sum())
+        st.write(f"TP1 executed: **{tp1_cnt}** / {n_total}")
+        st.write(f"TP2 executed: **{tp2_cnt}** / {n_total}")
+        st.write(f"TP3 hit (close): **{tp3_cnt}** / {n_total}")
+
+    with c2:
+        st.markdown("**DCA fills**")
+        if "dca1_filled" in df_subset.columns:
+            dca1_cnt = int(df_subset["dca1_filled"].fillna(False).astype(bool).sum())
+        else:
+            dca1_cnt = int(reasons.str.contains("DCA1", na=False).sum())
+        if "dca2_filled" in df_subset.columns:
+            dca2_cnt = int(df_subset["dca2_filled"].fillna(False).astype(bool).sum())
+        else:
+            dca2_cnt = int(reasons.str.contains("DCA2", na=False).sum())
+        if "dca3_filled" in df_subset.columns:
+            dca3_cnt = int(df_subset["dca3_filled"].fillna(False).astype(bool).sum())
+        else:
+            dca3_cnt = int(reasons.str.contains("DCA3", na=False).sum())
+        st.write(f"DCA1 filled: **{dca1_cnt}** / {n_total}")
+        st.write(f"DCA2 filled: **{dca2_cnt}** / {n_total}")
+        st.write(f"DCA3 filled: **{dca3_cnt}** / {n_total}")
+
+    with c3:
+        st.markdown("**Dôvod zatvorenia**")
+        reason_labels = {
+            "HARD_SL_HIT": "🔴 Hard SL",
+            "TP1_SCALE_OUT": "TP1_SCALE_OUT",
+            "TRAILING_SL_PROFIT": "🟢 Trailing SL (zisk)",
+            "EARLY_ORDERFLOW_ESCAPE": "⚠️ Early OF escape",
+            "TP2_SCALE_OUT": "TP2_SCALE_OUT",
+            "LIQUIDATION_CLIMAX_HIT": "🎯 TP3 Liquidation Climax",
+            "TP3_LIQUIDATION_HIT": "🎯 TP3",
+            "VPIN_EMERGENCY_ESCAPE": "☠️ VPIN Emergency",
+        }
+        reason_counts = reasons.replace("", "UNKNOWN").value_counts()
+        for reason, cnt in reason_counts.items():
+            label = reason_labels.get(str(reason), str(reason))
+            pct = (cnt / n_total) * 100.0
+            st.write(f"{label}: **{cnt}** ({pct:.0f}%)")
+
+
 # =========================================================================
 # BLOK 7: VIZUÁLNY KOKPIT (HORNÝ DASHBOARD, SIDEBAR & 4 VEĽKÉ GRAFY)
 # =========================================================================
@@ -217,62 +277,96 @@ with top_col1:
         m2.caption(f"✅ Win: **{win_trades}**  |  ❌ Fail: **{fail_trades}**")
         m3.metric("Nerealizované PnL", f"${unrealized:+.2f}")
 
-        # ----- SUMÁR ŠTATISTIKY: TP / DCA / EXIT REASON -----
-        st.markdown("##### 📊 Sumár štatistiky obchodov")
-        s1, s2, s3 = st.columns(3)
-
-        with s1:
-            st.markdown("**Take Profit hits**")
-            tp1_n = int(history_df["tp1_hit"].fillna(False).astype(bool).sum()) if "tp1_hit" in history_df.columns else 0
-            tp2_n = int(history_df["tp2_hit"].fillna(False).astype(bool).sum()) if "tp2_hit" in history_df.columns else 0
-            tp3_n = int(history_df["exit_reason"].isin(["LIQUIDATION_CLIMAX_HIT", "TP3_LIQUIDATION_HIT"]).sum()) if "exit_reason" in history_df.columns else 0
-            st.write(f"TP1 executed: **{tp1_n}** / {total_trades}")
-            st.write(f"TP2 executed: **{tp2_n}** / {total_trades}")
-            st.write(f"TP3 hit (close): **{tp3_n}** / {total_trades}")
-
-        with s2:
-            st.markdown("**DCA fills**")
-            dca1_n = int(history_df["dca1_filled"].fillna(False).astype(bool).sum()) if "dca1_filled" in history_df.columns else 0
-            dca2_n = int(history_df["dca2_filled"].fillna(False).astype(bool).sum()) if "dca2_filled" in history_df.columns else 0
-            dca3_n = int(history_df["dca3_filled"].fillna(False).astype(bool).sum()) if "dca3_filled" in history_df.columns else 0
-            st.write(f"DCA1 filled: **{dca1_n}** / {total_trades}")
-            st.write(f"DCA2 filled: **{dca2_n}** / {total_trades}")
-            st.write(f"DCA3 filled: **{dca3_n}** / {total_trades}")
-
-        with s3:
-            st.markdown("**Dôvod zatvorenia**")
-            if "exit_reason" in history_df.columns:
-                reason_counts = history_df["exit_reason"].fillna("UNKNOWN").value_counts()
-                reason_labels = {
-                    "HARD_SL_HIT": "🔴 Hard SL",
-                    "TRAILING_SL_PROFIT": "🟢 Trailing SL (zisk)",
-                    "LIQUIDATION_CLIMAX_HIT": "🎯 TP3 Liquidation Climax",
-                    "TP3_LIQUIDATION_HIT": "🎯 TP3",
-                    "EARLY_ORDERFLOW_ESCAPE": "⚠️ Early OF escape",
-                    "VPIN_EMERGENCY_ESCAPE": "☠️ VPIN Emergency",
-                }
-                for reason, cnt in reason_counts.items():
-                    label = reason_labels.get(str(reason), str(reason))
-                    pct = (cnt / total_trades) * 100.0
-                    st.write(f"{label}: **{cnt}** ({pct:.0f}%)")
-            else:
-                st.caption("exit_reason ešte nie je v histórii")
-
-        # Equity krivka – preferujeme closed_at, potom updated_at, inak id
-        if "closed_at" in history_df.columns and history_df["closed_at"].notna().any():
-            x_col = "closed_at"
-        elif "updated_at" in history_df.columns and history_df["updated_at"].notna().any():
-            x_col = "updated_at"
+        # ----- ROZDELENÉ ŠTATISTIKY: Okná 1–5 vs AI Okno 6 -----
+        if "window_id" in history_df.columns:
+            df_w15 = history_df[history_df["window_id"].astype(int) != 6].copy()
+            df_w6 = history_df[history_df["window_id"].astype(int) == 6].copy()
         else:
-            x_col = "id"
+            df_w15 = history_df.copy()
+            df_w6 = history_df.iloc[0:0].copy()
 
-        fig_eq = go.Figure()
-        fig_eq.add_trace(go.Scatter(
-            x=history_df[x_col], y=history_df["current_balance"],
-            mode="lines+markers", name="Equity ($)", line=dict(color="#00ffcc", width=3)
-        ))
-        fig_eq.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), template="plotly_dark")
-        st.plotly_chart(fig_eq, use_container_width=True)
+        tab_w15, tab_w6 = st.tabs([
+            "📊 Okná 1–5 (Adaptívne MMR)",
+            "🤖 AI Okno 6 (XGBoost V3)",
+        ])
+
+        def _equity_xcol(df_sub: pd.DataFrame) -> str:
+            if "closed_at" in df_sub.columns and df_sub["closed_at"].notna().any():
+                return "closed_at"
+            if "updated_at" in df_sub.columns and df_sub["updated_at"].notna().any():
+                return "updated_at"
+            return "id"
+
+        with tab_w15:
+            n15 = len(df_w15)
+            if n15 > 0:
+                wins15 = int((df_w15["pnl_usd"] > 0).sum()) if "pnl_usd" in df_w15.columns else 0
+                fails15 = n15 - wins15
+                wr15 = (wins15 / n15) * 100.0
+                pnl15 = float(df_w15["pnl_usd"].sum()) if "pnl_usd" in df_w15.columns else 0.0
+                a1, a2, a3 = st.columns(3)
+                a1.metric("Čistý PnL ($)", f"${pnl15:+.2f}")
+                a2.metric("Win / Fail Ratio (%)", f"{wr15:.1f} %", f"{wins15} / {n15}")
+                a3.metric("Počet záznamov", f"{n15}")
+
+                x15 = _equity_xcol(df_w15)
+                cum15 = df_w15["pnl_usd"].fillna(0.0).cumsum() if "pnl_usd" in df_w15.columns else pd.Series([0.0] * n15)
+                fig15 = go.Figure()
+                fig15.add_trace(go.Scatter(
+                    x=df_w15[x15], y=cum15,
+                    mode="lines+markers", name="Equity W1–5 ($)",
+                    line=dict(color="#00ffcc", width=3),
+                ))
+                fig15.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), template="plotly_dark")
+                st.plotly_chart(fig15, use_container_width=True)
+            else:
+                st.info("Okná 1–5: Zatiaľ žiadne uzavreté obchody.")
+
+            st.markdown("##### 📊 Sumár štatistiky — Okná 1–5")
+            render_execution_breakdown(df_w15, "Okná 1–5")
+
+        with tab_w6:
+            # AI model status (id=1)
+            try:
+                model_res = supabase.table("ai_models").select("model_name, accuracy, trained_at").eq("id", 1).execute()
+                if model_res.data and len(model_res.data) > 0:
+                    mrow = model_res.data[0]
+                    m_name = mrow.get("model_name") or "xgboost_us_champion_v3"
+                    m_acc = mrow.get("accuracy")
+                    m_trained = mrow.get("trained_at") or "—"
+                    acc_txt = f"{float(m_acc) * 100:.1f}%" if m_acc is not None else "—"
+                    st.caption(f"Model: **{m_name}**  |  Accuracy: **{acc_txt}**  |  Trained at: **{m_trained}**")
+                else:
+                    st.caption("AI model (id=1) zatiaľ nie je v `ai_models`.")
+            except Exception as e:
+                st.caption(f"ai_models nedostupné: {e}")
+
+            n6 = len(df_w6)
+            if n6 > 0:
+                wins6 = int((df_w6["pnl_usd"] > 0).sum()) if "pnl_usd" in df_w6.columns else 0
+                fails6 = n6 - wins6
+                wr6 = (wins6 / n6) * 100.0
+                pnl6 = float(df_w6["pnl_usd"].sum()) if "pnl_usd" in df_w6.columns else 0.0
+                b1, b2, b3 = st.columns(3)
+                b1.metric("AI Čistý PnL ($)", f"${pnl6:+.2f}")
+                b2.metric("AI Win / Fail Ratio (%)", f"{wr6:.1f} %", f"{wins6} / {n6}")
+                b3.metric("Počet AI záznamov", f"{n6}")
+
+                x6 = _equity_xcol(df_w6)
+                cum6 = df_w6["pnl_usd"].fillna(0.0).cumsum() if "pnl_usd" in df_w6.columns else pd.Series([0.0] * n6)
+                fig6 = go.Figure()
+                fig6.add_trace(go.Scatter(
+                    x=df_w6[x6], y=cum6,
+                    mode="lines+markers", name="Equity AI W6 ($)",
+                    line=dict(color="#00FFAA", width=3),
+                ))
+                fig6.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), template="plotly_dark")
+                st.plotly_chart(fig6, use_container_width=True)
+            else:
+                st.info("AI Okno 6: Zatiaľ žiadne uzavreté obchody.")
+
+            st.markdown("##### 📊 Sumár štatistiky — AI Okno 6")
+            render_execution_breakdown(df_w6, "AI Okno 6")
     else:
         st.metric("Aktuálny Kapitál", f"${curr_bal:.2f}", f"{total_pnl:+.2f} USD")
         st.info("Zatiaľ neboli uzavreté žiadne obchody. Equity krivka sa vykreslí automaticky po prvom trejde.")
@@ -304,7 +398,7 @@ window_titles = {
     3: "3️⃣ Elitný ≥10M (B)",
     4: "4️⃣ Nízka likvidita 5-9.9M (A)",
     5: "5️⃣ Nízka likvidita 5-9.9M (B)",
-    6: "6️⃣ Pump & Dump 1-4.9M"
+    6: "6️⃣ AI Lovec (XGBoost V3)"
 }
 
 for wid in (1, 2, 3, 4, 5, 6):
