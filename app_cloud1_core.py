@@ -2642,7 +2642,7 @@ async def run_core_cycle(vault: dict):
                             pos["tp2_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.8 * natr * tp_mod) / 100.0 + cost_rate))
 
             # D. FÁZOVANÝ SCALE-OUT (TP1 & TP2) S REŽIMOVÝM TSL
-            # ZMENA 1: same-bar ochrana + širší BE + min-hold po TP1 + miernejší LOW_VOL trail
+            # ZMENA 1+3: same-bar + širší BE + 5min BE freeze / trail delay + voľnejší post-TP1 trail
             _tp1_just_hit = False
             if not pos.get("tp1_hit", False):
                 if (is_long and (curr_price >= pos["tp1_price"] or candle_high >= pos["tp1_price"])) or (not is_long and (curr_price <= pos["tp1_price"] or candle_low <= pos["tp1_price"])):
@@ -2667,18 +2667,26 @@ async def run_core_cycle(vault: dict):
                 elif not is_long and curr_price < pos["extreme_price"]:
                     pos["extreme_price"] = curr_price
 
-                # REŽIMOVÝ TSL ENGINE: Krok trailingu se adaptuje podle osy Y (volatility) z MMR matice
-                if ry == 3:    # HIGH_VOL (Volnější krok pro šum velkých svíček)
-                    step_pct = (0.85 * natr) / 100.0
-                elif ry == 1:  # LOW_VOL — miernejšie (0.55×) aby trail nezabíjal noise hneď po TP1
-                    step_pct = (0.55 * natr) / 100.0
-                else:          # MID_VOL
-                    step_pct = (0.65 * natr) / 100.0
+                # ZMENA 3: po TP1 drž BE fixný 5 min (trail ešte neťahaj), potom voľnejší krok
+                # → viac priestoru dobehnúť TP2 namiesto skorého TRAILING_SL_PROFIT
+                tp1_ts_for_trail = float(pos.get("tp1_hit_ts") or 0.0)
+                sec_since_tp1_trail = (float(now_ts) - tp1_ts_for_trail) if tp1_ts_for_trail > 0 else 1e9
+                post_tp1_trail_delay_sec = 300.0  # 5 minút BE freeze
 
-                new_tsl = pos["extreme_price"] * (1.0 - dir_mult * step_pct)
-                if (is_long and new_tsl > pos["sl_tsl_price"]) or (not is_long and new_tsl < pos["sl_tsl_price"]):
-                    paper_amend_sl(pos, new_tsl, "REGIME_TSL")
-                    db_dirty = True
+                if sec_since_tp1_trail >= post_tp1_trail_delay_sec:
+                    # REŽIMOVÝ TSL ENGINE — voľnejšie kroky (Zmena 3B)
+                    if ry == 3:    # HIGH_VOL
+                        step_pct = (1.10 * natr) / 100.0
+                    elif ry == 1:  # LOW_VOL
+                        step_pct = (0.90 * natr) / 100.0
+                    else:          # MID_VOL
+                        step_pct = (1.00 * natr) / 100.0
+
+                    new_tsl = pos["extreme_price"] * (1.0 - dir_mult * step_pct)
+                    if (is_long and new_tsl > pos["sl_tsl_price"]) or (not is_long and new_tsl < pos["sl_tsl_price"]):
+                        paper_amend_sl(pos, new_tsl, "REGIME_TSL")
+                        db_dirty = True
+                # else: BE lock ostáva, trail ešte neaktívny
 
                 if (is_long and (curr_price >= pos["tp2_price"] or candle_high >= pos["tp2_price"])) or (not is_long and (curr_price <= pos["tp2_price"] or candle_low <= pos["tp2_price"])):
                     execute_scale_out(pos, curr_price, 0.60, "TP2_SCALE_OUT", vault, now_dt)
@@ -2726,10 +2734,11 @@ async def run_core_cycle(vault: dict):
             # LONG:  hit ak curr_price/eff_low  <= SL
             # SHORT: hit ak curr_price/eff_high >= SL
             # eff_* ignoruje pre-entry wick prvé 15 min; min_hold 120s pre počiatočný Hard SL
-            # ZMENA 1: po TP1 — same-bar skip + min 90s hold pred TRAILING/BE stopom
+            # ZMENA 1 + ZMENA 3: same-bar skip; po TP1 min 5 min hold pred BE/TRAIL close
+            # (zosúladené s post_tp1_trail_delay_sec = 300s — BE freeze window)
             sl_px = float(pos["sl_tsl_price"])
             min_hold_sec = 120.0
-            post_tp1_min_hold_sec = 90.0
+            post_tp1_min_hold_sec = 300.0
 
             hit_sl_tsl = (
                 (is_long and (curr_price <= sl_px or eff_low <= sl_px))
