@@ -2244,7 +2244,16 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict):
         "pnl_percent": round(net_pnl_pct, 2),
         "exit_reason": reason,
         "current_balance": vault["balance"],
-        "closed_at": now_dt.isoformat()
+        "closed_at": now_dt.isoformat(),
+        # DCA / TP execution flags (pre cockpit breakdown)
+        "dca1_filled": bool(pos.get("dca1_filled", False)),
+        "dca2_filled": bool(pos.get("dca2_filled", False)),
+        "dca3_filled": bool(pos.get("dca3_filled", False)),
+        "tp1_hit": bool(pos.get("tp1_hit", False)),
+        "tp2_hit": bool(pos.get("tp2_hit", False)),
+        "dca1_price": float(pos.get("dca1_price") or 0.0),
+        "dca2_price": float(pos.get("dca2_price") or 0.0),
+        "dca3_price": float(pos.get("dca3_price") or 0.0),
     }
     try:
         supabase.table("trade_history").insert(hist_row).execute()
@@ -2302,7 +2311,15 @@ def execute_scale_out(pos: dict, price: float, pct: float, reason: str, vault: d
         "regime": pos["regime"], "leverage": pos["leverage"], "entry_price": pos["entry_price"],
         "exit_price": price, "margin_usd": round(closed_margin, 4), "pnl_usd": round(partial_pnl_usd, 4),
         "pnl_percent": round(net_pnl_pct, 2), "exit_reason": reason, "current_balance": vault["balance"],
-        "closed_at": now_dt.isoformat()
+        "closed_at": now_dt.isoformat(),
+        "dca1_filled": bool(pos.get("dca1_filled", False)),
+        "dca2_filled": bool(pos.get("dca2_filled", False)),
+        "dca3_filled": bool(pos.get("dca3_filled", False)),
+        "tp1_hit": bool(pos.get("tp1_hit", False)),
+        "tp2_hit": bool(pos.get("tp2_hit", False)),
+        "dca1_price": float(pos.get("dca1_price") or 0.0),
+        "dca2_price": float(pos.get("dca2_price") or 0.0),
+        "dca3_price": float(pos.get("dca3_price") or 0.0),
     }
     try:
         supabase.table("trade_history").insert(hist_row).execute()
