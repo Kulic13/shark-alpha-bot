@@ -2642,6 +2642,8 @@ async def run_core_cycle(vault: dict):
                             pos["tp2_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.8 * natr * tp_mod) / 100.0 + cost_rate))
 
             # D. FÁZOVANÝ SCALE-OUT (TP1 & TP2) S REŽIMOVÝM TSL
+            # ZMENA 1: same-bar ochrana + širší BE + min-hold po TP1 + miernejší LOW_VOL trail
+            _tp1_just_hit = False
             if not pos.get("tp1_hit", False):
                 if (is_long and (curr_price >= pos["tp1_price"] or candle_high >= pos["tp1_price"])) or (not is_long and (curr_price <= pos["tp1_price"] or candle_low <= pos["tp1_price"])):
                     # Odprodej 50 % pozice tržním scale-outem
@@ -2649,9 +2651,13 @@ async def run_core_cycle(vault: dict):
                     pos["tp1_hit"] = True
                     pos["tsl_active"] = True
                     pos["extreme_price"] = curr_price
-                    
-                    # OKAMŽITÝ POSUN SL NA BE+ (paper)
-                    be_lock = pos["entry_price"] * (1.0 + dir_mult * (cost_rate + 0.0010))
+                    pos["tp1_hit_ts"] = float(now_ts)
+                    _tp1_just_hit = True
+
+                    # BE lock: max(cost+0.10%, 0.35×NATR, 40% cesty entry→TP1) — mimo bežný 15m noise
+                    dist_tp1 = abs(float(pos["tp1_price"]) - float(pos["entry_price"])) / max(1e-9, float(pos["entry_price"]))
+                    be_pad = max(float(cost_rate) + 0.0010, (0.35 * float(natr)) / 100.0, 0.40 * dist_tp1)
+                    be_lock = pos["entry_price"] * (1.0 + dir_mult * be_pad)
                     paper_amend_sl(pos, be_lock, "BE_LOCK_AFTER_TP1")
                     db_dirty = True
 
@@ -2664,8 +2670,8 @@ async def run_core_cycle(vault: dict):
                 # REŽIMOVÝ TSL ENGINE: Krok trailingu se adaptuje podle osy Y (volatility) z MMR matice
                 if ry == 3:    # HIGH_VOL (Volnější krok pro šum velkých svíček)
                     step_pct = (0.85 * natr) / 100.0
-                elif ry == 1:  # LOW_VOL (Agresivní utažení pro okamžité uzamčení zisku)
-                    step_pct = (0.35 * natr) / 100.0
+                elif ry == 1:  # LOW_VOL — miernejšie (0.55×) aby trail nezabíjal noise hneď po TP1
+                    step_pct = (0.55 * natr) / 100.0
                 else:          # MID_VOL
                     step_pct = (0.65 * natr) / 100.0
 
@@ -2720,8 +2726,10 @@ async def run_core_cycle(vault: dict):
             # LONG:  hit ak curr_price/eff_low  <= SL
             # SHORT: hit ak curr_price/eff_high >= SL
             # eff_* ignoruje pre-entry wick prvé 15 min; min_hold 120s pre počiatočný Hard SL
+            # ZMENA 1: po TP1 — same-bar skip + min 90s hold pred TRAILING/BE stopom
             sl_px = float(pos["sl_tsl_price"])
             min_hold_sec = 120.0
+            post_tp1_min_hold_sec = 90.0
 
             hit_sl_tsl = (
                 (is_long and (curr_price <= sl_px or eff_low <= sl_px))
@@ -2729,12 +2737,27 @@ async def run_core_cycle(vault: dict):
             )
             if hit_sl_tsl:
                 if pos.get("tsl_active"):
-                    # Trailing po TP1 – môže zatvárať okamžite (obe strany)
-                    reason = "TRAILING_SL_PROFIT"
-                    exit_px = sl_px
-                    close_position(pos, exit_px, reason, vault)
-                    db_dirty = True
-                    continue
+                    # Same-bar ako TP1: knôt by inak okamžite zabil zvyšok na BE
+                    if _tp1_just_hit:
+                        pass
+                    else:
+                        tp1_ts = float(pos.get("tp1_hit_ts") or 0.0)
+                        sec_since_tp1 = (float(now_ts) - tp1_ts) if tp1_ts > 0 else 1e9
+                        if sec_since_tp1 < post_tp1_min_hold_sec:
+                            # Ochranné okno po TP1 — nechaj pozíciu bežať k TP2
+                            pass
+                        else:
+                            # Rozlíš tesný BE stop vs bežný trailing profit
+                            entry_px = float(pos.get("entry_price") or 0.0)
+                            be_band = abs(sl_px - entry_px) / max(1e-9, entry_px)
+                            if be_band <= 0.012 and sec_since_tp1 < 600.0:
+                                reason = "BE_STOP_AFTER_TP1"
+                            else:
+                                reason = "TRAILING_SL_PROFIT"
+                            exit_px = sl_px
+                            close_position(pos, exit_px, reason, vault)
+                            db_dirty = True
+                            continue
                 elif age_sec >= min_hold_sec:
                     reason = "HARD_SL_HIT"
                     exit_px = sl_px
