@@ -217,6 +217,7 @@ def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
         st.markdown("**Dôvod zatvorenia**")
         reason_labels = {
             "HARD_SL_HIT": "🔴 Hard SL",
+            "BE_STOP_AFTER_TP1": "🟡 BE stop po TP1",
             "TP1_SCALE_OUT": "TP1_SCALE_OUT",
             "TRAILING_SL_PROFIT": "🟢 Trailing SL (zisk)",
             "EARLY_ORDERFLOW_ESCAPE": "⚠️ Early OF escape",
