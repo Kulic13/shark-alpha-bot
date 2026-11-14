@@ -145,45 +145,73 @@ def safe_float(val, default=0.0) -> float:
 
 
 def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
-    """3-stĺpcový breakdown: Take Profit hits / DCA fills / Dôvod zatvorenia pre daný subset histórie."""
-    n_total = len(df_subset)
-    if n_total == 0:
+    """3-stĺpcový breakdown: Take Profit hits / DCA fills / Dôvod zatvorenia pre daný subset histórie.
+
+    trade_history obsahuje aj partial scale-out riadky (TP1_SCALE_OUT / TP2_SCALE_OUT).
+    - TP hits: počítame eventy (scale-out riadky + finálne TP3 close).
+    - DCA fills: počítame len na finálnych close riadkoch (flags dca*_filled z core1).
+    - Dôvod zatvorenia: všetky riadky (vrátane scale-outov).
+    """
+    n_all = len(df_subset)
+    if n_all == 0:
         st.info(f"{title_prefix}: Zatiaľ žiadne uzavreté obchody.")
         return
 
     if "exit_reason" in df_subset.columns:
-        reasons = df_subset["exit_reason"].fillna("").astype(str)
+        reasons_all = df_subset["exit_reason"].fillna("").astype(str)
     else:
-        reasons = pd.Series([""] * n_total)
+        reasons_all = pd.Series([""] * n_all, index=df_subset.index)
+
+    # Finálne close = všetko okrem partial scale-out ledger riadkov
+    scale_out_reasons = {"TP1_SCALE_OUT", "TP2_SCALE_OUT"}
+    is_final = ~reasons_all.isin(scale_out_reasons)
+    df_final = df_subset.loc[is_final].copy()
+    n_trades = len(df_final) if len(df_final) > 0 else n_all
+    reasons_final = (
+        df_final["exit_reason"].fillna("").astype(str)
+        if "exit_reason" in df_final.columns and len(df_final) > 0
+        else reasons_all
+    )
 
     c1, c2, c3 = st.columns(3)
 
     with c1:
         st.markdown("**Take Profit hits**")
-        tp1_cnt = int((reasons == "TP1_SCALE_OUT").sum())
-        tp2_cnt = int((reasons == "TP2_SCALE_OUT").sum())
-        tp3_cnt = int(reasons.str.contains("LIQUIDATION_CLIMAX|TP3", regex=True, na=False).sum())
-        st.write(f"TP1 executed: **{tp1_cnt}** / {n_total}")
-        st.write(f"TP2 executed: **{tp2_cnt}** / {n_total}")
-        st.write(f"TP3 hit (close): **{tp3_cnt}** / {n_total}")
+        # Event-based: scale-out riadky + finálne TP3/climax
+        tp1_cnt = int((reasons_all == "TP1_SCALE_OUT").sum())
+        tp2_cnt = int((reasons_all == "TP2_SCALE_OUT").sum())
+        tp3_cnt = int(reasons_all.str.contains("LIQUIDATION_CLIMAX|TP3", regex=True, na=False).sum())
+        # Fallback z boolean flags na finálnych close (ak core1 zapísal tp*_hit)
+        if tp1_cnt == 0 and "tp1_hit" in df_final.columns and len(df_final) > 0:
+            tp1_cnt = int(df_final["tp1_hit"].fillna(False).astype(bool).sum())
+        if tp2_cnt == 0 and "tp2_hit" in df_final.columns and len(df_final) > 0:
+            tp2_cnt = int(df_final["tp2_hit"].fillna(False).astype(bool).sum())
+        st.write(f"TP1 executed: **{tp1_cnt}** / {n_trades}")
+        st.write(f"TP2 executed: **{tp2_cnt}** / {n_trades}")
+        st.write(f"TP3 hit (close): **{tp3_cnt}** / {n_trades}")
 
     with c2:
         st.markdown("**DCA fills**")
-        if "dca1_filled" in df_subset.columns:
-            dca1_cnt = int(df_subset["dca1_filled"].fillna(False).astype(bool).sum())
+        # Trade-level: flags len na finálnych close riadkoch (core1 close_position)
+        src = df_final if len(df_final) > 0 else df_subset
+        n_dca_base = len(src) if len(src) > 0 else n_all
+        if "dca1_filled" in src.columns:
+            dca1_cnt = int(src["dca1_filled"].fillna(False).astype(bool).sum())
         else:
-            dca1_cnt = int(reasons.str.contains("DCA1", na=False).sum())
-        if "dca2_filled" in df_subset.columns:
-            dca2_cnt = int(df_subset["dca2_filled"].fillna(False).astype(bool).sum())
+            dca1_cnt = 0
+        if "dca2_filled" in src.columns:
+            dca2_cnt = int(src["dca2_filled"].fillna(False).astype(bool).sum())
         else:
-            dca2_cnt = int(reasons.str.contains("DCA2", na=False).sum())
-        if "dca3_filled" in df_subset.columns:
-            dca3_cnt = int(df_subset["dca3_filled"].fillna(False).astype(bool).sum())
+            dca2_cnt = 0
+        if "dca3_filled" in src.columns:
+            dca3_cnt = int(src["dca3_filled"].fillna(False).astype(bool).sum())
         else:
-            dca3_cnt = int(reasons.str.contains("DCA3", na=False).sum())
-        st.write(f"DCA1 filled: **{dca1_cnt}** / {n_total}")
-        st.write(f"DCA2 filled: **{dca2_cnt}** / {n_total}")
-        st.write(f"DCA3 filled: **{dca3_cnt}** / {n_total}")
+            dca3_cnt = 0
+        st.write(f"DCA1 filled: **{dca1_cnt}** / {n_dca_base}")
+        st.write(f"DCA2 filled: **{dca2_cnt}** / {n_dca_base}")
+        st.write(f"DCA3 filled: **{dca3_cnt}** / {n_dca_base}")
+        if "dca1_filled" not in df_subset.columns:
+            st.caption("⚠ Stĺpce dca*_filled ešte nie sú v trade_history (deploy core1 fix).")
 
     with c3:
         st.markdown("**Dôvod zatvorenia**")
@@ -197,10 +225,10 @@ def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
             "TP3_LIQUIDATION_HIT": "🎯 TP3",
             "VPIN_EMERGENCY_ESCAPE": "☠️ VPIN Emergency",
         }
-        reason_counts = reasons.replace("", "UNKNOWN").value_counts()
+        reason_counts = reasons_all.replace("", "UNKNOWN").value_counts()
         for reason, cnt in reason_counts.items():
             label = reason_labels.get(str(reason), str(reason))
-            pct = (cnt / n_total) * 100.0
+            pct = (cnt / n_all) * 100.0
             st.write(f"{label}: **{cnt}** ({pct:.0f}%)")
 
 
