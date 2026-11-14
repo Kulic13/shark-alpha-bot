@@ -144,6 +144,43 @@ def safe_float(val, default=0.0) -> float:
         return default
 
 
+# Čistý reštart equity: zabudnúť na staré / rozbité current_balance zo SQL
+EQUITY_BASELINE = 1000.0
+
+
+def build_fresh_equity(df_sub: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """
+    Equity od EQUITY_BASELINE + kumulatívny súčet pnl_usd.
+    Ignoruje current_balance z DB (po mazaní SQL býva nekonzistentný).
+    Triedi chronologicky; vynechá riadky bez pnl_usd.
+    """
+    if df_sub is None or df_sub.empty or "pnl_usd" not in df_sub.columns:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+
+    d = df_sub.copy()
+    d["pnl_usd"] = pd.to_numeric(d["pnl_usd"], errors="coerce")
+    d = d.dropna(subset=["pnl_usd"])
+    if d.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+
+    # časová os
+    if "closed_at" in d.columns and d["closed_at"].notna().any():
+        d["_t"] = pd.to_datetime(d["closed_at"], utc=True, errors="coerce")
+    elif "updated_at" in d.columns and d["updated_at"].notna().any():
+        d["_t"] = pd.to_datetime(d["updated_at"], utc=True, errors="coerce")
+    elif "id" in d.columns:
+        d["_t"] = d["id"]
+    else:
+        d["_t"] = np.arange(len(d))
+
+    d = d.dropna(subset=["_t"]).sort_values("_t")
+    if d.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+
+    equity = EQUITY_BASELINE + d["pnl_usd"].cumsum()
+    return d["_t"].reset_index(drop=True), equity.reset_index(drop=True)
+
+
 def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
     """3-stĺpcový breakdown: Take Profit hits / DCA fills / Dôvod zatvorenia pre daný subset histórie.
 
@@ -282,10 +319,9 @@ top_col1, top_col2 = st.columns([1.2, 1.0])
 
 with top_col1:
     st.subheader("📈 Dynamický Equity Dashboard")
-    # Baseline 1000.0 USD – prefer live vault balance, fallback history
-    hist_bal = safe_float(history_df["current_balance"].iloc[-1], 1000.0) if not history_df.empty else 1000.0
-    curr_bal = safe_float(vault_state.get("balance"), hist_bal)
-    total_pnl = curr_bal - 1000.0
+    # Čistý reštart: kapitál z live vault; PnL voči EQUITY_BASELINE (zabudnúť na staré SQL balance)
+    curr_bal = safe_float(vault_state.get("balance"), EQUITY_BASELINE)
+    total_pnl = curr_bal - EQUITY_BASELINE
 
     if not history_df.empty:
         win_trades = len(history_df[history_df["pnl_usd"] > 0])
@@ -338,16 +374,25 @@ with top_col1:
                 a2.metric("Win / Fail Ratio (%)", f"{wr15:.1f} %", f"{wins15} / {n15}")
                 a3.metric("Počet záznamov", f"{n15}")
 
-                x15 = _equity_xcol(df_w15)
-                cum15 = df_w15["pnl_usd"].fillna(0.0).cumsum() if "pnl_usd" in df_w15.columns else pd.Series([0.0] * n15)
-                fig15 = go.Figure()
-                fig15.add_trace(go.Scatter(
-                    x=df_w15[x15], y=cum15,
-                    mode="lines+markers", name="Equity W1–5 ($)",
-                    line=dict(color="#00ffcc", width=3),
-                ))
-                fig15.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), template="plotly_dark")
-                st.plotly_chart(fig15, use_container_width=True)
+                x15, eq15 = build_fresh_equity(df_w15)
+                if len(eq15) > 0:
+                    fig15 = go.Figure()
+                    fig15.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray",
+                                    annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
+                    fig15.add_trace(go.Scatter(
+                        x=x15, y=eq15,
+                        mode="lines+markers", name="Equity W1–5 ($)",
+                        line=dict(color="#00ffcc", width=3),
+                    ))
+                    fig15.update_layout(
+                        height=260, margin=dict(l=10, r=10, t=10, b=10),
+                        template="plotly_dark",
+                        yaxis_title="Equity ($)",
+                    )
+                    st.plotly_chart(fig15, use_container_width=True)
+                    st.caption(f"Equity od baseline **{EQUITY_BASELINE:.0f} $** + Σ pnl (aktuálne dáta, bez starej SQL histórie balance).")
+                else:
+                    st.info("Okná 1–5: žiadne platné pnl_usd na vykreslenie equity.")
             else:
                 st.info("Okná 1–5: Zatiaľ žiadne uzavreté obchody.")
 
@@ -381,16 +426,25 @@ with top_col1:
                 b2.metric("AI Win / Fail Ratio (%)", f"{wr6:.1f} %", f"{wins6} / {n6}")
                 b3.metric("Počet AI záznamov", f"{n6}")
 
-                x6 = _equity_xcol(df_w6)
-                cum6 = df_w6["pnl_usd"].fillna(0.0).cumsum() if "pnl_usd" in df_w6.columns else pd.Series([0.0] * n6)
-                fig6 = go.Figure()
-                fig6.add_trace(go.Scatter(
-                    x=df_w6[x6], y=cum6,
-                    mode="lines+markers", name="Equity AI W6 ($)",
-                    line=dict(color="#00FFAA", width=3),
-                ))
-                fig6.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), template="plotly_dark")
-                st.plotly_chart(fig6, use_container_width=True)
+                x6, eq6 = build_fresh_equity(df_w6)
+                if len(eq6) > 0:
+                    fig6 = go.Figure()
+                    fig6.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray",
+                                   annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
+                    fig6.add_trace(go.Scatter(
+                        x=x6, y=eq6,
+                        mode="lines+markers", name="Equity AI W6 ($)",
+                        line=dict(color="#00FFAA", width=3),
+                    ))
+                    fig6.update_layout(
+                        height=260, margin=dict(l=10, r=10, t=10, b=10),
+                        template="plotly_dark",
+                        yaxis_title="Equity ($)",
+                    )
+                    st.plotly_chart(fig6, use_container_width=True)
+                    st.caption(f"AI Equity od baseline **{EQUITY_BASELINE:.0f} $** + Σ pnl (fresh restart).")
+                else:
+                    st.info("AI Okno 6: žiadne platné pnl_usd na vykreslenie equity.")
             else:
                 st.info("AI Okno 6: Zatiaľ žiadne uzavreté obchody.")
 
@@ -792,4 +846,4 @@ for wid in (1, 2, 3, 4, 5, 6):
     st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
-st.caption("Shark Alpha Cockpit Cloud 2 • System F telemetry • baseline 1000 USD • y-range okolo ceny / OPEN v-line / DCA & TP stavy")
+st.caption("Shark Alpha Cockpit Cloud 2 • System F telemetry • fresh equity baseline 1000 USD (Σ pnl, ignore old SQL balance) • y-range okolo ceny / OPEN v-line / DCA & TP stavy")
