@@ -319,25 +319,48 @@ top_col1, top_col2 = st.columns([1.2, 1.0])
 
 with top_col1:
     st.subheader("📈 Dynamický Equity Dashboard")
-    # Čistý reštart: kapitál z live vault; PnL voči EQUITY_BASELINE (zabudnúť na staré SQL balance)
-    curr_bal = safe_float(vault_state.get("balance"), EQUITY_BASELINE)
-    total_pnl = curr_bal - EQUITY_BASELINE
+    # --- Kapitál: po SQL wipe nespoliehať sa len na vault.balance (býva starý/seknutý) ---
+    # Zdroj pravdy v cockpite = EQUITY_BASELINE + Σ realized pnl z trade_history + unrealized
+    vault_bal = safe_float(vault_state.get("balance"), EQUITY_BASELINE)
+
+    realized_pnl = 0.0
+    if not history_df.empty and "pnl_usd" in history_df.columns:
+        realized_pnl = float(pd.to_numeric(history_df["pnl_usd"], errors="coerce").fillna(0.0).sum())
+
+    unrealized = sum(
+        safe_float(w.get("pnl_usd"), 0.0)
+        for w in active_windows.values()
+        if w.get("status") == "ACTIVE"
+    )
+
+    # Rekonštruovaný kapitál (fresh baseline) – to, čo má user vidieť ako „Aktuálny zostatok“
+    curr_bal = EQUITY_BASELINE + realized_pnl + unrealized
+    total_pnl = realized_pnl + unrealized  # delta voči baseline
 
     if not history_df.empty:
-        win_trades = len(history_df[history_df["pnl_usd"] > 0])
-        fail_trades = len(history_df[history_df["pnl_usd"] <= 0])
-        total_trades = len(history_df)
+        # Win/fail len z finálnych close (nie TP1/TP2 scale-out partial riadky)
+        if "exit_reason" in history_df.columns:
+            _reasons = history_df["exit_reason"].fillna("").astype(str)
+            _final = ~_reasons.isin(["TP1_SCALE_OUT", "TP2_SCALE_OUT"])
+            _pdf = history_df.loc[_final]
+        else:
+            _pdf = history_df
+        if "pnl_usd" in _pdf.columns and len(_pdf) > 0:
+            win_trades = int((_pdf["pnl_usd"] > 0).sum())
+            fail_trades = int((_pdf["pnl_usd"] <= 0).sum())
+            total_trades = len(_pdf)
+        else:
+            win_trades = len(history_df[history_df.get("pnl_usd", pd.Series(dtype=float)) > 0]) if "pnl_usd" in history_df.columns else 0
+            fail_trades = len(history_df[history_df.get("pnl_usd", pd.Series(dtype=float)) <= 0]) if "pnl_usd" in history_df.columns else 0
+            total_trades = len(history_df)
         wr_total = (win_trades / total_trades) * 100.0 if total_trades > 0 else 0.0
-
-        # Nerealizované PnL – IBA aktívne pozície
-        unrealized = sum(
-            safe_float(w.get("pnl_usd"), 0.0)
-            for w in active_windows.values()
-            if w.get("status") == "ACTIVE"
-        )
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Aktuálny Kapitál", f"${curr_bal:.2f}", f"{total_pnl:+.2f} USD")
+        m1.caption(
+            f"baseline {EQUITY_BASELINE:.0f} + realized {realized_pnl:+.2f} + unrealized {unrealized:+.2f}"
+            + (f"  | vault: ${vault_bal:.2f}" if abs(vault_bal - curr_bal) > 0.5 else "")
+        )
         m2.metric("Celková Úspešnosť", f"{wr_total:.1f} %", f"{total_trades} obchodov")
         m2.caption(f"✅ Win: **{win_trades}**  |  ❌ Fail: **{fail_trades}**")
         m3.metric("Nerealizované PnL", f"${unrealized:+.2f}")
