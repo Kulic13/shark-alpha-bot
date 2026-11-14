@@ -338,22 +338,63 @@ with top_col1:
     total_pnl = realized_pnl + unrealized  # delta voči baseline
 
     if not history_df.empty:
-        # Win/fail len z finálnych close (nie TP1/TP2 scale-out partial riadky)
+        # Win/Fail: 1 obchod = 1 finálny close (bez TP1/TP2 scale-out ledger riadkov).
+        # WIN = dosiahnutý TP1/TP2/TP3 alebo TSL/BE po TP, alebo kladný pnl na finálnom close.
+        WIN_REASONS = {
+            "TRAILING_SL_PROFIT",
+            "BE_STOP_AFTER_TP1",
+            "LIQUIDATION_CLIMAX_HIT",
+            "TP3_LIQUIDATION_HIT",
+            "TP2_SCALE_OUT",  # ak by finálny close omylom niesol tento reason
+        }
+        FAIL_REASONS = {
+            "HARD_SL_HIT",
+            "EARLY_ORDERFLOW_ESCAPE",
+            "VPIN_EMERGENCY_ESCAPE",
+            "LIQUIDATION_HIT",
+        }
+        SCALE_OUT = {"TP1_SCALE_OUT", "TP2_SCALE_OUT"}
+
         if "exit_reason" in history_df.columns:
             _reasons = history_df["exit_reason"].fillna("").astype(str)
-            _final = ~_reasons.isin(["TP1_SCALE_OUT", "TP2_SCALE_OUT"])
-            _pdf = history_df.loc[_final]
+            _pdf = history_df.loc[~_reasons.isin(SCALE_OUT)].copy()
         else:
-            _pdf = history_df
-        if "pnl_usd" in _pdf.columns and len(_pdf) > 0:
-            win_trades = int((_pdf["pnl_usd"] > 0).sum())
-            fail_trades = int((_pdf["pnl_usd"] <= 0).sum())
-            total_trades = len(_pdf)
-        else:
-            win_trades = len(history_df[history_df.get("pnl_usd", pd.Series(dtype=float)) > 0]) if "pnl_usd" in history_df.columns else 0
-            fail_trades = len(history_df[history_df.get("pnl_usd", pd.Series(dtype=float)) <= 0]) if "pnl_usd" in history_df.columns else 0
-            total_trades = len(history_df)
+            _pdf = history_df.copy()
+
+        win_trades = 0
+        fail_trades = 0
+        if len(_pdf) > 0:
+            for _, row in _pdf.iterrows():
+                reason = str(row.get("exit_reason") or "")
+                tp1 = bool(row.get("tp1_hit", False)) if "tp1_hit" in _pdf.columns else False
+                tp2 = bool(row.get("tp2_hit", False)) if "tp2_hit" in _pdf.columns else False
+                pnl = 0.0
+                try:
+                    pnl = float(row.get("pnl_usd") or 0.0)
+                except (TypeError, ValueError):
+                    pnl = 0.0
+
+                is_win = False
+                if reason in WIN_REASONS:
+                    is_win = True
+                elif tp1 or tp2:
+                    # dosiahnutý TP → počítame ako WIN (aj keď zvyšok dotrailoval na BE)
+                    is_win = True
+                elif reason in FAIL_REASONS:
+                    is_win = False
+                else:
+                    is_win = pnl > 0
+
+                if is_win:
+                    win_trades += 1
+                else:
+                    fail_trades += 1
+
+        total_trades = win_trades + fail_trades
         wr_total = (win_trades / total_trades) * 100.0 if total_trades > 0 else 0.0
+        n_scale = 0
+        if "exit_reason" in history_df.columns:
+            n_scale = int(history_df["exit_reason"].fillna("").astype(str).isin(list(SCALE_OUT)).sum())
 
         m1, m2, m3 = st.columns(3)
         m1.metric("Aktuálny Kapitál", f"${curr_bal:.2f}", f"{total_pnl:+.2f} USD")
@@ -362,7 +403,10 @@ with top_col1:
             + (f"  | vault: ${vault_bal:.2f}" if abs(vault_bal - curr_bal) > 0.5 else "")
         )
         m2.metric("Celková Úspešnosť", f"{wr_total:.1f} %", f"{total_trades} obchodov")
-        m2.caption(f"✅ Win: **{win_trades}**  |  ❌ Fail: **{fail_trades}**")
+        m2.caption(
+            f"✅ Win: **{win_trades}**  |  ❌ Fail: **{fail_trades}**"
+            + (f"  |  scale-out eventy: {n_scale} (nezapočítané do WR)" if n_scale else "")
+        )
         m3.metric("Nerealizované PnL", f"${unrealized:+.2f}")
 
         # ----- ROZDELENÉ ŠTATISTIKY: Okná 1–5 vs AI Okno 6 -----
