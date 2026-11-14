@@ -4,3 +4,5 @@ numpy
 pandas
 plotly
 supabase
+xgboost
+scikit-learn
