@@ -5,6 +5,7 @@ import json
 import os
 import time
 import operator
+import math
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone, timedelta
@@ -76,7 +77,8 @@ def get_default_vault() -> dict:
         },
         "shadow_pool": [],  # unified incubator (max 100); replaces shadow_trades
         "pending_supabase_sync": [],
-        "cell_strictness": 0.85
+        "cell_strictness": 0.85,
+        "pending_setups": {},
     }
 
 def load_vault() -> dict:
@@ -108,6 +110,7 @@ def load_vault() -> dict:
                         "shield": 0, "micro": 0, "risk": 0,
                     })
                     state.setdefault("shadow_pool", list(state.get("shadow_trades") or []))  # migrate old key
+                    state.setdefault("pending_setups", {})
                     state.setdefault("shadow_trades", [])  # legacy no-op list
                     state.setdefault("last_btc_veto", {
                         "veto_long": False,
@@ -150,6 +153,7 @@ def load_vault() -> dict:
                 "shield": 0, "micro": 0, "risk": 0,
             })
             state.setdefault("shadow_pool", list(state.get("shadow_trades") or []))  # migrate old key
+            state.setdefault("pending_setups", {})
             state.setdefault("shadow_trades", [])  # legacy no-op list
             state.setdefault("last_btc_veto", {
                 "veto_long": False,
@@ -812,6 +816,8 @@ def _get_filter_ctx(vault: dict | None, direction: str = "LONG") -> dict:
     cell_s = float(vault.get("cell_strictness", 1.0))
     strictness = float(np.clip(base * cell_s, 0.80, 1.30))
     w = lambda k, d=1.0: float(weights.get(k, d))
+    raw_ofd_long = 1.30 * strictness * w("ofd")
+    raw_ofd_short = 0.70 / max(1e-9, strictness * w("ofd"))
     return {
         "strictness": strictness,
         "cell_strictness": cell_s,
@@ -821,8 +827,8 @@ def _get_filter_ctx(vault: dict | None, direction: str = "LONG") -> dict:
         "w_shield": w("shield"),
         "w_micro": w("micro"),
         "w_risk": w("risk"),
-        "ofd_long_thr": 1.30 * strictness * w("ofd"),
-        "ofd_short_thr": 0.70 / max(1e-9, strictness * w("ofd")),
+        "ofd_long_thr": max(1.18, raw_ofd_long),
+        "ofd_short_thr": min(0.82, raw_ofd_short),
         "rsi_high": 78.0 - (strictness * w("shield") - 1.0) * 15.0,
         "rsi_low": 22.0 + (strictness * w("shield") - 1.0) * 15.0,
         "vpin_max": 0.80 / max(1e-9, strictness * w("micro")),
@@ -1129,20 +1135,28 @@ def check_anti_extreme_shield(
     std_20 = float(df["c"].rolling(20).std().iloc[-1])
     if atr_14 <= 0 or np.isnan(atr_14) or np.isnan(std_20):
         return False
+    # Štrukturálny trendový filter: nekupuj pod EMA20 / neshortuj nad EMA20
+    if direction == "LONG" and last_c <= ema_20:
+        return False
+    if direction == "SHORT" and last_c >= ema_20:
+        return False
+    # Anti-Chasing: aktuálna 15m sviečka už urobila príliš veľký impulz
+    if abs(last_c - last_o) > (1.25 * atr_14):
+        return False
     # SYSTEM A: adaptive RSI from filter_ctx (strictness × w_shield)
     ctx_rsi_high = float(ctx.get("rsi_high", 78.0))
     ctx_rsi_low = float(ctx.get("rsi_low", 22.0))
     if is_pd:
-        max_atr_dist = 2.2
+        max_atr_dist = 2.0
         rsi_high, rsi_low = max(ctx_rsi_high, 78.0), min(ctx_rsi_low, 22.0)
         skip_bb = True
     elif is_btc:
-        max_atr_dist = 1.8
+        max_atr_dist = 1.4
         rsi_high, rsi_low = min(75.0, ctx_rsi_high), max(25.0, ctx_rsi_low)
         skip_bb = True
     else:
         # Štandardný režim: BB filter vypnutý; ATR + adaptive RSI
-        max_atr_dist = 2.0
+        max_atr_dist = 1.4
         rsi_high, rsi_low = ctx_rsi_high, ctx_rsi_low
         skip_bb = True
     bb_upper = ema_20 + (2.0 * std_20)
@@ -1658,19 +1672,20 @@ async def build_trade_setup(cand: dict, balance: float, window_id: int, vault: d
 
     if is_pd:
         dca1 = dca2 = dca3 = 0.0
-        # P&D: širší SL, hard floor 1.6 %
-        sl_pct = max(0.016, (natr * 2.2 * sl_mod) / 100.0)
+        # P&D: zúžený SL, hard floor 1.2 %
+        sl_pct = max(0.012, (natr * 1.8 * sl_mod) / 100.0)
         tp1 = price * (1.0 + dir_mult * ((natr * 1.0 * tp_mod) / 100.0 + cost_rate))
         tp2 = price * (1.0 + dir_mult * ((natr * 1.8 * tp_mod) / 100.0 + cost_rate))
     else:
-        dca1 = price * (1.0 - dir_mult * ((0.5 * natr) / 100.0))
+        # Max 2 DCA úrovne (DCA3 vypnuté)
+        dca1 = price * (1.0 - dir_mult * ((0.6 * natr) / 100.0))
         dca2 = price * (1.0 - dir_mult * ((1.2 * natr) / 100.0))
-        dca3 = price * (1.0 - dir_mult * ((2.0 * natr) / 100.0))
-        
-        # Širší SL multiplier + hard floor 1.4 % (ochrana pred okamžitým wick SL)
-        raw_sl_mult = max(3.2, 3.5 * sl_mod)
-        sl_pct = max(0.014, (raw_sl_mult * natr) / 100.0)
-        
+        dca3 = 0.0
+
+        # Zúžený SL: ~2.0 × NATR, hard floor 1.0 %
+        raw_sl_mult = max(1.8, 2.0 * sl_mod)
+        sl_pct = max(0.010, (raw_sl_mult * natr) / 100.0)
+
         tp1 = price * (1.0 + dir_mult * ((1.0 * natr * tp_mod) / 100.0 + cost_rate))
         tp2 = price * (1.0 + dir_mult * ((1.8 * natr * tp_mod) / 100.0 + cost_rate))
 
@@ -1692,26 +1707,13 @@ async def build_trade_setup(cand: dict, balance: float, window_id: int, vault: d
         raw_tp3 = liq_ref * 0.995
         tp3 = min(raw_tp3, tp2 * (1.0 - min_tp3_gap))
 
-    # SYSTEM C – TWAP 40/60 (non-P&D): 40% market now (taker), 60% pending limit (maker)
-    # Jediný zdroj pravdy pre active_margin pri vstupe (žiadny starý 30% split).
+    # Jednotný 100 % vstup na VWAP cene (bez 40/60 TWAP pending leg)
+    # Celá marža ide hneď do active_margin; pending limit vypnutý.
+    if margin_usd * max(1, leverage) < min_notional:
+        return None  # celý setup pod minimom OKX
+    active_margin = margin_usd
     pending_limit_margin = 0.0
     pending_limit_price = 0.0
-    if not is_pd:
-        market_frac = 0.40
-        filled_margin = margin_usd * market_frac
-        # Ak by 40% leg neprešiel min notional, daj celú maržu marketom (bez pending)
-        if (filled_margin * max(1, leverage)) < min_notional:
-            if margin_usd * max(1, leverage) < min_notional:
-                return None  # celý setup pod minimom OKX
-            active_margin = margin_usd
-            pending_limit_margin = 0.0
-            pending_limit_price = 0.0
-        else:
-            active_margin = filled_margin
-            pending_limit_margin = margin_usd * (1.0 - market_frac)
-            pending_limit_price = price
-    else:
-        active_margin = margin_usd
 
     # Generování unikátních klientských ID (clOrdId) pro bleskové AMEND operace
     tx_id = f"sk_{int(time.time()*1000)}"
@@ -1739,7 +1741,7 @@ async def build_trade_setup(cand: dict, balance: float, window_id: int, vault: d
         "entry_price": price,
         "dca1_price": dca1, "dca1_filled": False,
         "dca2_price": dca2, "dca2_filled": False,
-        "dca3_price": dca3, "dca3_filled": False,
+        "dca3_price": 0.0, "dca3_filled": True,
         "tp1_price": tp1, "tp1_hit": False,
         "tp2_price": tp2, "tp2_hit": False,
         "tp3_price": tp3,
@@ -1984,41 +1986,39 @@ def compute_real_cvd_5(klines_15m: list) -> float:
 
 def calculate_vpin_toxicity(klines_15m: list, volume_bucket_size: float = 10000.0) -> float:
     """
-    VPIN Engine (Toxický štít): Počítá pravděpodobnost toxického toku objednávek
-    (Volume-Synchronized Probability of Toxicity) synchronizovanou na objemové koše.
+    VPIN Engine (Toxický štít) – Bulk Volume Classification (BVC).
+    Rozdeľuje barový objem podľa CDF normalizovaných log-výnosov (math.erf).
     Vrací hodnotu od 0.0 (bez toxicity) do 1.0 (extrémní riziko flash crashe).
+    volume_bucket_size zachované pre spätnú kompatibilitu podpisu (BVC ho nepoužíva).
     """
     if len(klines_15m) < 10:
         return 0.5
-        
-    buy_volumes = []
-    sell_volumes = []
-    
-    # Rozpouštění svíček do standardizovaných objemových košů o velikosti V
-    for bar in klines_15m:
-        h = float(get_high(bar))
-        l = float(get_low(bar))
-        c = float(get_close(bar))
-        v = float(get_vol(bar))
-        
-        candle_range = max(1e-12, h - l)
-        b_ratio = (c - l) / candle_range
-        
-        buy_volumes.append(v * b_ratio)
-        sell_volumes.append(v * (1.0 - b_ratio))
-        
-    # Výpočet sumy absolutních rozdílů mezi nákupním a prodejním tlakem napříč koši
-    absolute_infow_imbalance = 0.0
-    total_volume_processed = sum(buy_volumes) + sum(sell_volumes)
-    
-    for b, s in zip(buy_volumes, sell_volumes):
-        absolute_infow_imbalance += abs(b - s)
-        
-    if total_volume_processed <= 1e-9:
+
+    closes = np.array([float(get_close(k)) for k in klines_15m], dtype=float)
+    vols = np.array([float(get_vol(k)) for k in klines_15m], dtype=float)
+
+    log_rets = np.diff(np.log(np.maximum(closes, 1e-12)))
+    bar_vols = vols[1:]
+
+    sigma = float(np.std(log_rets))
+    # Poistka proti nulovej volatilite
+    if sigma <= 1e-12 or np.isnan(sigma):
+        return 0.25
+
+    z = log_rets / sigma
+    phi = np.array(
+        [0.5 * (1.0 + math.erf(float(zi) / math.sqrt(2.0))) for zi in z],
+        dtype=float,
+    )
+
+    buy_vols = bar_vols * phi
+    sell_vols = bar_vols * (1.0 - phi)
+
+    total_vol = float(np.sum(bar_vols))
+    if total_vol <= 1e-9:
         return 0.0
-        
-    # Finální VPIN koeficient informovaného/toxického flow
-    return absolute_infow_imbalance / total_volume_processed
+
+    return float(np.sum(np.abs(buy_vols - sell_vols)) / total_vol)
 
 
 # =========================================================================
@@ -2159,6 +2159,77 @@ async def verify_execution_confirmation_btc(
         return True, exec_price
     except Exception:
         return False, 0.0
+
+
+
+async def check_1m_sniper_trigger(
+    client: httpx.AsyncClient,
+    symbol: str,
+    direction: str,
+    natr: float,
+    cache: dict | None = None,
+) -> tuple[bool, float]:
+    """
+    1-minútový sniper trigger: Rolling 30m VWAP + micro break & reverse.
+    Potvrdzuje vstup až keď cena ostáva v zóne férovej hodnoty okolo VWAP
+    a aktuálna 1m sviečka prerazí high/low predchádzajúcej v smere obchodu.
+    """
+    try:
+        klines_1m = await fetch_okx_klines(client, symbol, "1m", 30, cache)
+        if not klines_1m or len(klines_1m) < 15:
+            return False, 0.0
+
+        # 30-minútový Rolling VWAP z dostupných 1m sviečok
+        tp_sum = 0.0
+        vol_sum = 0.0
+        tp_list = []
+        for k in klines_1m:
+            h = float(get_high(k))
+            l = float(get_low(k))
+            c = float(get_close(k))
+            v = float(get_vol(k))
+            tp = (h + l + c) / 3.0
+            tp_list.append(tp)
+            tp_sum += tp * v
+            vol_sum += v
+        if vol_sum <= 1e-9:
+            vwap_30m = float(np.mean(tp_list)) if tp_list else 0.0
+        else:
+            vwap_30m = tp_sum / vol_sum
+        if vwap_30m <= 0:
+            return False, 0.0
+
+        prev_bar = klines_1m[-2]
+        curr_bar = klines_1m[-1]
+        prev_h = float(get_high(prev_bar))
+        prev_l = float(get_low(prev_bar))
+        curr_o = float(get_open(curr_bar))
+        curr_c = float(get_close(curr_bar))
+
+        max_vwap_dev = max(0.0015, (0.30 * float(natr or 1.5)) / 100.0)
+
+        if direction == "LONG":
+            # Zóna férovej ceny: nekupujeme prestrelený vrchol nad VWAP
+            if curr_c > vwap_30m * (1.0 + max_vwap_dev):
+                return False, 0.0
+            # Micro-Break & Obrat korekcie: zelená 1m + prerazenie prev high
+            if curr_c > curr_o and curr_c > prev_h:
+                return True, curr_c
+            return False, 0.0
+
+        if direction == "SHORT":
+            # Zóna férovej ceny: neshortujeme dno hlboko pod VWAP
+            if curr_c < vwap_30m * (1.0 - max_vwap_dev):
+                return False, 0.0
+            # Micro-Break & Obrat korekcie: červená 1m + prerazenie prev low
+            if curr_c < curr_o and curr_c < prev_l:
+                return True, curr_c
+            return False, 0.0
+
+        return False, 0.0
+    except Exception:
+        return False, 0.0
+
 
 
 # =========================================================================
@@ -2407,6 +2478,7 @@ def purge_stale_open_positions(vault: dict, reason: str = "APP_OFFLINE_GT_10MIN"
             "mandate_until": 0,
         }
     vault["windows"] = windows
+    vault["pending_setups"] = {}
     vault["last_heartbeat"] = now_ts
 
     # Vyčisti DB active_positions
@@ -2446,6 +2518,11 @@ async def run_core_cycle(vault: dict):
     ny_lock = is_ny_open_lock(now_dt)
     vault["ny_open_lock"] = ny_lock
 
+    pending_setups = vault.setdefault("pending_setups", {})
+    for _pk in list(pending_setups.keys()):
+        if now_ts >= float((pending_setups.get(_pk) or {}).get("expires_at", 0) or 0):
+            pending_setups.pop(_pk, None)
+
     active_windows = [
         (win_key, pos) for win_key, pos in vault["windows"].items()
         if pos["status"] == "ACTIVE" and pos.get("symbol")
@@ -2453,8 +2530,8 @@ async def run_core_cycle(vault: dict):
     last_main_scan = vault.get("last_main_scan", 0)
     is_scan_due = (now_ts - last_main_scan) >= 180
 
-    # ----- IDLE PATH: žiadne ACTIVE okná a scan nie je due -----
-    if not active_windows and not is_scan_due:
+    # ----- IDLE PATH: žiadne ACTIVE okná, žiadne pending, scan nie je due -----
+    if not active_windows and not pending_setups and not is_scan_due:
         save_vault_local(vault)
         last_sync = float(vault.get("last_db_sync", 0) or 0)
         has_pending = bool(vault.get("pending_supabase_sync"))
@@ -2468,6 +2545,58 @@ async def run_core_cycle(vault: dict):
         mmr_cache = load_mmr_cache()
         klines_cache: dict = {}
         tick_micro_cache: dict = {}  # per-symbol mid-freq cache (klines / book / vpin / ofd)
+
+        # ===== 1m Sniper: vyhodnotenie pending_setups =====
+        pending_setups = vault.setdefault("pending_setups", {})
+        if pending_setups and not ny_lock:
+            for w_idx, item in list(pending_setups.items()):
+                try:
+                    if now_ts >= float((item or {}).get("expires_at", 0) or 0):
+                        pending_setups.pop(w_idx, None)
+                        continue
+                    win_state = (vault.get("windows") or {}).get(w_idx) or {}
+                    if win_state.get("status") != "WAITING":
+                        pending_setups.pop(w_idx, None)
+                        continue
+                    cand = (item or {}).get("cand") or {}
+                    if not cand.get("symbol") or not cand.get("direction"):
+                        pending_setups.pop(w_idx, None)
+                        continue
+                    ok_trig, trig_px = await check_1m_sniper_trigger(
+                        client,
+                        cand["symbol"],
+                        cand["direction"],
+                        float(item.get("natr", 2.0) or 2.0),
+                        cache=klines_cache,
+                    )
+                    if not ok_trig:
+                        continue
+                    cand = dict(cand)
+                    cand["exec_price"] = float(trig_px)
+                    setup = await build_trade_setup(
+                        cand, vault["balance"], int(w_idx), vault,
+                        client=client, mmr_cache=mmr_cache,
+                    )
+                    if setup:
+                        vault["windows"][w_idx] = setup
+                        vault["last_trade_opened_ts"] = time.time()
+                        mkt_notional = float(setup.get("active_margin") or 0.0) * float(setup.get("leverage") or 1)
+                        vault["balance"] = round(float(vault["balance"]) - mkt_notional * 0.0005, 4)
+                        push_active_position_row(setup, vault)
+                    else:
+                        record_shadow_trade(
+                            vault,
+                            {**cand, "natr": float(item.get("natr", 2.0) or 2.0)},
+                            failed_filter=cand.get("_failed_filter", "FILTER_6_RISK_MMR"),
+                        )
+                    pending_setups.pop(w_idx, None)
+                except Exception:
+                    pass
+            # Refresh active list po prípadnom otvorení z čakárne
+            active_windows = [
+                (win_key, pos) for win_key, pos in vault["windows"].items()
+                if pos.get("status") == "ACTIVE" and pos.get("symbol")
+            ]
 
         # ===== 1-sekundová Dual-Speed slučka pre ACTIVE pozície (max 15 tikov) =====
         if active_windows:
@@ -2599,39 +2728,6 @@ async def run_core_cycle(vault: dict):
                         except Exception:
                             pass
 
-                    # SYSTEM C – TWAP pending limit fill (60% remainder)
-                    pending_m = float(pos.get("pending_limit_margin") or 0.0)
-                    pending_px = float(pos.get("pending_limit_price") or 0.0)
-                    if pending_m > 0 and pending_px > 0:
-                        touched = (
-                            (is_long and curr_price <= pending_px)
-                            or (not is_long and curr_price >= pending_px)
-                        )
-                        # Cancel if price ran away > 0.5 * NATR
-                        away = abs(curr_price - pending_px) / max(1e-9, pending_px) * 100.0
-                        if away > 0.5 * float(natr or 1.0):
-                            pos["pending_limit_margin"] = 0.0
-                            pos["pending_limit_price"] = 0.0
-                            db_dirty = True
-                        elif touched:
-                            # Maker fill 0.02% fee; blend average entry
-                            old_am = float(pos.get("active_margin") or 0.0)
-                            old_entry = float(pos.get("entry_price") or pending_px)
-                            fill_px = pending_px  # limit price
-                            new_am = old_am + pending_m
-                            if new_am > 0:
-                                pos["entry_price"] = (old_am * old_entry + pending_m * fill_px) / new_am
-                            pos["active_margin"] = new_am
-                            pos["max_deployed_margin"] = max(
-                                float(pos.get("max_deployed_margin", new_am)), new_am
-                            )
-                            # Maker fee
-                            maker_fee = pending_m * float(pos.get("leverage") or 1) * 0.0002
-                            vault["balance"] = round(float(vault.get("balance", 0.0)) - maker_fee, 4)
-                            pos["pending_limit_margin"] = 0.0
-                            pos["pending_limit_price"] = 0.0
-                            db_dirty = True
-
                     # A. VPIN EMERGENCY ESCAPE – len ak je pozícia už v strate (LONG aj SHORT)
                     # Nevyhadzuje ziskové / break-even pozície pri toxickom flow
                     if vpin_score > 0.85:
@@ -2686,36 +2782,52 @@ async def run_core_cycle(vault: dict):
                                 paper_amend_sl(pos, shadow_sl, "SHADOW_OBI_SHORT")
                                 db_dirty = True
 
-                    # C. FILTROVANÉ DCA DOKUPY S EXEKUČNÍM OBRANNÝM VETEM
+                    # C. RISK-CAPPED DCA (max 2 úrovne) s OFD filtrom a dynamickým SL
                     if not pos["is_pd"]:
                         cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
                         tp_mod = pos.get("tp_mod", 1.0)
-                        for idx, pct in ((1, 0.10), (2, 0.30), (3, 0.30)):
-                            if not pos[f"dca{idx}_filled"]:
-                                dca_p = pos[f"dca{idx}_price"]
-                                if (is_long and curr_price <= dca_p) or (not is_long and curr_price >= dca_p):
+                        for idx, pct in ((1, 0.25), (2, 0.35)):
+                            if pos.get(f"dca{idx}_filled"):
+                                continue
+                            dca_p = float(pos.get(f"dca{idx}_price") or 0.0)
+                            if dca_p <= 0:
+                                continue
+                            if not ((is_long and curr_price <= dca_p) or (not is_long and curr_price >= dca_p)):
+                                continue
+                            # OFD filter spomalenia tlaku – nerieď v extrémnom protitlaku
+                            if (is_long and ofd < 0.70) or (not is_long and ofd > 1.30):
+                                continue
 
-                                    # Pokud jsme u DCA3 a flow je extrémně toxické, aktivujeme Veto a neriskujeme ředění
-                                    if idx == 3 and ((is_long and ofd < 0.40) or (not is_long and ofd > 1.60)):
-                                        close_position(pos, curr_price, "EARLY_ORDERFLOW_ESCAPE", vault, mmr_cache=mmr_cache)
-                                        db_dirty = True
-                                        position_closed_in_tick = True
-                                        break
+                            added_m = pos["margin_usd"] * pct
+                            old_qty = (pos["active_margin"] * pos["leverage"]) / pos["entry_price"]
+                            new_qty = (added_m * pos["leverage"]) / dca_p
+                            pos["entry_price"] = ((old_qty * pos["entry_price"]) + (new_qty * dca_p)) / (old_qty + new_qty)
+                            pos["active_margin"] += added_m
+                            pos["max_deployed_margin"] = max(
+                                float(pos.get("max_deployed_margin", pos["active_margin"])),
+                                float(pos["active_margin"]),
+                            )
+                            pos[f"dca{idx}_filled"] = True
+                            db_dirty = True
 
-                                    added_m = pos["margin_usd"] * pct
-                                    old_qty = (pos["active_margin"] * pos["leverage"]) / pos["entry_price"]
-                                    new_qty = (added_m * pos["leverage"]) / dca_p
-                                    pos["entry_price"] = ((old_qty * pos["entry_price"]) + (new_qty * dca_p)) / (old_qty + new_qty)
-                                    pos["active_margin"] += added_m
-                                    pos["max_deployed_margin"] = max(
-                                        float(pos.get("max_deployed_margin", pos["active_margin"])),
-                                        float(pos["active_margin"]),
-                                    )
-                                    pos[f"dca{idx}_filled"] = True
-                                    db_dirty = True
+                            # Dynamický SL: 1.6 × NATR od novej priemernej ceny
+                            new_sl_pct = max(0.010, (1.6 * float(natr)) / 100.0)
+                            new_sl = pos["entry_price"] * (1.0 - dir_mult * new_sl_pct)
+                            # Likvidačná poistka
+                            if pos.get("regime") == "FUTURES" and int(pos.get("leverage") or 1) > 1:
+                                lev = max(1, int(pos.get("leverage", 1)))
+                                new_liq = pos["entry_price"] * (1.0 - dir_mult * (0.90 / lev))
+                                safe_buffer = max(0.003, (0.4 * float(natr)) / 100.0)
+                                if is_long:
+                                    if new_sl <= new_liq * (1.0 + safe_buffer):
+                                        new_sl = new_liq * (1.0 + safe_buffer)
+                                else:
+                                    if new_sl >= new_liq * (1.0 - safe_buffer):
+                                        new_sl = new_liq * (1.0 - safe_buffer)
+                            paper_amend_sl(pos, new_sl, f"RISK_CAPPED_DCA{idx}")
 
-                                    pos["tp1_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.0 * natr * tp_mod) / 100.0 + cost_rate))
-                                    pos["tp2_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.8 * natr * tp_mod) / 100.0 + cost_rate))
+                            pos["tp1_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.0 * natr * tp_mod) / 100.0 + cost_rate))
+                            pos["tp2_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.8 * natr * tp_mod) / 100.0 + cost_rate))
 
                     # D. FÁZOVANÝ SCALE-OUT (TP1 & TP2) S REŽIMOVÝM TSL
                     # ZMENA 1+3: same-bar + širší BE + 5min BE freeze / trail delay + voľnejší post-TP1 trail
@@ -2730,10 +2842,9 @@ async def run_core_cycle(vault: dict):
                             pos["tp1_hit_ts"] = float(tick_ts)
                             _tp1_just_hit = True
 
-                            # BE lock: max(cost+0.10%, 0.35×NATR, 40% cesty entry→TP1) — mimo bežný 15m noise
+                            # Čistý Break-Even po TP1: len krytie nákladov (cost_rate + 0.08 %)
                             cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
-                            dist_tp1 = abs(float(pos["tp1_price"]) - float(pos["entry_price"])) / max(1e-9, float(pos["entry_price"]))
-                            be_pad = max(float(cost_rate) + 0.0010, (0.35 * float(natr)) / 100.0, 0.40 * dist_tp1)
+                            be_pad = float(cost_rate) + 0.0008
                             be_lock = pos["entry_price"] * (1.0 + dir_mult * be_pad)
                             paper_amend_sl(pos, be_lock, "BE_LOCK_AFTER_TP1")
                             db_dirty = True
@@ -2983,8 +3094,22 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
         vault.setdefault("cell_strictness", 0.85)
 
     # Sběr aktuálně obsazených mincí a sektorů pro zamezení nežádoucí korelace rizika
+    pending_setups = vault.setdefault("pending_setups", {})
+    # Vyčisti expirované pending setups
+    for _pk in list(pending_setups.keys()):
+        if now_ts >= float((pending_setups.get(_pk) or {}).get("expires_at", 0) or 0):
+            pending_setups.pop(_pk, None)
     active_syms = {p["symbol"] for p in vault["windows"].values() if p["status"] == "ACTIVE" and p["symbol"]}
+    for _ps in pending_setups.values():
+        _c = (_ps or {}).get("cand") or {}
+        if _c.get("symbol"):
+            active_syms.add(_c["symbol"])
     active_secs = {sectors_map.get(s, "UNKNOWN") for s in active_syms}
+    for _ps in pending_setups.values():
+        _c = (_ps or {}).get("cand") or {}
+        _sec = _c.get("sector")
+        if _sec:
+            active_secs.add(_sec)
 
     # ===== OKNO 1: BTCUSDT (MAKROKOTVA) =====
     if vault["windows"]["1"]["status"] == "WAITING" and len(btc_klines) >= 20:
@@ -3061,49 +3186,37 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
                         failed_filter="FILTER_6_RISK_MMR",
                     )
 
-    # ===== OKNA 2 & 3: ELITNÍ ŠAMPIONI (Objem >= 10M USD) =====
+    # ===== OKNA 2 & 3: ELITNÍ ŠAMPIONI (Objem >= 10M USD) – 1m Sniper čakáreň =====
     for w_idx in ("2", "3"):
-        if vault["windows"][w_idx]["status"] == "WAITING":
+        if vault["windows"][w_idx]["status"] == "WAITING" and w_idx not in pending_setups:
             cands = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 7_000_000.0, 1e12, btc_veto, klines_cache, is_pd_mode=False, vault=vault, sectors_map=sectors_map, metrics_24h=metrics_24h)
-            for c in cands:
-                setup = await build_trade_setup(c, vault["balance"], int(w_idx), vault, client=client, mmr_cache=mmr_cache)
-                if setup:
-                    vault["windows"][w_idx] = setup
-                    vault["last_trade_opened_ts"] = time.time()
-                    mkt_notional = float(setup.get("active_margin") or 0.0) * float(setup.get("leverage") or 1)
-                    vault["balance"] = round(float(vault["balance"]) - mkt_notional * 0.0005, 4)
-                    push_active_position_row(setup, vault)
-                    active_syms.add(c["symbol"])
-                    active_secs.add(c["sector"])
-                    break
-                else:
-                    record_shadow_trade(
-                        vault,
-                        {**c, "natr": calculate_natr_14(c["klines"]) if c.get("klines") else 2.0},
-                        failed_filter=c.get("_failed_filter", "FILTER_6_RISK_MMR"),
-                    )
+            if cands:
+                c = cands[0]
+                pending_setups[w_idx] = {
+                    "window_id": int(w_idx),
+                    "cand": c,
+                    "natr": float(calculate_natr_14(c["klines"])) if c.get("klines") else 2.0,
+                    "created_at": now_ts,
+                    "expires_at": now_ts + 900.0,
+                }
+                active_syms.add(c["symbol"])
+                active_secs.add(c.get("sector") or "UNKNOWN")
 
-    # ===== OKNA 4 & 5: ŠAMPIONI NÍZKÉ LIKVIDITY (Objem 5M – 9.99M USD) =====
+    # ===== OKNA 4 & 5: ŠAMPIONI NÍZKÉ LIKVIDITY (Objem 5M – 9.99M USD) – 1m Sniper čakáreň =====
     for w_idx in ("4", "5"):
-        if vault["windows"][w_idx]["status"] == "WAITING":
+        if vault["windows"][w_idx]["status"] == "WAITING" and w_idx not in pending_setups:
             cands = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 3_500_000.0, 9_999_999.0, btc_veto, klines_cache, is_pd_mode=False, vault=vault, sectors_map=sectors_map, metrics_24h=metrics_24h)
-            for c in cands:
-                setup = await build_trade_setup(c, vault["balance"], int(w_idx), vault, client=client, mmr_cache=mmr_cache)
-                if setup:
-                    vault["windows"][w_idx] = setup
-                    vault["last_trade_opened_ts"] = time.time()
-                    mkt_notional = float(setup.get("active_margin") or 0.0) * float(setup.get("leverage") or 1)
-                    vault["balance"] = round(float(vault["balance"]) - mkt_notional * 0.0005, 4)
-                    push_active_position_row(setup, vault)
-                    active_syms.add(c["symbol"])
-                    active_secs.add(c["sector"])
-                    break
-                else:
-                    record_shadow_trade(
-                        vault,
-                        {**c, "natr": calculate_natr_14(c["klines"]) if c.get("klines") else 2.0},
-                        failed_filter=c.get("_failed_filter", "FILTER_6_RISK_MMR"),
-                    )
+            if cands:
+                c = cands[0]
+                pending_setups[w_idx] = {
+                    "window_id": int(w_idx),
+                    "cand": c,
+                    "natr": float(calculate_natr_14(c["klines"])) if c.get("klines") else 2.0,
+                    "created_at": now_ts,
+                    "expires_at": now_ts + 900.0,
+                }
+                active_syms.add(c["symbol"])
+                active_secs.add(c.get("sector") or "UNKNOWN")
 
     # ===== OKNO 6: AI LOVEC ŠAMPIÓNOV (US SESSION - XGBOOST V3) =====
     if vault["windows"]["6"]["status"] == "WAITING":
