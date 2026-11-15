@@ -814,7 +814,8 @@ def _get_filter_ctx(vault: dict | None, direction: str = "LONG") -> dict:
         else vault.get("strictness_short", 1.0)
     )
     cell_s = float(vault.get("cell_strictness", 1.0))
-    strictness = float(np.clip(base * cell_s, 0.80, 1.30))
+    # cell_strictness riadi veľkosť stávky (Kelly), nie prahy filtrov
+    strictness = float(np.clip(base, 0.75, 1.30))
     w = lambda k, d=1.0: float(weights.get(k, d))
     raw_ofd_long = 1.30 * strictness * w("ofd")
     raw_ofd_short = 0.70 / max(1e-9, strictness * w("ofd"))
@@ -910,7 +911,7 @@ def record_shadow_trade(vault: dict, cand: dict, failed_filter: str, tp1_price: 
 def process_shadow_pool(vault: dict, tickers: dict, now_ts: float):
     """
     Evaluate unified shadow_pool during 3-min scan using already-fetched tickers (0 extra API).
-    Age window: [900s, 3600s]. TP1 first → loosen filter; SL first → tighten.
+    Dynamický pool od age >= 0 do age <= 3600. TP1 first → loosen filter; SL first → tighten.
     """
     pool = list(vault.get("shadow_pool") or [])
     if not pool:
@@ -924,9 +925,7 @@ def process_shadow_pool(vault: dict, tickers: dict, now_ts: float):
         age = now_ts - ts0
         if age > 3600:
             continue  # expired
-        if age < 900:
-            remaining.append(sh)  # too young
-            continue
+        # Dynamický pool: vyhodnocuj okamžite od age >= 0 (žiadny 900s lock)
         sym = sh.get("symbol")
         if not sym or not tickers or sym not in tickers:
             remaining.append(sh)
@@ -945,22 +944,22 @@ def process_shadow_pool(vault: dict, tickers: dict, now_ts: float):
         hit_sl = (is_long and px <= sl) or (not is_long and px >= sl)
         if hit_sl and not hit_tp:
             w = float(weights.get(key, 1.0))
-            weights[key] = float(np.clip(w + 0.01, 0.80, 1.25))
+            weights[key] = float(np.clip(w + 0.02, 0.70, 1.40))
             continue  # evaluated out
         if hit_tp and not hit_sl:
             w = float(weights.get(key, 1.0))
-            weights[key] = float(np.clip(w - 0.015, 0.80, 1.25))
+            weights[key] = float(np.clip(w - 0.025, 0.70, 1.40))
             if is_long:
-                vault["strictness_long"] = float(np.clip(float(vault.get("strictness_long", 1.0)) - 0.01, 0.80, 1.30))
+                vault["strictness_long"] = float(np.clip(float(vault.get("strictness_long", 1.0)) - 0.015, 0.75, 1.30))
             else:
-                vault["strictness_short"] = float(np.clip(float(vault.get("strictness_short", 1.0)) - 0.01, 0.80, 1.30))
+                vault["strictness_short"] = float(np.clip(float(vault.get("strictness_short", 1.0)) - 0.015, 0.75, 1.30))
             continue  # evaluated out
         remaining.append(sh)
     vault["filter_weights"] = weights
     vault["shadow_pool"] = remaining[-100:]
 
 
-# Backward-compatible alias used by older call sites
+
 def process_shadow_trades(vault: dict, price_tickers: dict, now_ts: float):
     process_shadow_pool(vault, price_tickers, now_ts)
 
@@ -1024,7 +1023,7 @@ def update_filter_weights_from_outcome(pos: dict, is_win: bool, reason: str, vau
     """
     Closed-loop System 1 <-> System 2 credit assignment.
     Uses entry_fingerprint on real trades + failed_filter on shadow trades.
-    Weights always clamped to [0.80, 1.25].
+    Weights always clamped to [0.70, 1.40].
     """
     weights = vault.setdefault("filter_weights", {
         "macro": 1.0, "liq": 1.0, "ofd": 1.0,
@@ -1036,35 +1035,35 @@ def update_filter_weights_from_outcome(pos: dict, is_win: bool, reason: str, vau
     direction = (pos.get("direction") or "").upper() if pos else ""
 
     def adj(key: str, delta: float):
-        weights[key] = float(np.clip(float(weights.get(key, 1.0)) + delta, 0.80, 1.25))
+        weights[key] = float(np.clip(float(weights.get(key, 1.0)) + delta, 0.70, 1.40))
 
     def clamp_all():
         for k in list(weights.keys()):
-            weights[k] = float(np.clip(float(weights.get(k, 1.0)), 0.80, 1.25))
+            weights[k] = float(np.clip(float(weights.get(k, 1.0)), 0.70, 1.40))
         vault["filter_weights"] = weights
 
     # --- Shadow incubator feedback ---
     if "SHADOW_WIN" in reason_u:
         # Overly restrictive filter that blocked a winner → loosen it
         if "MICRO" in reason_u or "VERIFY" in reason_u or "FILTER_5" in failed or "MICRO" in failed:
-            adj("micro", -0.015)
+            adj("micro", -0.025)
         if "RISK" in reason_u or "MMR" in reason_u or "FILTER_6" in failed or "RISK" in failed:
-            adj("risk", -0.015)
+            adj("risk", -0.025)
         if "SHIELD" in reason_u or "SHIELD" in failed:
-            adj("shield", -0.015)
+            adj("shield", -0.025)
         # Slightly reduce directional strictness
         if direction == "SHORT":
-            vault["strictness_short"] = float(np.clip(float(vault.get("strictness_short", 1.0)) - 0.02, 0.80, 1.30))
+            vault["strictness_short"] = float(np.clip(float(vault.get("strictness_short", 1.0)) - 0.02, 0.75, 1.30))
         else:
-            vault["strictness_long"] = float(np.clip(float(vault.get("strictness_long", 1.0)) - 0.02, 0.80, 1.30))
+            vault["strictness_long"] = float(np.clip(float(vault.get("strictness_long", 1.0)) - 0.02, 0.75, 1.30))
         clamp_all()
         return
 
     if "SHADOW_LOSS" in reason_u:
         if "MICRO" in reason_u or "VERIFY" in reason_u or "FILTER_5" in failed:
-            adj("micro", +0.02)
+            adj("micro", +0.025)
         if "RISK" in reason_u or "FILTER_6" in failed:
-            adj("risk", +0.02)
+            adj("risk", +0.025)
         clamp_all()
         return
 
@@ -1072,7 +1071,7 @@ def update_filter_weights_from_outcome(pos: dict, is_win: bool, reason: str, vau
     if is_win:
         for k in list(weights.keys()):
             w0 = float(weights.get(k, 1.0))
-            weights[k] = float(np.clip(w0 * 0.98 + 1.0 * 0.02, 0.80, 1.25))
+            weights[k] = float(np.clip(w0 * 0.98 + 1.0 * 0.02, 0.70, 1.40))
         clamp_all()
         return
 
@@ -1101,6 +1100,7 @@ def update_filter_weights_from_outcome(pos: dict, is_win: bool, reason: str, vau
         adj("shield", +0.02)
 
     clamp_all()
+
 
 
 def check_anti_extreme_shield(
@@ -1603,10 +1603,9 @@ async def build_trade_setup(cand: dict, balance: float, window_id: int, vault: d
     is_shield_active = vault.get("shield_mode_active", False)
     veto_threshold = 0.34 if is_shield_active else 0.30
     
-    # MATICOVÉ VETO: Pokud je buňka pod limitem úspěšnosti, Risk Engine příkaz zablokuje
-    if wr < veto_threshold:
-        cand["_failed_filter"] = "FILTER_6_RISK_MMR"
-        return None
+    # Continuous Scout Mode: nízke WR neblokuje vstup – len zmenší stávku (nižšie)
+    continuous_scout = bool(wr < veto_threshold)
+
 
     # 5. DYNAMICKÁ VOLBA REGIMU A LEVERAGE PODLE OSY Y
     if is_pd:
@@ -1628,19 +1627,25 @@ async def build_trade_setup(cand: dict, balance: float, window_id: int, vault: d
     b = float(mmr_cell["avg_win_r"]) / max(0.1, float(mmr_cell["avg_loss_r"]))
     q = 1.0 - wr
     full_kelly = (wr * b - q) / max(0.1, b)
-    if full_kelly <= 0:
-        return None
 
-    # Adaptivní sázkový zlomek: Shield → polovica; Scout Mode (cell trades < 5) → 0.15
+    # Continuous Scout: nikdy neskôr slepý – minimálny prieskumný zlomok
     cell_trades = int(mmr_cell.get("total_trades", 0) or 0)
-    if cell_trades < 5:
+    if continuous_scout or full_kelly <= 0:
+        kelly_fraction = 0.08
+        full_kelly = max(float(full_kelly), 0.15)
+    elif cell_trades < 5:
         kelly_fraction = 0.20  # Scout Mode – uvoľnené
     elif is_shield_active:
         kelly_fraction = 0.20
     else:
         kelly_fraction = 0.40
     max_risk_pct = 0.015 if is_pd else 0.025
-    kelly_margin = min(balance * full_kelly * kelly_fraction, balance * max_risk_pct)
+    # cell_strictness z vaultu škáluje veľkosť stávky (nie filter prahy)
+    cell_s = float(vault.get("cell_strictness", 1.0) or 1.0)
+    kelly_margin = min(
+        balance * full_kelly * (kelly_fraction / max(0.75, cell_s)),
+        balance * max_risk_pct,
+    )
 
     # Ověření reálných limitů OKX burzy
     # Ak Kellyho marža nestačí na min. notional, obchod NEOTVÁRAME
@@ -1822,56 +1827,56 @@ def get_mmr_neighbors(rx: int, ry: int) -> list[tuple[int, int]]:
                 neighbors.append((nx, ny))
     return neighbors
 
-def update_mmr_cell_values(rx: int, ry: int, outcome: float, r_multiple: float, weight: float, vault: dict, mmr_cache: dict | None = None):
+def update_mmr_cell_values(rx: int, ry: int, outcome: float, r_multiple: float, weight: float, vault: dict, mmr_cache: dict | None = None, exit_reason: str = ""):
     """
-    Matematické jádro učení buňky s adaptivním decay faktorem a prostorovou vahou.
-    VERZIA SLOW-LEARN: výrazne pomalšie učenie (gamma↑, asymetrický alpha pri WIN/FAIL),
-    hard-floor na win_rate, aby 10–20 failov ešte úplne nezablokovalo vstupy.
+    Matematické jádro učení buňky – responzívne 24/7 EMA s rozlíšením exit_reason.
+    base_alpha je konštantné (učenie nikdy nezamrzne), reason_mult upravuje intenzitu.
     """
     cell = get_mmr_cell(rx, ry, mmr_cache=mmr_cache)
     trades_n = int(cell.get("total_trades", 0))
-    
-    # Pomalšia saturácia: gamma 0.05 → 0.18 (base_alpha klesá rýchlejšie s počtom tradeov)
-    gamma = 0.18
-    base_alpha = 1.0 / (1.0 + gamma * trades_n)
-    
-    # Finální rychlost učení modifikovaná prostorovou vahou (1.0 pro cíl, 0.20 pro sousedy)
-    alpha = base_alpha * weight
+    reason_u = (exit_reason or "").upper()
 
-    # Asymetrické spomalenie: FAIL sa učí ešte pomalšie ako WIN
-    # (aby séria Hard SL maticu nezničila, ale stále sa učila)
-    if outcome == 100.0:          # WIN
-        alpha *= 0.55
-    else:                         # FAIL / LOSS
-        alpha *= 0.28
+    # Konštantná rýchlosť učenia (nikdy nezamrzne pri vysokom total_trades)
+    base_alpha = 0.12
+    alpha = float(base_alpha * weight)  # 0.12 cieľ / 0.024 sused (≈0.025)
 
-    # Horný strop alpha (aj pri prázdnej bunke)
-    alpha = float(np.clip(alpha, 0.0, 0.22))
-    
-    # Výpočet inverzního decay (retence paměti)
-    decay = 1.0 - alpha
-    
-    # 1. Update Win Rate
-    new_wr = float((cell["win_rate"] * decay) + (outcome * alpha))
-    # Hard-floor: win_rate nikdy neklesne pod 28 % (stále pod priorom, ale neblokuje veto)
-    cell["win_rate"] = float(max(28.0, new_wr))
-    
-    # 2. Update R-Multiples a asymetrických modifikátorů řízení rizik
-    if outcome == 100.0:  # WIN
-        cell["avg_win_r"] = float((cell["avg_win_r"] * decay) + (abs(r_multiple) * alpha))
-        # Jemnejšie utiahnutie SL / roztiahnutie TP
-        cell["sl_modifier"] = float(np.clip(cell["sl_modifier"] * (1.0 - 0.015 * weight), 0.75, 1.45))
-        cell["tp_modifier"] = float(np.clip(cell["tp_modifier"] * (1.0 + 0.012 * weight), 0.75, 1.45))
-    else:  # LOSS
-        cell["avg_loss_r"] = float((cell["avg_loss_r"] * decay) + (abs(r_multiple) * alpha))
-        # Menej agresívne sprísňovanie risk managementu pri failoch
-        cell["sl_modifier"] = float(np.clip(cell["sl_modifier"] * (1.0 + 0.025 * weight), 0.75, 1.45))
-        cell["tp_modifier"] = float(np.clip(cell["tp_modifier"] * (1.0 - 0.010 * weight), 0.75, 1.45))
-        
+    if outcome == 0.0:  # LOSS
+        if "LIQUIDATION" in reason_u:
+            reason_mult = 1.50
+            sl_delta = +0.05 * weight
+            tp_delta = -0.02 * weight
+        elif "VPIN" in reason_u or "ORDERFLOW" in reason_u:
+            reason_mult = 0.45
+            sl_delta = +0.015 * weight
+            tp_delta = 0.0
+        else:
+            reason_mult = 1.00
+            sl_delta = +0.035 * weight
+            tp_delta = -0.015 * weight
+        eff_alpha = float(np.clip(alpha * reason_mult, 0.0, 0.25))
+        cell["win_rate"] = float(np.clip((cell["win_rate"] * (1.0 - eff_alpha)) + (0.0 * eff_alpha), 25.0, 85.0))
+        cell["avg_loss_r"] = float((cell["avg_loss_r"] * (1.0 - alpha)) + (abs(r_multiple) * alpha))
+        cell["sl_modifier"] = float(np.clip(cell["sl_modifier"] * (1.0 + sl_delta), 0.70, 1.50))
+        cell["tp_modifier"] = float(np.clip(cell["tp_modifier"] * (1.0 + tp_delta), 0.70, 1.50))
+    else:  # WIN (outcome == 100.0)
+        if "CLIMAX" in reason_u or "TP2" in reason_u or "TRAILING" in reason_u:
+            reason_mult = 1.25
+            sl_delta = -0.02 * weight
+            tp_delta = +0.025 * weight
+        else:
+            reason_mult = 0.80
+            sl_delta = -0.01 * weight
+            tp_delta = +0.01 * weight
+        eff_alpha = float(np.clip(alpha * reason_mult, 0.0, 0.25))
+        cell["win_rate"] = float(np.clip((cell["win_rate"] * (1.0 - eff_alpha)) + (100.0 * eff_alpha), 25.0, 85.0))
+        cell["avg_win_r"] = float((cell["avg_win_r"] * (1.0 - alpha)) + (abs(r_multiple) * alpha))
+        cell["sl_modifier"] = float(np.clip(cell["sl_modifier"] * (1.0 + sl_delta), 0.70, 1.50))
+        cell["tp_modifier"] = float(np.clip(cell["tp_modifier"] * (1.0 + tp_delta), 0.70, 1.50))
+
     # Počet obchodů zvyšujeme pouze v cílové buňce, kde reálně k exekuci došlo
     if weight == 1.0:
         cell["total_trades"] = trades_n + 1
-        
+
     cell["updated_at"] = datetime.now(timezone.utc).isoformat()
     safe_supabase_upsert("ai_mmr_matrix", cell, vault)
     if mmr_cache is not None:
@@ -1888,6 +1893,7 @@ def update_ai_learning(
     regime_x: int | None = None,
     regime_y: int | None = None,
     mmr_cache: dict | None = None,
+    exit_reason: str = "",
 ):
     """
     Hlavní post-trade modul učení 2.0. Kompletně odstraňuje izolované učení mincí.
@@ -1904,12 +1910,12 @@ def update_ai_learning(
     outcome = 100.0 if is_win else 0.0
 
     # 1. ZÁPIS DO CÍLOVÉ BUŇKY TRŽNÍHO REŽIMU (Plná váha = 100 %)
-    update_mmr_cell_values(rx, ry, outcome, r_multiple, 1.0, vault, mmr_cache=mmr_cache)
+    update_mmr_cell_values(rx, ry, outcome, r_multiple, 1.0, vault, mmr_cache=mmr_cache, exit_reason=exit_reason)
     
     # 2. PROSTOROVÉ PŘELÉVÁNÍ INFORMACÍ (KNN Spatial Smoothing - Sousední buňky = 20 %)
     neighbors = get_mmr_neighbors(rx, ry)
     for nx, ny in neighbors:
-        update_mmr_cell_values(nx, ny, outcome, r_multiple, 0.20, vault, mmr_cache=mmr_cache)
+        update_mmr_cell_values(nx, ny, outcome, r_multiple, 0.20, vault, mmr_cache=mmr_cache, exit_reason=exit_reason)
 
 
 # =========================================================================
@@ -2326,6 +2332,7 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict, mmr_c
                 regime_x=pos.get("regime_x"),
                 regime_y=pos.get("regime_y"),
                 mmr_cache=mmr_cache,
+                exit_reason=reason,
             )
         except Exception:
             pass
@@ -3358,7 +3365,7 @@ async def _fetch_klines_paginated(
 def _sim_verify_hist(klines_15m: list, direction: str, ofd: float) -> tuple[bool, float]:
     """
     Historical execution confirmation WITHOUT order book API.
-    Uses VPIN, OFD, volume ratio; neutral WOB; fixed tight spread.
+    Uses BVC VPIN, OFD floors zosúladené so živými filtrami (1.18 / 0.82).
     """
     if len(klines_15m) < 12:
         return False, 0.0
@@ -3368,6 +3375,7 @@ def _sim_verify_hist(klines_15m: list, direction: str, ofd: float) -> tuple[bool
     if avg_prev > 0 and (curr_vol / avg_prev) < 1.10:
         return False, 0.0
     vpin = float(calculate_vpin_toxicity(klines_15m))
+    # Adaptívny strop zosúladený s default vpin_max (~0.80 pri strictness=1)
     if vpin > 0.80:
         return False, 0.0
     # Neutral book assumption
@@ -3379,10 +3387,10 @@ def _sim_verify_hist(klines_15m: list, direction: str, ofd: float) -> tuple[bool
         return False, 0.0
     if direction == "SHORT" and wob_imbalance > 0.15:
         return False, 0.0
-    # weak OFD vs direction
-    if direction == "LONG" and ofd < 1.05:
+    # OFD floors zosúladené s _get_filter_ctx (max 1.18 / min 0.82)
+    if direction == "LONG" and ofd < 1.18:
         return False, 0.0
-    if direction == "SHORT" and ofd > 0.95:
+    if direction == "SHORT" and ofd > 0.82:
         return False, 0.0
     px = float(get_close(klines_15m[-1]))
     return True, px
@@ -3420,6 +3428,7 @@ def _sandbox_close(pos: dict, exit_price: float, reason: str, sandbox: dict, vau
             regime_x=pos.get("regime_x"),
             regime_y=pos.get("regime_y"),
             mmr_cache=mmr_cache,
+            exit_reason=reason,
         )
     except Exception:
         pass
@@ -3432,6 +3441,7 @@ def _sandbox_close(pos: dict, exit_price: float, reason: str, sandbox: dict, vau
 def _sandbox_manage(pos: dict, bar: list, sandbox: dict, vault: dict, mmr_cache: dict | None = None) -> bool:
     """
     Manage one sandbox position on a historical bar.
+    Zosúladené s Oblasťou 2: Risk-Capped DCA1/2, čistý BE po TP1, rozlíšenie exit_reason.
     Returns True if position still open, False if closed.
     """
     hi = float(get_high(bar))
@@ -3441,6 +3451,49 @@ def _sandbox_manage(pos: dict, bar: list, sandbox: dict, vault: dict, mmr_cache:
     dir_mult = 1.0 if is_long else -1.0
     entry = float(pos["entry_price"])
     lev = max(1, int(pos.get("leverage") or 1))
+    natr = float(pos.get("natr") or 2.0)
+    cost_rate = float(pos.get("cost_rate", 0.0015))
+
+    # --- Risk-Capped DCA1 / DCA2 (pred SL/TP, iba non-P&D a pred TP1) ---
+    if not pos.get("is_pd") and not pos.get("tp1_hit"):
+        for idx_dca, pct in ((1, 0.25), (2, 0.35)):
+            if pos.get(f"dca{idx_dca}_filled"):
+                continue
+            dca_p = float(pos.get(f"dca{idx_dca}_price") or 0.0)
+            if dca_p <= 0:
+                continue
+            if not ((is_long and lo <= dca_p) or (not is_long and hi >= dca_p)):
+                continue
+            added_m = float(pos.get("margin_usd") or 0.0) * pct
+            old_qty = (float(pos["active_margin"]) * lev) / max(1e-12, float(pos["entry_price"]))
+            new_qty = (added_m * lev) / dca_p
+            if old_qty + new_qty > 0:
+                pos["entry_price"] = (
+                    (old_qty * float(pos["entry_price"])) + (new_qty * dca_p)
+                ) / (old_qty + new_qty)
+            pos["active_margin"] = float(pos["active_margin"]) + added_m
+            pos["max_deployed_margin"] = max(
+                float(pos.get("max_deployed_margin", pos["active_margin"])),
+                float(pos["active_margin"]),
+            )
+            pos[f"dca{idx_dca}_filled"] = True
+            entry = float(pos["entry_price"])
+            # Dynamický SL: 1.6 × NATR od novej priemernej ceny + likvidačná poistka
+            new_sl_pct = max(0.010, (1.6 * natr) / 100.0)
+            new_sl = entry * (1.0 - dir_mult * new_sl_pct)
+            if pos.get("regime") == "FUTURES" and lev > 1:
+                new_liq = entry * (1.0 - dir_mult * (0.90 / lev))
+                safe_buffer = max(0.003, (0.4 * natr) / 100.0)
+                if is_long:
+                    if new_sl <= new_liq * (1.0 + safe_buffer):
+                        new_sl = new_liq * (1.0 + safe_buffer)
+                else:
+                    if new_sl >= new_liq * (1.0 - safe_buffer):
+                        new_sl = new_liq * (1.0 - safe_buffer)
+            pos["sl_tsl_price"] = new_sl
+            tp_mod = float(pos.get("tp_mod", 1.0))
+            pos["tp1_price"] = entry * (1.0 + dir_mult * ((1.0 * natr * tp_mod) / 100.0 + cost_rate))
+            pos["tp2_price"] = entry * (1.0 + dir_mult * ((1.8 * natr * tp_mod) / 100.0 + cost_rate))
 
     # Liquidation
     if pos.get("regime") == "FUTURES" and lev > 1:
@@ -3450,22 +3503,27 @@ def _sandbox_manage(pos: dict, bar: list, sandbox: dict, vault: dict, mmr_cache:
             _sandbox_close(pos, liq, "LIQUIDATION_HIT", sandbox, vault, mmr_cache=mmr_cache)
             return False
 
-    # SL / TSL
+    # SL / TSL s rozlíšením dôvodu
     sl = float(pos.get("sl_tsl_price") or 0.0)
     if sl > 0:
         hit_sl = (is_long and lo <= sl) or (not is_long and hi >= sl)
         if hit_sl:
-            reason = "TRAILING_SL_PROFIT" if pos.get("tsl_active") else "HARD_SL_HIT"
+            if pos.get("tsl_active"):
+                be_band = abs(sl - entry) / max(1e-9, entry)
+                if be_band <= 0.012:
+                    reason = "BE_STOP_AFTER_TP1"
+                else:
+                    reason = "TRAILING_SL_PROFIT"
+            else:
+                reason = "HARD_SL_HIT"
             _sandbox_close(pos, sl, reason, sandbox, vault, mmr_cache=mmr_cache)
             return False
 
-    # TP1 scale-out 50% + BE lock
+    # TP1 scale-out 50% + čistý BE lock
     if not pos.get("tp1_hit"):
         tp1 = float(pos.get("tp1_price") or 0.0)
         hit_tp1 = (is_long and hi >= tp1) or (not is_long and lo <= tp1)
         if hit_tp1 and tp1 > 0:
-            # virtual partial
-            cost_rate = float(pos.get("cost_rate", 0.0015))
             gross = ((tp1 - entry) / max(1e-9, entry)) * dir_mult * lev * 100.0
             xcost = 0.0005 + 0.5 * max(0.0, cost_rate - 0.0010)
             net = gross - (xcost * lev * 100.0)
@@ -3477,7 +3535,8 @@ def _sandbox_manage(pos: dict, bar: list, sandbox: dict, vault: dict, mmr_cache:
             pos["tp1_hit"] = True
             pos["tsl_active"] = True
             pos["extreme_price"] = tp1
-            be = entry * (1.0 + dir_mult * (cost_rate + 0.0010))
+            # Čistý Break-Even: cost_rate + 0.08 %
+            be = entry * (1.0 + dir_mult * (cost_rate + 0.0008))
             pos["sl_tsl_price"] = be
 
     # TP2 close remainder
@@ -3492,13 +3551,13 @@ def _sandbox_manage(pos: dict, bar: list, sandbox: dict, vault: dict, mmr_cache:
             pos["extreme_price"] = max(float(pos.get("extreme_price", cl)), hi)
         else:
             pos["extreme_price"] = min(float(pos.get("extreme_price", cl)), lo)
-        natr = float(pos.get("natr") or 2.0)
         step = (0.65 * natr) / 100.0
         new_tsl = float(pos["extreme_price"]) * (1.0 - dir_mult * step)
         if (is_long and new_tsl > pos["sl_tsl_price"]) or (not is_long and new_tsl < pos["sl_tsl_price"]):
             pos["sl_tsl_price"] = new_tsl
 
     return True
+
 
 
 async def run_historical_pretrain(vault: dict):
@@ -3508,6 +3567,24 @@ async def run_historical_pretrain(vault: dict):
     Only trains ai_mmr_matrix + vault filter_weights (+ natr_history_30d warm-up).
     """
     mmr_cache = load_mmr_cache()
+    # 25 % exponenciálne omladenie (Memory Decay) – stará história neprebíja 7-dňový Pre-Train
+    for _cell in list(mmr_cache.values()):
+        try:
+            _cell["win_rate"] = float(_cell.get("win_rate", 52.0)) * 0.75 + 50.0 * 0.25
+            _cell["sl_modifier"] = float(_cell.get("sl_modifier", 1.0)) * 0.75 + 1.0 * 0.25
+            _cell["tp_modifier"] = float(_cell.get("tp_modifier", 1.0)) * 0.75 + 1.0 * 0.25
+        except Exception:
+            pass
+    # Jemné omladenie filter_weights o 20 % smerom k 1.0
+    _fw = vault.setdefault("filter_weights", {
+        "macro": 1.0, "liq": 1.0, "ofd": 1.0, "shield": 1.0, "micro": 1.0, "risk": 1.0,
+    })
+    for _k in list(_fw.keys()):
+        try:
+            _fw[_k] = float(np.clip(float(_fw.get(_k, 1.0)) * 0.80 + 1.0 * 0.20, 0.70, 1.40))
+        except Exception:
+            pass
+    vault["filter_weights"] = _fw
     sem = asyncio.Semaphore(4)
     hist: dict[str, list] = {}
     async with httpx.AsyncClient(http2=True, timeout=20.0) as client:
