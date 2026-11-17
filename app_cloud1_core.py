@@ -81,6 +81,7 @@ def get_default_vault() -> dict:
         "cell_strictness": 0.85,
         "pending_setups": {},
         "ai_w6_feedback": [],
+        "auto_refresh_enabled": True,
         "micro_weights": {
             "spoof_sensitivity": 1.0,
             "wall_frontrun_mult": 3.5,
@@ -119,6 +120,7 @@ def load_vault() -> dict:
                     state.setdefault("shadow_pool", list(state.get("shadow_trades") or []))  # migrate old key
                     state.setdefault("pending_setups", {})
                     state.setdefault("ai_w6_feedback", [])
+                    state.setdefault("auto_refresh_enabled", True)
                     state.setdefault("micro_weights", {
                         "spoof_sensitivity": 1.0,
                         "wall_frontrun_mult": 3.5,
@@ -168,6 +170,7 @@ def load_vault() -> dict:
             state.setdefault("shadow_pool", list(state.get("shadow_trades") or []))  # migrate old key
             state.setdefault("pending_setups", {})
             state.setdefault("ai_w6_feedback", [])
+            state.setdefault("auto_refresh_enabled", True)
             state.setdefault("micro_weights", {
                 "spoof_sensitivity": 1.0,
                 "wall_frontrun_mult": 3.5,
@@ -2916,6 +2919,7 @@ async def run_core_cycle(vault: dict):
 
                 # --- Rýchla frekvencia: kompletná správa pozície každú 1 s ---
                 for win_key, pos in list(active_windows):
+                    pos_changed_in_tick = False  # zmena stavu (SL / DCA / TP1 / TP2) → okamžitý zápis do Supabase
                     # Mohla sa medzitým uzavrieť
                     if pos.get("status") != "ACTIVE" or not pos.get("symbol"):
                         continue
@@ -3077,6 +3081,7 @@ async def run_core_cycle(vault: dict):
                                     and shadow_sl < entry_px  # SL musí ostať pod entry pri LONGu
                                     and shadow_sl < dca_floor_px):
                                 paper_amend_sl(pos, shadow_sl, "SHADOW_OBI_LONG")
+                                pos_changed_in_tick = True
                                 db_dirty = True
 
                         elif (not is_long) and asks and cur_sl > 0:
@@ -3100,6 +3105,7 @@ async def run_core_cycle(vault: dict):
                                     and shadow_sl > entry_px  # SL musí ostať nad entry pri SHORTe
                                     and shadow_sl > dca_ceil_px):
                                 paper_amend_sl(pos, shadow_sl, "SHADOW_OBI_SHORT")
+                                pos_changed_in_tick = True
                                 db_dirty = True
 
                     # C. RISK-CAPPED DCA (max 2 úrovne) s OFD + WOB + Real Tape CVD
@@ -3140,6 +3146,7 @@ async def run_core_cycle(vault: dict):
                                 float(pos["active_margin"]),
                             )
                             pos[f"dca{idx}_filled"] = True
+                            pos_changed_in_tick = True
                             db_dirty = True
 
                             # Dynamický SL: 1.6 × NATR od novej priemernej ceny
@@ -3157,6 +3164,7 @@ async def run_core_cycle(vault: dict):
                                     if new_sl >= new_liq * (1.0 - safe_buffer):
                                         new_sl = new_liq * (1.0 - safe_buffer)
                             paper_amend_sl(pos, new_sl, f"RISK_CAPPED_DCA{idx}")
+                            pos_changed_in_tick = True
 
                             pos["tp1_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.0 * natr * tp_mod) / 100.0 + cost_rate))
                             pos["tp2_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.8 * natr * tp_mod) / 100.0 + cost_rate))
@@ -3198,6 +3206,7 @@ async def run_core_cycle(vault: dict):
                                     execute_scale_out(pos, curr_price, 0.50, "TP1_WALL_FRONTRUN", vault, tick_dt)
                                     pos["wall_frontrun_used"] = True
                                     pos["tp1_hit"] = True
+                                    pos_changed_in_tick = True
                                     pos["tsl_active"] = True
                                     pos["extreme_price"] = curr_price
                                     pos["tp1_hit_ts"] = float(tick_ts)
@@ -3206,6 +3215,7 @@ async def run_core_cycle(vault: dict):
                                     be_pad = float(cost_rate) + 0.0008
                                     be_lock = pos["entry_price"] * (1.0 + dir_mult * be_pad)
                                     paper_amend_sl(pos, be_lock, "BE_LOCK_AFTER_TP1")
+                                    pos_changed_in_tick = True
                                     db_dirty = True
 
                         if not pos.get("tp1_hit", False):
@@ -3213,6 +3223,7 @@ async def run_core_cycle(vault: dict):
                                 # Odprodej 50 % pozice tržním scale-outem
                                 execute_scale_out(pos, curr_price, 0.50, "TP1_SCALE_OUT", vault, tick_dt)
                                 pos["tp1_hit"] = True
+                                pos_changed_in_tick = True
                                 pos["tsl_active"] = True
                                 pos["extreme_price"] = curr_price
                                 pos["tp1_hit_ts"] = float(tick_ts)
@@ -3223,6 +3234,7 @@ async def run_core_cycle(vault: dict):
                                 be_pad = float(cost_rate) + 0.0008
                                 be_lock = pos["entry_price"] * (1.0 + dir_mult * be_pad)
                                 paper_amend_sl(pos, be_lock, "BE_LOCK_AFTER_TP1")
+                                pos_changed_in_tick = True
                                 db_dirty = True
 
                     if pos.get("tp1_hit", False) and not pos.get("tp2_hit", False):
@@ -3238,6 +3250,7 @@ async def run_core_cycle(vault: dict):
                                     execute_scale_out(pos, curr_price, 0.60, "TP2_WALL_FRONTRUN", vault, tick_dt)
                                     pos["wall_frontrun_used"] = True
                                     pos["tp2_hit"] = True
+                                    pos_changed_in_tick = True
                                     pos["extreme_price"] = curr_price
                                     db_dirty = True
                         if is_long and curr_price > pos["extreme_price"]:
@@ -3263,12 +3276,14 @@ async def run_core_cycle(vault: dict):
                             new_tsl = pos["extreme_price"] * (1.0 - dir_mult * step_pct)
                             if (is_long and new_tsl > pos["sl_tsl_price"]) or (not is_long and new_tsl < pos["sl_tsl_price"]):
                                 paper_amend_sl(pos, new_tsl, "REGIME_TSL")
+                                pos_changed_in_tick = True
                                 db_dirty = True
                         # else: BE lock ostáva, trail ešte neaktívny
 
                         if (is_long and (curr_price >= pos["tp2_price"] or candle_high >= pos["tp2_price"])) or (not is_long and (curr_price <= pos["tp2_price"] or candle_low <= pos["tp2_price"])):
                             execute_scale_out(pos, curr_price, 0.60, "TP2_SCALE_OUT", vault, tick_dt)
                             pos["tp2_hit"] = True
+                            pos_changed_in_tick = True
                             pos["extreme_price"] = curr_price
                             db_dirty = True
 
@@ -3312,6 +3327,7 @@ async def run_core_cycle(vault: dict):
                             new_tsl = pos["extreme_price"] * (1.0 - dir_mult * step_pct)
                             if (is_long and new_tsl > pos["sl_tsl_price"]) or (not is_long and new_tsl < pos["sl_tsl_price"]):
                                 paper_amend_sl(pos, new_tsl, "POST_TP2_TSL")
+                                pos_changed_in_tick = True
                                 db_dirty = True
 
                     # E2. DVOJSTUPŇOVÝ TIME-STOP
@@ -3375,6 +3391,14 @@ async def run_core_cycle(vault: dict):
 
                     # UI synchronizační vrstva pre pamäť Streamlitu
                     update_live_pnl_metrics(pos, curr_price, dir_mult, win_id)
+
+                    # Okamžitý zápis pri zmene stavu + priebežný Live PnL každé 3 s pre cockpit sidebar
+                    if pos_changed_in_tick or (tick % 3 == 0):
+                        try:
+                            push_active_position_row(pos, vault)
+                            save_vault_local(vault)
+                        except Exception:
+                            pass
 
                 # Po spracovaní všetkých pozícií v tiku: ak niečo zatvorené → break pre UI redraw
                 if position_closed_in_tick:
@@ -4166,7 +4190,11 @@ def main_ui():
     with c1:
         run_once = st.button("▶ Spustiť 1 cyklus", type="primary", use_container_width=True)
     with c2:
-        auto_refresh = st.toggle("Auto-refresh (15s)", value=False)
+        default_ar = bool(vault.get("auto_refresh_enabled", True))
+        auto_refresh = st.toggle("Auto-refresh (15s)", value=default_ar)
+        if auto_refresh != default_ar:
+            vault["auto_refresh_enabled"] = bool(auto_refresh)
+            save_vault(vault, sync_cloud=True)
     with c3:
         if st.button("🔄 Reload vault", use_container_width=True):
             st.session_state.vault = load_vault()
