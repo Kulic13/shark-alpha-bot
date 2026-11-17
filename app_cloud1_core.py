@@ -1687,7 +1687,7 @@ async def build_trade_setup(cand: dict, balance: float, window_id: int, vault: d
     trades_n = int(mmr_cell["total_trades"])
     
     # Bayesovské vyhlazení pravděpodobnosti (Prior síla = 10 vzorků, Prior WR = 52%)
-    prior_strength = 14.0
+    prior_strength = 6.0
     prior_wr = 0.48
     wr = ((cell_wr * trades_n) + (prior_wr * prior_strength)) / (trades_n + prior_strength)
 
@@ -2698,7 +2698,7 @@ def update_live_pnl_metrics(pos: dict, curr_price: float, dir_mult: float, win_i
 
 
 # Maximálny čas offline (sekundy). Ak appka spí/offline dlhšie, pozície sa mažú.
-STALE_POSITION_MAX_SEC = 600  # 10 minút
+STALE_POSITION_MAX_SEC = 3600  # 60 minút – krátky reštart obnoví obchody, dlhý výpadok (>1h) ich čisto zmaže
 
 
 def purge_stale_open_positions(vault: dict, reason: str = "APP_OFFLINE_GT_10MIN") -> int:
@@ -3371,7 +3371,8 @@ async def run_core_cycle(vault: dict):
                                 # Rozlíš tesný BE stop vs bežný trailing profit
                                 entry_px = float(pos.get("entry_price") or 0.0)
                                 be_band = abs(sl_px - entry_px) / max(1e-9, entry_px)
-                                if be_band <= 0.012 and sec_since_tp1 < 600.0:
+                                cost_r = float(pos.get("cost_rate", compute_roundtrip_cost_rate(win_id)))
+                                if be_band <= (cost_r + 0.0020) and sec_since_tp1 < 600.0:
                                     reason = "BE_STOP_AFTER_TP1"
                                 else:
                                     reason = "TRAILING_SL_PROFIT"
