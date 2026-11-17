@@ -3020,35 +3020,50 @@ async def run_core_cycle(vault: dict):
                             position_closed_in_tick = True
                             continue
 
-                    # A2. SPOOFING / LIQUIDITY PULL ESCAPE – vyhladený 3s EMA trend knihy + Real Tape CVD
+                    # A2. SPOOFING / LIQUIDITY PULL ESCAPE – 2-tikové potvrdenie + Real Tape CVD
                     prev_wob_ema = float(pos.get("wob_ema", curr_wob))
                     wob_ema = 0.65 * prev_wob_ema + 0.35 * float(curr_wob)
                     pos["wob_ema"] = wob_ema
                     pos["last_wob_imbalance"] = float(curr_wob)
-                    spoof_drop_thr = 0.65 / max(0.5, float(mw.get("spoof_sensitivity", 1.0)))
+
+                    sens = max(0.5, float(mw.get("spoof_sensitivity", 1.0)))
+                    spoof_drop_thr = 0.65 / sens
+                    wob_abs_thr = min(0.45, 0.25 / sens)
                     spoof_suspect = (
-                        (is_long and (prev_wob_ema - curr_wob) > spoof_drop_thr and curr_wob < -0.25)
-                        or ((not is_long) and (curr_wob - prev_wob_ema) > spoof_drop_thr and curr_wob > 0.25)
+                        (is_long and (prev_wob_ema - curr_wob) > spoof_drop_thr and curr_wob < -wob_abs_thr)
+                        or ((not is_long) and (curr_wob - prev_wob_ema) > spoof_drop_thr and curr_wob > wob_abs_thr)
                     )
-                    if spoof_suspect:
-                        entry_px = float(pos.get("entry_price") or curr_price)
-                        loss_pct = abs(curr_price - entry_px) / max(1e-9, entry_px) * 100.0
-                        min_spoof_loss_pct = max(0.35, 0.35 * float(natr or 1.5))
-                        in_loss_spoof = (
-                            ((is_long and curr_price < entry_px) or ((not is_long) and curr_price > entry_px))
-                            and loss_pct > min_spoof_loss_pct
-                        )
-                        if in_loss_spoof:
-                            try:
-                                tape = await fetch_real_tape_cvd(client, sym, limit=100)
-                            except Exception:
-                                tape = {"ok": False}
-                            real_flow = float(tape["tape_ofd"]) if tape.get("ok") else float(ofd)
-                            if (is_long and real_flow < 0.80) or ((not is_long) and real_flow > 1.20):
-                                close_position(pos, curr_price, "SPOOF_COLLAPSE_ESCAPE", vault, mmr_cache=mmr_cache)
-                                db_dirty = True
-                                position_closed_in_tick = True
-                                continue
+
+                    entry_px = float(pos.get("entry_price") or curr_price)
+                    loss_pct = abs(curr_price - entry_px) / max(1e-9, entry_px) * 100.0
+                    if not pos.get("is_pd", False) and not pos.get("dca1_filled", False):
+                        min_spoof_loss_pct = max(0.75, 0.85 * float(natr or 1.5))
+                    else:
+                        min_spoof_loss_pct = max(0.45, 0.45 * float(natr or 1.5))
+
+                    in_loss_spoof = (
+                        ((is_long and curr_price < entry_px) or ((not is_long) and curr_price > entry_px))
+                        and loss_pct > min_spoof_loss_pct
+                    )
+
+                    if spoof_suspect and in_loss_spoof:
+                        pos["spoof_confirm_ticks"] = int(pos.get("spoof_confirm_ticks", 0)) + 1
+                    else:
+                        pos["spoof_confirm_ticks"] = 0
+
+                    if pos["spoof_confirm_ticks"] >= 2:
+                        try:
+                            tape = await fetch_real_tape_cvd(client, sym, limit=100)
+                        except Exception:
+                            tape = {"ok": False}
+                        real_flow = float(tape["tape_ofd"]) if tape.get("ok") else float(ofd)
+                        tape_long_thr = max(0.55, 0.80 / sens)
+                        tape_short_thr = min(1.45, 1.20 * sens)
+                        if (is_long and real_flow < tape_long_thr) or ((not is_long) and real_flow > tape_short_thr):
+                            close_position(pos, curr_price, "SPOOF_COLLAPSE_ESCAPE", vault, mmr_cache=mmr_cache)
+                            db_dirty = True
+                            position_closed_in_tick = True
+                            continue
 
                     # B. SHADOW OBI BARRIER (PAPER) – LONG aj SHORT
                     # SL smie posunúť len smerom k zisku a max na 40 % vzdialenosti k aktuálnej cene
@@ -3212,7 +3227,7 @@ async def run_core_cycle(vault: dict):
                                     pos["tp1_hit_ts"] = float(tick_ts)
                                     _tp1_just_hit = True
                                     cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
-                                    be_pad = float(cost_rate) + 0.0008
+                                    be_pad = float(cost_rate) + max(0.0015, (0.20 * float(natr or 1.5)) / 100.0)
                                     be_lock = pos["entry_price"] * (1.0 + dir_mult * be_pad)
                                     paper_amend_sl(pos, be_lock, "BE_LOCK_AFTER_TP1")
                                     pos_changed_in_tick = True
@@ -3231,7 +3246,7 @@ async def run_core_cycle(vault: dict):
 
                                 # Čistý Break-Even po TP1: len krytie nákladov (cost_rate + 0.08 %)
                                 cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
-                                be_pad = float(cost_rate) + 0.0008
+                                be_pad = float(cost_rate) + max(0.0015, (0.20 * float(natr or 1.5)) / 100.0)
                                 be_lock = pos["entry_price"] * (1.0 + dir_mult * be_pad)
                                 paper_amend_sl(pos, be_lock, "BE_LOCK_AFTER_TP1")
                                 pos_changed_in_tick = True
@@ -3372,7 +3387,8 @@ async def run_core_cycle(vault: dict):
                                 entry_px = float(pos.get("entry_price") or 0.0)
                                 be_band = abs(sl_px - entry_px) / max(1e-9, entry_px)
                                 cost_r = float(pos.get("cost_rate", compute_roundtrip_cost_rate(win_id)))
-                                if be_band <= (cost_r + 0.0020) and sec_since_tp1 < 600.0:
+                                expected_be_pad = cost_r + max(0.0015, (0.20 * float(natr or 1.5)) / 100.0)
+                                if be_band <= (expected_be_pad + 0.0015) and sec_since_tp1 < 600.0:
                                     reason = "BE_STOP_AFTER_TP1"
                                 else:
                                     reason = "TRAILING_SL_PROFIT"
