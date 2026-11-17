@@ -1,0 +1,29 @@
+name: Retrain Shark Alpha AI V5
+
+on:
+  schedule:
+    - cron: '15 */4 * * *'
+  workflow_dispatch:
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install supabase xgboost scikit-learn httpx pandas numpy
+
+      - name: Retrain XGBoost V5
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python train_xgboost_v5_champion.py
