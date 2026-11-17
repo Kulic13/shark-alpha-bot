@@ -9,7 +9,7 @@ from supabase import Client
 
 OKX_API = "https://okx.com"
 
-FEATURES = [
+FEATURES_V5 = [
     "natr",
     "rsi",
     "ofd",
@@ -20,7 +20,10 @@ FEATURES = [
     "rel_btc_2h",
     "market_breadth",
     "market_dispersion",
+    "regime_x",
+    "regime_y",
 ]
+FEATURES = FEATURES_V5
 
 _MODEL_CACHE = None
 _FEATURES_CACHE = None
@@ -29,7 +32,7 @@ _MODEL_CACHE_TTL = 1800.0  # Obnoviť model zo Supabase každých 30 minút
 
 
 def _load_xgboost_v3(supabase: Client):
-    """Načíta a kešuje natrénovaný XGBoost V3 model a jeho zoznam príznakov zo Supabase."""
+    """Načíta a kešuje natrénovaný XGBoost V5 model a jeho zoznam príznakov zo Supabase."""
     global _MODEL_CACHE, _FEATURES_CACHE, _MODEL_CACHE_TS
     now = time.time()
     if _MODEL_CACHE is not None and (now - _MODEL_CACHE_TS) < _MODEL_CACHE_TTL:
@@ -110,6 +113,7 @@ def _compute_features_v3(
     btc_2h_pct: float,
     market_breadth: float,
     market_dispersion: float,
+    vault: dict | None = None,
 ) -> dict | None:
     """Vypočíta všetkých 10 príznakov pre model xgboost_us_champion_v3."""
     if len(klines) < 25:
@@ -168,6 +172,35 @@ def _compute_features_v3(
         "market_breadth": float(market_breadth),
         "market_dispersion": float(market_dispersion),
     }
+    # Rovnaká klasifikácia ako Cloud 1 get_mmr_coordinates().
+    regime_vault = vault if isinstance(vault, dict) else {}
+    if vault is None:
+        result["regime_x"] = 2.0
+        result["regime_y"] = 2.0
+    else:
+        slope = regime_vault.get("last_btc_trend_slope")
+        if slope is None:
+            slope = (regime_vault.get("last_btc_veto") or {}).get("btc_1h_pct", 0.0)
+        try:
+            slope = float(slope)
+        except (TypeError, ValueError):
+            slope = 0.0
+        regime_x = 1 if slope < -0.33 else (3 if slope > 0.33 else 2)
+        try:
+            natr_history = np.asarray(regime_vault.get("natr_history_30d") or [], dtype=float)
+            natr_history = natr_history[np.isfinite(natr_history)]
+            if len(natr_history) >= 15:
+                low = float(np.percentile(natr_history, 33))
+                mid = float(np.percentile(natr_history, 66))
+            else:
+                low = float(regime_vault.get("vol_prah_low", 1.5))
+                mid = float(regime_vault.get("vol_prah_mid", 2.5))
+            current_natr = float(result["natr"])
+            regime_y = 1 if current_natr <= low else (2 if current_natr <= mid else 3)
+        except (TypeError, ValueError):
+            regime_y = 2
+        result["regime_x"] = float(regime_x)
+        result["regime_y"] = float(regime_y)
 
     if any(np.isnan(v) or np.isinf(v) for v in result.values()):
         return None
@@ -179,10 +212,11 @@ async def scan_ai_champion_window6(
     tickers_list: list,
     excluded_symbols: set,
     min_confidence: float = 0.46,
+    vault: dict | None = None,
 ) -> dict | None:
     """
-    Asynchrónny AI skener pre Okno 6 (XGBoost V3).
-    Vyhodnotí top 20 likvidných párov s využitím US VWAP a korelácie voči BTC.
+    Asynchrónny AI skener pre Okno 6 (XGBoost V5).
+    Vyhodnotí top 30 likvidných párov s využitím US VWAP a korelácie voči BTC.
     """
     model, feature_order = _load_xgboost_v3(supabase)
     if model is None or not feature_order:
@@ -200,11 +234,11 @@ async def scan_ai_champion_window6(
             continue
         vol = float(t.get("volCcy24h") or 0.0)
         price = float(t.get("last") or 0.0)
-        if vol >= 1_000_000.0 and price > 0:
+        if vol >= 2_000_000.0 and price > 0:
             candidates.append((sym, inst_id, vol, price))
 
     candidates.sort(key=lambda x: x[2], reverse=True)
-    top_candidates = candidates[:20]
+    top_candidates = candidates[:30]
     if not top_candidates:
         return None
 
@@ -244,7 +278,7 @@ async def scan_ai_champion_window6(
                         return None
 
                     klines = list(reversed(payload["data"]))
-                    feats = _compute_features_v3(klines, btc_2h_pct, market_breadth, market_dispersion)
+                    feats = _compute_features_v3(klines, btc_2h_pct, market_breadth, market_dispersion, vault=vault)
                     if feats is None:
                         return None
 
@@ -281,7 +315,7 @@ async def scan_ai_champion_window6(
                             "rsi": feats["rsi"],
                             "vpin": feats["vpin"],
                             "ai_features": dict(feats),
-                            "source": "AI_CHAMPION_US_V3",
+                            "source": "AI_CHAMPION_US_V5",
                         }
                 except Exception:
                     return None
