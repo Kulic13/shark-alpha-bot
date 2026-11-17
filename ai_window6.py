@@ -7,6 +7,9 @@ import numpy as np
 import pandas as pd
 from supabase import Client
 
+from us_market_engine import AI_FEATURES, compute_live_coin_features, is_us_trading_window
+from us_market_engine import compute_single_coin_features
+
 OKX_API = "https://okx.com"
 
 _MODEL_CACHE = None
@@ -28,10 +31,7 @@ def _load_xgboost_v3(supabase: Client):
             row = res.data[0]
             raw_bytes = base64.b64decode(row["model_base64"])
             model = pickle.loads(raw_bytes)
-            feats = row.get("features_list") or [
-                "natr", "rsi", "ofd", "vpin", "vol_ratio", "ema_dist_atr",
-                "z_us_vwap", "rel_btc_2h", "market_breadth", "market_dispersion"
-            ]
+            feats = row.get("features_list") or list(AI_FEATURES)
             _MODEL_CACHE = model
             _FEATURES_CACHE = list(feats)
             _MODEL_CACHE_TS = now
@@ -41,127 +41,36 @@ def _load_xgboost_v3(supabase: Client):
     return _MODEL_CACHE, _FEATURES_CACHE
 
 
-def _compute_market_regime_metrics(tickers_list: list) -> tuple[float, float]:
-    """Vypočíta market_breadth (podiel rastúcich mincí) a market_dispersion (rozptyl zmien)."""
-    changes = []
-    for t in tickers_list:
-        inst_id = t.get("instId", "")
-        if not inst_id.endswith("-USDT-SWAP"):
-            continue
-        last_px = float(t.get("last") or 0.0)
-        open_24h = float(t.get("open24h") or 0.0)
-        if last_px > 0 and open_24h > 0:
-            pct = ((last_px - open_24h) / open_24h) * 100.0
-            changes.append(pct)
-
-    if not changes:
-        return 0.5, 2.0
-
-    arr = np.asarray(changes, dtype=float)
-    breadth = float(np.mean(arr > 0.0))
-    dispersion = float(np.std(arr))
-    return breadth, dispersion
-
-
-def _compute_us_vwap_zscore(df: pd.DataFrame) -> float:
-    """
-    Vypočíta Z-skóre aktuálnej ceny voči objemovo váženému priemeru (VWAP)
-    od začiatku aktuálnej/poslednej US obchodnej seansy (14:30 UTC).
-    """
-    times_utc = pd.to_datetime(df["ts"].astype(np.int64), unit="ms", utc=True)
-    now_utc = times_utc.iloc[-1]
-
-    us_open_today = now_utc.replace(hour=14, minute=30, second=0, microsecond=0)
-    if now_utc < us_open_today:
-        us_start = us_open_today - pd.Timedelta(days=1)
-    else:
-        us_start = us_open_today
-
-    session_df = df[times_utc >= us_start]
-    if len(session_df) < 3:
-        session_df = df.tail(20)
-
-    typical_px = (session_df["h"] + session_df["l"] + session_df["c"]) / 3.0
-    vol = session_df["v"].replace(0, 1e-9)
-    cum_vol = vol.cumsum()
-    vwap_series = (typical_px * vol).cumsum() / cum_vol
-
-    current_vwap = float(vwap_series.iloc[-1])
-    std_dev = float((typical_px - vwap_series).std())
-    if std_dev <= 1e-9 or np.isnan(std_dev):
+def _btc_return_2h(btc_klines: list | None) -> float:
+    """2h výnos BTC (v %) z 15m sviečok (8 × 15m); pri nedostatku dát vráti 0.0."""
+    if not btc_klines or len(btc_klines) < 9:
+        return 0.0
+    try:
+        b_now = float(btc_klines[-1][4])
+        b_2h = float(btc_klines[-9][4])
+        return ((b_now - b_2h) / max(1e-9, b_2h)) * 100.0
+    except Exception:
         return 0.0
 
-    z_score = (float(df["c"].iloc[-1]) - current_vwap) / std_dev
-    return float(np.clip(z_score, -5.0, 5.0))
 
-
-def _compute_features_v3(
-    klines: list,
-    btc_2h_pct: float,
-    market_breadth: float,
-    market_dispersion: float,
-) -> dict | None:
-    """Vypočíta všetkých 10 príznakov pre model xgboost_us_champion_v3."""
-    if len(klines) < 25:
+def _preliminary_cross_section(klines: list | None) -> tuple[float, float] | None:
+    """
+    Predbežný z_us_vwap a ret_2h jedného coinu cez compute_single_coin_features
+    z us_market_engine (rovnaký pipeline ako v trénerovi). Berie posledný riadok.
+    """
+    if not klines or len(klines) < 25:
         return None
-
-    df = pd.DataFrame(klines, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "cf"])
-    for col in ["o", "h", "l", "c", "v"]:
-        df[col] = df[col].astype(float)
-
-    prev_c = df["c"].shift(1)
-    tr = pd.concat([df["h"] - df["l"], (df["h"] - prev_c).abs(), (df["l"] - prev_c).abs()], axis=1).max(axis=1)
-    atr_14 = tr.rolling(14).mean()
-    df["natr"] = (atr_14 / df["c"]) * 100.0
-
-    delta = df["c"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, 1e-9)
-    df["rsi"] = 100.0 - (100.0 / (1.0 + rs))
-
-    rng = (df["h"] - df["l"]).replace(0, 1e-9)
-    body_frac = (df["c"] - df["o"]).abs() / rng
-    buyer_ratio = np.where(df["c"] >= df["o"], 0.5 + 0.5 * body_frac, 0.5 - 0.5 * body_frac)
-    buy_vol = (df["v"] * buyer_ratio).rolling(5).sum()
-    sell_vol = (df["v"] * (1.0 - buyer_ratio)).rolling(5).sum().replace(0, 1e-9)
-    df["ofd"] = buy_vol / sell_vol
-
-    c_ratio = (df["c"] - df["l"]) / rng
-    b_v = df["v"] * c_ratio
-    s_v = df["v"] * (1.0 - c_ratio)
-    df["vpin"] = (b_v - s_v).abs().rolling(10).sum() / (b_v + s_v).rolling(10).sum().replace(0, 1e-9)
-
-    df["vol_ratio"] = df["v"] / df["v"].rolling(10).mean().replace(0, 1e-9)
-
-    ema_20 = df["c"].ewm(span=20, adjust=False).mean()
-    df["ema_dist_atr"] = (df["c"] - ema_20) / atr_14.replace(0, 1e-9)
-
-    # 2-hodinová relatívna výkonnosť voči BTC (8 × 15m sviečok)
-    c_now = float(df["c"].iloc[-1])
-    c_2h_ago = float(df["c"].iloc[-9]) if len(df) >= 9 else float(df["c"].iloc[0])
-    coin_2h_pct = ((c_now - c_2h_ago) / max(1e-9, c_2h_ago)) * 100.0
-    rel_btc_2h = coin_2h_pct - btc_2h_pct
-
-    z_us_vwap = _compute_us_vwap_zscore(df)
-
-    last = df.iloc[-1]
-    result = {
-        "natr": float(last["natr"]),
-        "rsi": float(last["rsi"]),
-        "ofd": float(last["ofd"]),
-        "vpin": float(last["vpin"]),
-        "vol_ratio": float(last["vol_ratio"]),
-        "ema_dist_atr": float(last["ema_dist_atr"]),
-        "z_us_vwap": float(z_us_vwap),
-        "rel_btc_2h": float(rel_btc_2h),
-        "market_breadth": float(market_breadth),
-        "market_dispersion": float(market_dispersion),
-    }
-
-    if any(np.isnan(v) or np.isinf(v) for v in result.values()):
+    try:
+        df = pd.DataFrame(klines, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "cf"])
+        feat_df = compute_single_coin_features(df[["ts", "o", "h", "l", "c", "v"]])
+        last = feat_df.iloc[-1]
+        z = float(last["z_us_vwap"])
+        r = float(last["ret_2h"])
+    except Exception:
         return None
-    return result
+    if np.isnan(z) or np.isinf(z) or np.isnan(r) or np.isinf(r):
+        return None
+    return z, r
 
 
 async def scan_ai_champion_window6(
@@ -173,12 +82,14 @@ async def scan_ai_champion_window6(
     """
     Asynchrónny AI skener pre Okno 6 (XGBoost V3).
     Vyhodnotí top 20 likvidných párov s využitím US VWAP a korelácie voči BTC.
+    Obchoduje výhradne počas US seansy (is_us_trading_window).
     """
+    if not is_us_trading_window():
+        return None
+
     model, feature_order = _load_xgboost_v3(supabase)
     if model is None or not feature_order:
         return None
-
-    market_breadth, market_dispersion = _compute_market_regime_metrics(tickers_list)
 
     candidates = []
     for t in tickers_list:
@@ -199,79 +110,93 @@ async def scan_ai_champion_window6(
         return None
 
     sem = asyncio.Semaphore(6)
-    best_pick = None
 
     async with httpx.AsyncClient(http2=True, timeout=8.0) as client:
-        # Najprv stiahneme 15m sviečky BTC pre výpočet rel_btc_2h
-        btc_2h_pct = 0.0
-        try:
-            btc_res = await client.get(
-                f"{OKX_API}/api/v5/market/candles",
-                params={"instId": "BTC-USDT-SWAP", "bar": "15m", "limit": "12"}
-            )
-            if btc_res.status_code == 200:
-                b_data = btc_res.json().get("data", [])
-                if len(b_data) >= 9:
-                    b_klines = list(reversed(b_data))
-                    b_now = float(b_klines[-1][4])
-                    b_2h = float(b_klines[-9][4])
-                    btc_2h_pct = ((b_now - b_2h) / max(1e-9, b_2h)) * 100.0
-        except Exception:
-            pass
 
-        async def evaluate_one(item):
-            sym, inst_id, vol, price = item
+        async def fetch_klines(inst_id: str) -> list | None:
             async with sem:
                 try:
                     res = await client.get(
                         f"{OKX_API}/api/v5/market/candles",
-                        params={"instId": inst_id, "bar": "15m", "limit": "60"}
+                        params={"instId": inst_id, "bar": "15m", "limit": "60"},
                     )
                     if res.status_code != 200:
                         return None
                     payload = res.json()
                     if payload.get("code") != "0" or not payload.get("data"):
                         return None
-
-                    klines = list(reversed(payload["data"]))
-                    feats = _compute_features_v3(klines, btc_2h_pct, market_breadth, market_dispersion)
-                    if feats is None:
-                        return None
-
-                    X_row = pd.DataFrame([[feats.get(k, 0.0) for k in feature_order]], columns=feature_order)
-
-                    # Predikcia pravdepodobností: [0 = WAIT, 1 = LONG, 2 = SHORT]
-                    probs = model.predict_proba(X_row)[0]
-                    prob_long = float(probs[1])
-                    prob_short = float(probs[2])
-
-                    direction = None
-                    conf = 0.0
-                    if prob_long >= min_confidence and prob_long > prob_short:
-                        direction = "LONG"
-                        conf = prob_long
-                    elif prob_short >= min_confidence and prob_short > prob_long:
-                        direction = "SHORT"
-                        conf = prob_short
-
-                    if direction:
-                        return {
-                            "symbol": sym,
-                            "direction": direction,
-                            "price": price,
-                            "ai_confidence": round(conf, 4),
-                            "ofd": feats["ofd"],
-                            "rsi": feats["rsi"],
-                            "vpin": feats["vpin"],
-                            "source": "AI_CHAMPION_US_V3",
-                        }
+                    return list(reversed(payload["data"]))
                 except Exception:
                     return None
-                return None
 
-        results = await asyncio.gather(*(evaluate_one(c) for c in top_candidates))
-        valid = [r for r in results if r is not None]
-        if valid:
-            valid.sort(key=lambda x: x["ai_confidence"], reverse=True)
-            best_pick = valid[0]
-        return best_pick
+        # FÁZA 1: 15m sviečky (limit=60) pre BTCUSDT + všetkých kandidátov naraz
+        fetch_ids = ["BTC-USDT-SWAP"] + [c[1] for c in top_candidates]
+        fetched = await asyncio.gather(*(fetch_klines(i) for i in fetch_ids))
+        btc_klines = fetched[0]
+        coin_klines = fetched[1:]
+
+        btc_ret_2h = _btc_return_2h(btc_klines)
+
+        # FÁZA 2: prierezové metriky zhodné s trénerom (attach_institutional_context)
+        z_list: list[float] = []
+        ret_2h_list: list[float] = []
+        for klines in coin_klines:
+            pre = _preliminary_cross_section(klines)
+            if pre is None:
+                continue
+            z_list.append(pre[0])
+            ret_2h_list.append(pre[1])
+
+        if not z_list:
+            return None
+
+        market_breadth = float(np.mean([z > 0 for z in z_list]))
+        # ddof=1 = rovnaká definícia ako pandas .std() v trénerovi
+        market_dispersion = float(np.std(ret_2h_list, ddof=1)) if len(ret_2h_list) > 1 else 0.0
+
+        # FÁZA 3: inferencia pre každého kandidáta
+        results = []
+        for item, klines in zip(top_candidates, coin_klines):
+            sym, inst_id, vol, price = item
+            if not klines:
+                continue
+            try:
+                feats = compute_live_coin_features(klines, btc_ret_2h, market_breadth, market_dispersion)
+                if feats is None:
+                    continue
+
+                X_row = pd.DataFrame([[feats.get(k, 0.0) for k in feature_order]], columns=feature_order)
+
+                # Predikcia pravdepodobností: [0 = WAIT, 1 = LONG, 2 = SHORT]
+                probs = model.predict_proba(X_row)[0]
+                prob_long = float(probs[1])
+                prob_short = float(probs[2])
+
+                direction = None
+                conf = 0.0
+                if prob_long >= min_confidence and prob_long > prob_short:
+                    direction = "LONG"
+                    conf = prob_long
+                elif prob_short >= min_confidence and prob_short > prob_long:
+                    direction = "SHORT"
+                    conf = prob_short
+
+                if direction:
+                    results.append({
+                        "symbol": sym,
+                        "direction": direction,
+                        "price": price,
+                        "ai_confidence": round(conf, 4),
+                        "ofd": feats["ofd"],
+                        "rsi": feats["rsi"],
+                        "vpin": feats["vpin"],
+                        "source": "AI_CHAMPION_US_V3",
+                        "ai_features": dict(feats),
+                    })
+            except Exception:
+                continue
+
+        if not results:
+            return None
+        results.sort(key=lambda x: x["ai_confidence"], reverse=True)
+        return results[0]
