@@ -3392,8 +3392,8 @@ async def run_core_cycle(vault: dict):
                     # UI synchronizační vrstva pre pamäť Streamlitu
                     update_live_pnl_metrics(pos, curr_price, dir_mult, win_id)
 
-                    # Okamžitý zápis pri zmene stavu + priebežný Live PnL každé 3 s pre cockpit sidebar
-                    if pos_changed_in_tick or (tick % 3 == 0):
+                    # Okamžitý zápis pri zmene stavu + priebežný Live PnL každé 2 s pre cockpit sidebar
+                    if pos_changed_in_tick or (tick % 2 == 0):
                         try:
                             push_active_position_row(pos, vault)
                             save_vault_local(vault)
