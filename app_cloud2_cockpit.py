@@ -248,11 +248,11 @@ def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
     scale_out_reasons = {"TP1_SCALE_OUT", "TP2_SCALE_OUT"}
     is_final = ~reasons_all.isin(scale_out_reasons)
     df_final = df_subset.loc[is_final].copy()
-    n_trades = len(df_final)
+    n_trades = len(df_final) if len(df_final) > 0 else n_all
     reasons_final = (
         df_final["exit_reason"].fillna("").astype(str)
         if "exit_reason" in df_final.columns and len(df_final) > 0
-        else pd.Series([], dtype=str)
+        else reasons_all
     )
 
     c1, c2, c3 = st.columns(3)
@@ -300,8 +300,10 @@ def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
         reason_labels = {
             "HARD_SL_HIT": "🔴 Hard SL",
             "BE_STOP_AFTER_TP1": "🟡 BE stop po TP1",
+            "TP1_SCALE_OUT": "TP1_SCALE_OUT",
             "TRAILING_SL_PROFIT": "🟢 Trailing SL (zisk)",
             "EARLY_ORDERFLOW_ESCAPE": "⚠️ Early OF escape",
+            "TP2_SCALE_OUT": "TP2_SCALE_OUT",
             "LIQUIDATION_CLIMAX_HIT": "🎯 TP3 Liquidation Climax",
             "TP3_LIQUIDATION_HIT": "🎯 TP3",
             "VPIN_EMERGENCY_ESCAPE": "☠️ VPIN Emergency",
@@ -311,17 +313,11 @@ def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
             "TIME_STOP_CHOP": "⏳ Time-Stop (Chop)",
             "TIME_STOP_STAGNANT": "⏳ Time-Stop (Stagnácia)",
         }
-        reason_counts = reasons_final.replace("", "UNKNOWN").value_counts()
+        reason_counts = reasons_all.replace("", "UNKNOWN").value_counts()
         for reason, cnt in reason_counts.items():
             label = reason_labels.get(str(reason), str(reason))
-            pct = (cnt / n_trades) * 100.0 if n_trades > 0 else 0.0
-            st.write(f"{label}: **{cnt}** ({pct:.1f}%)")
-
-        st.caption("Čiastočné scale-outy:")
-        tp1_scale_count = int((reasons_all == "TP1_SCALE_OUT").sum())
-        tp2_scale_count = int((reasons_all == "TP2_SCALE_OUT").sum())
-        st.write(f"TP1_SCALE_OUT: **{tp1_scale_count}**")
-        st.write(f"TP2_SCALE_OUT: **{tp2_scale_count}**")
+            pct = (cnt / n_all) * 100.0
+            st.write(f"{label}: **{cnt}** ({pct:.0f}%)")
 
 
 # =========================================================================
@@ -419,6 +415,15 @@ def render_live_sidebar_positions():
                 updated = w.get("updated_at")
                 if updated:
                     st.caption(f"Posledný update: {updated}")
+                    try:
+                        updated_dt = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
+                        if updated_dt.tzinfo is None:
+                            updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                        age_s = (datetime.now(timezone.utc) - updated_dt.astimezone(timezone.utc)).total_seconds()
+                        if age_s > 20:
+                            st.warning(f"⚠️ Dáta stoja {int(age_s)}s (skontroluj Cloud 1)")
+                    except (TypeError, ValueError, OverflowError):
+                        pass
         else:
             # Čakajúci kandidát z 1m Sniper čakárne (pending_setups)
             pend = pending_all.get(str(wid)) or {}
