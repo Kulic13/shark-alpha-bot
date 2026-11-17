@@ -81,6 +81,9 @@ def get_default_vault() -> dict:
         "cell_strictness": 0.85,
         "pending_setups": {},
         "ai_w6_feedback": [],
+        "last_market_breadth": 0.5,
+        "last_market_dispersion": 2.0,
+        "last_btc_2h_pct": 0.0,
         "auto_refresh_enabled": True,
         "micro_weights": {
             "spoof_sensitivity": 1.0,
@@ -120,6 +123,9 @@ def load_vault() -> dict:
                     state.setdefault("shadow_pool", list(state.get("shadow_trades") or []))  # migrate old key
                     state.setdefault("pending_setups", {})
                     state.setdefault("ai_w6_feedback", [])
+                    state.setdefault("last_market_breadth", 0.5)
+                    state.setdefault("last_market_dispersion", 2.0)
+                    state.setdefault("last_btc_2h_pct", 0.0)
                     state.setdefault("auto_refresh_enabled", True)
                     state.setdefault("micro_weights", {
                         "spoof_sensitivity": 1.0,
@@ -1024,6 +1030,12 @@ def record_shadow_trade(vault: dict, cand: dict, failed_filter: str, tp1_price: 
         "opened_ts": time.time(),
         "status": "ACTIVE",
     }
+    if len(cand.get("klines") or []) >= 25:
+        v5_feats = _extract_v5_features_from_klines(
+            cand["klines"], vault, float(vault.get("last_btc_2h_pct", 0.0))
+        )
+        if v5_feats:
+            item["v5_features"] = dict(v5_feats)
     pool = list(vault.get("shadow_pool") or vault.get("shadow_trades") or [])
     pool.append(item)
     vault["shadow_pool"] = pool[-100:]
@@ -1064,10 +1076,32 @@ def process_shadow_pool(vault: dict, tickers: dict, now_ts: float):
         hit_tp = (is_long and px >= tp1) or (not is_long and px <= tp1)
         hit_sl = (is_long and px <= sl) or (not is_long and px >= sl)
         if hit_sl and not hit_tp:
+            if sh.get("v5_features"):
+                feedback = list(vault.get("ai_w6_feedback") or [])
+                feedback.append({
+                    "source": "SHADOW_POOL",
+                    "is_win": False,
+                    "direction": sh.get("direction"),
+                    "r_multiple": -1.0,
+                    "features": dict(sh["v5_features"]),
+                    "closed_ts": float(now_ts),
+                })
+                vault["ai_w6_feedback"] = feedback[-600:]
             w = float(weights.get(key, 1.0))
             weights[key] = float(np.clip(w + 0.02, 0.70, 1.40))
             continue  # evaluated out
         if hit_tp and not hit_sl:
+            if sh.get("v5_features"):
+                feedback = list(vault.get("ai_w6_feedback") or [])
+                feedback.append({
+                    "source": "SHADOW_POOL",
+                    "is_win": True,
+                    "direction": sh.get("direction"),
+                    "r_multiple": 1.0,
+                    "features": dict(sh["v5_features"]),
+                    "closed_ts": float(now_ts),
+                })
+                vault["ai_w6_feedback"] = feedback[-600:]
             w = float(weights.get(key, 1.0))
             weights[key] = float(np.clip(w - 0.025, 0.70, 1.40))
             if is_long:
@@ -1681,6 +1715,102 @@ def get_mmr_coordinates(natr: float, vault: dict) -> tuple[int, int]:
         
     return regime_x, regime_y
 
+
+FEATURES_V5 = [
+    "natr", "rsi", "ofd", "vpin", "vol_ratio", "ema_dist_atr",
+    "z_us_vwap", "rel_btc_2h", "market_breadth", "market_dispersion",
+    "regime_x", "regime_y",
+]
+
+
+def _extract_v5_features_from_klines(
+    klines: list,
+    vault: dict,
+    btc_2h_pct: float = 0.0,
+) -> dict | None:
+    """Vypočíta kanonický 12-prvkový V5 vektor z 15m OHLCV sviečok."""
+    if not isinstance(klines, list) or len(klines) < 25:
+        return None
+    try:
+        df = pd.DataFrame(
+            klines,
+            columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "cf"],
+        )
+        for col in ("o", "h", "l", "c", "v"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["o", "h", "l", "c", "v"]).reset_index(drop=True)
+        if len(df) < 25:
+            return None
+        prev_c = df["c"].shift(1)
+        tr = pd.concat(
+            [df["h"] - df["l"], (df["h"] - prev_c).abs(), (df["l"] - prev_c).abs()],
+            axis=1,
+        ).max(axis=1)
+        atr = tr.rolling(14).mean()
+        natr_s = (atr / df["c"].replace(0, np.nan)) * 100.0
+        delta = df["c"].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss.replace(0, 1e-9)
+        rsi_s = 100.0 - (100.0 / (1.0 + rs))
+        rng = (df["h"] - df["l"]).replace(0, 1e-9)
+        body_frac = (df["c"] - df["o"]).abs() / rng
+        buyer_ratio = np.where(
+            df["c"] >= df["o"], 0.5 + 0.5 * body_frac, 0.5 - 0.5 * body_frac
+        )
+        buy_vol = (df["v"] * buyer_ratio).rolling(5).sum()
+        sell_vol = (df["v"] * (1.0 - buyer_ratio)).rolling(5).sum().replace(0, 1e-9)
+        ofd_s = buy_vol / sell_vol
+        c_ratio = (df["c"] - df["l"]) / rng
+        b_v = df["v"] * c_ratio
+        s_v = df["v"] * (1.0 - c_ratio)
+        vpin_s = (b_v - s_v).abs().rolling(10).sum() / (
+            (b_v + s_v).rolling(10).sum().replace(0, 1e-9)
+        )
+        vol_ratio_s = df["v"] / df["v"].rolling(10).mean().replace(0, 1e-9)
+        ema = df["c"].ewm(span=20, adjust=False).mean()
+        ema_dist_s = (df["c"] - ema) / atr.replace(0, 1e-9)
+
+        times = pd.to_datetime(df["ts"].astype(np.int64), unit="ms", utc=True)
+        now_utc = times.iloc[-1]
+        us_open = now_utc.replace(hour=14, minute=30, second=0, microsecond=0)
+        us_start = us_open - pd.Timedelta(days=1) if now_utc < us_open else us_open
+        session = df[times >= us_start]
+        if len(session) < 3:
+            session = df.tail(20)
+        typical = (session["h"] + session["l"] + session["c"]) / 3.0
+        volume = session["v"].replace(0, 1e-9)
+        vwap = (typical * volume).cumsum() / volume.cumsum()
+        std_dev = float((typical - vwap).std())
+        z_us_vwap = 0.0 if not np.isfinite(std_dev) or std_dev <= 1e-9 else float(
+            np.clip((float(df["c"].iloc[-1]) - float(vwap.iloc[-1])) / std_dev, -5.0, 5.0)
+        )
+        c_now = float(df["c"].iloc[-1])
+        c_2h = float(df["c"].iloc[-9])
+        coin_2h_pct = ((c_now - c_2h) / max(1e-9, c_2h)) * 100.0
+        natr = float(natr_s.iloc[-1])
+        rx, ry = get_mmr_coordinates(natr, vault if isinstance(vault, dict) else {})
+        result = {
+            "natr": natr,
+            "rsi": float(rsi_s.iloc[-1]),
+            "ofd": float(ofd_s.iloc[-1]),
+            "vpin": float(vpin_s.iloc[-1]),
+            "vol_ratio": float(vol_ratio_s.iloc[-1]),
+            "ema_dist_atr": float(ema_dist_s.iloc[-1]),
+            "z_us_vwap": float(z_us_vwap),
+            "rel_btc_2h": float(coin_2h_pct - float(btc_2h_pct or 0.0)),
+            "market_breadth": float((vault or {}).get("last_market_breadth", 0.5)),
+            "market_dispersion": float((vault or {}).get("last_market_dispersion", 2.0)),
+            "regime_x": float(rx),
+            "regime_y": float(ry),
+        }
+        if any(not np.isfinite(v) for v in result.values()):
+            return None
+        return {key: float(result[key]) for key in FEATURES_V5}
+    except Exception:
+        return None
+
+
 def _build_entry_fingerprint(cand: dict, vault: dict, mmr_cell: dict, initial_ofd: float) -> dict:
     fp = dict(cand.get("entry_fingerprint") or {})
     fp.setdefault("macro_btc_1h", float((vault.get("last_btc_veto") or {}).get("btc_1h_pct", 0.0)))
@@ -1903,6 +2033,13 @@ async def build_trade_setup(cand: dict, balance: float, window_id: int, vault: d
         "okx_tp3_order_id": f"{tx_id}_tp3_{window_id}",
         "entry_fingerprint": _build_entry_fingerprint(cand, vault, mmr_cell, initial_ofd),
         "ai_features": dict(cand.get("ai_features") or {}),
+        "v5_features": (
+            dict(cand.get("ai_features") or {})
+            if len(cand.get("ai_features") or {}) == 12
+            else _extract_v5_features_from_klines(
+                klines, vault, float(vault.get("last_btc_2h_pct", 0.0))
+            )
+        ),
         "ai_confidence": float(cand.get("ai_confidence", 0.0)),
         "source": cand.get("source", ""),
     }
@@ -2579,6 +2716,20 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict, mmr_c
 
     is_win = total_pnl_usd > 0
     if int(pos.get("window_id", 0)) != 6:
+        if pos.get("v5_features"):
+            try:
+                feedback = list(vault.get("ai_w6_feedback") or [])
+                feedback.append({
+                    "source": "W15_REAL",
+                    "is_win": bool(is_win),
+                    "direction": pos.get("direction"),
+                    "r_multiple": round(float(r_mult), 4),
+                    "features": dict(pos["v5_features"]),
+                    "closed_ts": time.time(),
+                })
+                vault["ai_w6_feedback"] = feedback[-600:]
+            except Exception:
+                pass
         try:
             update_ai_learning(
                 symbol=pos.get("symbol", ""),
@@ -2600,21 +2751,23 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict, mmr_c
         except Exception:
             pass
     else:
-        # Okno 6: uzavretá slučka učenia – spätná väzba pre nočný tréner (daily_train.py)
-        if pos.get("ai_features"):
+        # Okno 6: reálna exekúcia je najvyššie vážený feedback zdroj.
+        feedback_features = pos.get("v5_features") or pos.get("ai_features")
+        if feedback_features:
             try:
                 fb_list = list(vault.get("ai_w6_feedback") or [])
                 fb_list.append({
+                    "source": "W6_REAL",
                     "symbol": pos.get("symbol"),
                     "direction": pos.get("direction"),
                     "is_win": bool(is_win),
                     "r_multiple": round(float(r_mult), 4),
                     "exit_reason": str(reason),
                     "ai_confidence": float(pos.get("ai_confidence", 0.0)),
-                    "features": dict(pos.get("ai_features") or {}),
+                    "features": dict(feedback_features),
                     "closed_ts": time.time(),
                 })
-                vault["ai_w6_feedback"] = fb_list[-250:]
+                vault["ai_w6_feedback"] = fb_list[-600:]
             except Exception:
                 pass
 
@@ -3478,6 +3631,22 @@ async def run_core_cycle(vault: dict):
         save_vault(vault, sync_cloud=True)
 
 
+def _compute_market_regime_metrics(tickers_list: list) -> tuple[float, float]:
+    changes = []
+    for ticker in tickers_list:
+        try:
+            last_px = float(ticker.get("last") or 0.0)
+            open_24h = float(ticker.get("open24h") or 0.0)
+            if last_px > 0.0 and open_24h > 0.0:
+                changes.append(((last_px - open_24h) / open_24h) * 100.0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+    if not changes:
+        return 0.5, 2.0
+    arr = np.asarray(changes, dtype=float)
+    return float(np.mean(arr > 0.0)), float(np.std(arr))
+
+
 async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict, now_ts: float, ny_lock: bool, klines_cache: dict, mmr_cache: dict | None = None):
     """
     Finální propojovací blok skeneru 2.0.
@@ -3516,6 +3685,13 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
 
     # B. SBĚR MARKET DATA A VETO FILTRACE
     tickers, oi_map = await fetch_market_snapshot(client)
+    try:
+        market_breadth, market_dispersion = _compute_market_regime_metrics(list(tickers.values()))
+        vault["last_market_breadth"] = float(market_breadth)
+        vault["last_market_dispersion"] = float(market_dispersion)
+    except Exception:
+        vault.setdefault("last_market_breadth", 0.5)
+        vault.setdefault("last_market_dispersion", 2.0)
     sectors_map = get_sectors_map()
     metrics_24h = get_24h_metrics()
     update_24h_oi_metrics(tickers, oi_map, existing_metrics=metrics_24h)
@@ -3526,6 +3702,13 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
         pass
 
     btc_klines = await fetch_okx_klines(client, "BTCUSDT", "15m", 25, klines_cache)
+    try:
+        if len(btc_klines) >= 9:
+            btc_last = float(get_close(btc_klines[-1]))
+            btc_2h_ago = float(get_close(btc_klines[-9]))
+            vault["last_btc_2h_pct"] = ((btc_last - btc_2h_ago) / max(1e-9, btc_2h_ago)) * 100.0
+    except Exception:
+        vault.setdefault("last_btc_2h_pct", 0.0)
     btc_veto = evaluate_btc_veto(btc_klines)
     vault["last_btc_veto"] = btc_veto
     # Regresný sklon z posledných 10×15m sviečok → stabilnejšia Os X v MMR
@@ -3689,7 +3872,7 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
     # ===== OKNO 6: AI LOVEC ŠAMPIÓNOV (US SESSION - XGBOOST V3) – 1m Sniper čakáreň =====
     if vault["windows"]["6"]["status"] == "WAITING" and "6" not in pending_setups:
         tickers_list = list(tickers.values()) if isinstance(tickers, dict) else list(tickers)
-        ai_cand = await scan_ai_champion_window6(supabase, tickers_list, active_syms)
+        ai_cand = await scan_ai_champion_window6(supabase, tickers_list, active_syms, vault=vault)
         if ai_cand:
             sym_6 = ai_cand["symbol"]
             klines_6 = await fetch_okx_klines(client, sym_6, "15m", 25, klines_cache)
@@ -3704,6 +3887,7 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
                     "klines": klines_6,
                     "exec_price": float(ai_cand["price"]),
                     "ai_features": dict(ai_cand.get("ai_features") or {}),
+                    "v5_features": dict(ai_cand.get("ai_features") or {}),
                     "ai_confidence": float(ai_cand.get("ai_confidence", 0.0)),
                     "source": ai_cand.get("source", "AI_CHAMPION_US_V3"),
                     "entry_fingerprint": {
