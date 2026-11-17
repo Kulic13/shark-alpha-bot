@@ -1,6 +1,7 @@
 import pickle
 import base64
 import time
+import math
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone
@@ -40,7 +41,7 @@ def is_us_trading_window(now_dt: datetime | None = None) -> bool:
         return False
     minutes_utc = now_dt.hour * 60 + now_dt.minute
     start_min = 15 * 60        # 15:00 UTC
-    end_min = 20 * 60 + 30     # 20:30 UTC
+    end_min = 21 * 60          # 21:00 UTC
     return start_min <= minutes_utc <= end_min
 
 
@@ -79,12 +80,15 @@ def compute_single_coin_features(df: pd.DataFrame) -> pd.DataFrame:
     sell_vol = (data["v"] * (1.0 - buyer_ratio)).rolling(5).sum().replace(0, 1e-9)
     data["ofd"] = buy_vol / sell_vol
 
-    # 4. VPIN (Toxicita toku za 10 sviečok)
-    c_ratio = ((data["c"] - data["l"]) / rng).clip(0.0, 1.0)
-    b_v = data["v"] * c_ratio
-    s_v = data["v"] * (1.0 - c_ratio)
-    total_v = (b_v + s_v).rolling(10).sum().replace(0, 1e-9)
-    data["vpin"] = (b_v - s_v).abs().rolling(10).sum() / total_v
+    # 4. VPIN – Bulk Volume Classification (BVC) na plávajúcom okne 15 sviečok
+    log_ret = np.log(data["c"] / data["c"].shift(1).replace(0, np.nan))
+    sigma = log_ret.rolling(15).std().replace(0, np.nan)
+    z_score = (log_ret / sigma).fillna(0.0)
+    phi = z_score.apply(lambda zi: 0.5 * (1.0 + math.erf(float(zi) / math.sqrt(2.0))))
+    b_v = data["v"] * phi
+    s_v = data["v"] * (1.0 - phi)
+    total_v = data["v"].rolling(15).sum().replace(0, 1e-9)
+    data["vpin"] = ((b_v - s_v).abs().rolling(15).sum() / total_v).fillna(0.25)
 
     # 5. Volume Ratio
     avg_vol = data["v"].rolling(10).mean().replace(0, 1e-9)
@@ -163,6 +167,39 @@ def attach_institutional_context(coins_dict: dict[str, pd.DataFrame], btc_df: pd
         final_dict[sym] = merged
 
     return final_dict
+
+
+
+def compute_live_coin_features(
+    klines: list,
+    btc_ret_2h: float,
+    market_breadth: float,
+    market_dispersion: float,
+) -> dict | None:
+    """
+    Živý výpočet všetkých 10 AI_FEATURES cez rovnaký pipeline ako tréner (0 % Train/Live Skew).
+    """
+    if not klines or len(klines) < 25:
+        return None
+    df = pd.DataFrame(klines, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "cf"])
+    feat_df = compute_single_coin_features(df[["ts", "o", "h", "l", "c", "v"]])
+    last = feat_df.iloc[-1]
+    rel_btc_2h = float(last["ret_2h"]) - float(btc_ret_2h)
+    res = {
+        "natr": float(last["natr"]),
+        "rsi": float(last["rsi"]),
+        "ofd": float(last["ofd"]),
+        "vpin": float(last["vpin"]),
+        "vol_ratio": float(last["vol_ratio"]),
+        "ema_dist_atr": float(last["ema_dist_atr"]),
+        "z_us_vwap": float(last["z_us_vwap"]),
+        "rel_btc_2h": float(rel_btc_2h),
+        "market_breadth": float(market_breadth),
+        "market_dispersion": float(market_dispersion),
+    }
+    if any(np.isnan(v) or np.isinf(v) for v in res.values()):
+        return None
+    return res
 
 
 def load_cloud_ai_model(supabase_client, force_refresh: bool = False):
