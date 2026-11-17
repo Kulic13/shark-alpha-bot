@@ -2256,9 +2256,9 @@ async def verify_execution_confirmation_btc(
         ema21_1h = float(closes_1h.ewm(span=21, adjust=False).mean().iloc[-1])
         last_1h_close = float(closes_1h.iloc[-1])
         # Proti-trend len pri slabej OFD (mierne uvoľnené)
-        if direction == "LONG" and last_1h_close < ema21_1h and ofd < 1.25:
+        if direction == "LONG" and last_1h_close < ema21_1h and ofd < 1.10:
             return False, 0.0
-        if direction == "SHORT" and last_1h_close > ema21_1h and ofd > 0.80:
+        if direction == "SHORT" and last_1h_close > ema21_1h and ofd > 0.90:
             return False, 0.0
 
     try:
@@ -2273,13 +2273,13 @@ async def verify_execution_confirmation_btc(
             return False, 0.0
 
         vpin_score = calculate_vpin_toxicity(klines_15m)
-        if vpin_score > 0.82:
+        if vpin_score > 0.85:
             return False, 0.0
 
         wob_imbalance = float(micro.get("wob_imbalance", 0.0))
-        if direction == "LONG" and wob_imbalance < -0.12:
+        if direction == "LONG" and wob_imbalance < -0.30:
             return False, 0.0
-        if direction == "SHORT" and wob_imbalance > 0.12:
+        if direction == "SHORT" and wob_imbalance > 0.30:
             return False, 0.0
 
         levels = (micro.get("asks") or []) if direction == "LONG" else (micro.get("bids") or [])
@@ -3467,7 +3467,7 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
             active_secs.add(_sec)
 
     # ===== OKNO 1: BTCUSDT (MAKROKOTVA) =====
-    if vault["windows"]["1"]["status"] == "WAITING" and len(btc_klines) >= 20:
+    if vault["windows"]["1"]["status"] == "WAITING" and "1" not in pending_setups and len(btc_klines) >= 20:
         last_btc = btc_klines[-1]
         is_15m_green = float(get_close(last_btc)) > float(get_open(last_btc))
         btc_ofd = compute_ofd_from_klines(btc_klines)
@@ -3504,42 +3504,34 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
                     btc_rsi_fp = float(calculate_rsi_14(pd.Series([float(get_close(k)) for k in btc_klines])))
                 except Exception:
                     btc_rsi_fp = 50.0
-                setup = await build_trade_setup(
-                    {
-                        "symbol": "BTCUSDT",
-                        "direction": direction,
-                        "is_pd": False,
-                        "is_funding_trap": is_trap,
-                        "klines": btc_klines,
-                        "exec_price": exec_price,
-                        "entry_fingerprint": {
-                            "macro_btc_1h": float(btc_veto.get("btc_1h_pct", 0.0)),
-                            "liq_vol_24h": 0.0,
-                            "ofd_val": float(btc_ofd),
-                            "shield_rsi": btc_rsi_fp,
-                            "micro_wob": 0.0,
-                            "micro_vpin": 0.0,
-                            "risk_wr": 52.0,
-                        },
+                # 1m Sniper čakáreň pre Okno 1 (30 min) – otvorenie až po VWAP/Tape spúšťači
+                btc_cand = {
+                    "symbol": "BTCUSDT",
+                    "direction": direction,
+                    "is_pd": False,
+                    "is_funding_trap": is_trap,
+                    "sector": sectors_map.get("BTCUSDT", "BTC_MACRO"),
+                    "ofd": float(btc_ofd),
+                    "klines": btc_klines,
+                    "exec_price": exec_price,
+                    "entry_fingerprint": {
+                        "macro_btc_1h": float(btc_veto.get("btc_1h_pct", 0.0)),
+                        "liq_vol_24h": float((tickers.get("BTCUSDT") or {}).get("volCcy24h", 0.0)),
+                        "ofd_val": float(btc_ofd),
+                        "shield_rsi": btc_rsi_fp,
+                        "micro_wob": 0.0,
+                        "micro_vpin": float(calculate_vpin_toxicity(btc_klines)) if len(btc_klines) >= 10 else 0.0,
+                        "risk_wr": 52.0,
                     },
-                    vault["balance"], 1, vault, client=client, mmr_cache=mmr_cache
-                )
-                if setup:
-                    vault["windows"]["1"] = setup
-                    vault["last_trade_opened_ts"] = time.time()
-                    # SYSTEM C: taker 0.05% on market leg notional
-                    mkt_notional = float(setup.get("active_margin") or 0.0) * float(setup.get("leverage") or 1)
-                    vault["balance"] = round(float(vault["balance"]) - mkt_notional * 0.0005, 4)
-                    push_active_position_row(setup, vault)
-                    active_syms.add("BTCUSDT")
-                else:
-                    # Filter 6 MMR veto shadow
-                    record_shadow_trade(
-                        vault,
-                        {"symbol": "BTCUSDT", "direction": direction, "exec_price": exec_price,
-                         "klines": btc_klines, "natr": calculate_natr_14(btc_klines)},
-                        failed_filter="FILTER_6_RISK_MMR",
-                    )
+                }
+                pending_setups["1"] = {
+                    "window_id": 1,
+                    "cand": btc_cand,
+                    "natr": float(calculate_natr_14(btc_klines)),
+                    "created_at": now_ts,
+                    "expires_at": now_ts + 1800.0,
+                }
+                active_syms.add("BTCUSDT")
 
     # ===== OKNA 2 & 3: ELITNÍ ŠAMPIONI (Objem >= 10M USD) – 1m Sniper čakáreň =====
     for w_idx in ("2", "3"):
