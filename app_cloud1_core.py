@@ -80,6 +80,7 @@ def get_default_vault() -> dict:
         "pending_supabase_sync": [],
         "cell_strictness": 0.85,
         "pending_setups": {},
+        "ai_w6_feedback": [],
         "micro_weights": {
             "spoof_sensitivity": 1.0,
             "wall_frontrun_mult": 3.5,
@@ -117,6 +118,7 @@ def load_vault() -> dict:
                     })
                     state.setdefault("shadow_pool", list(state.get("shadow_trades") or []))  # migrate old key
                     state.setdefault("pending_setups", {})
+                    state.setdefault("ai_w6_feedback", [])
                     state.setdefault("micro_weights", {
                         "spoof_sensitivity": 1.0,
                         "wall_frontrun_mult": 3.5,
@@ -165,6 +167,7 @@ def load_vault() -> dict:
             })
             state.setdefault("shadow_pool", list(state.get("shadow_trades") or []))  # migrate old key
             state.setdefault("pending_setups", {})
+            state.setdefault("ai_w6_feedback", [])
             state.setdefault("micro_weights", {
                 "spoof_sensitivity": 1.0,
                 "wall_frontrun_mult": 3.5,
@@ -1856,6 +1859,9 @@ async def build_trade_setup(cand: dict, balance: float, window_id: int, vault: d
         "okx_tp2_order_id": f"{tx_id}_tp2_{window_id}",
         "okx_tp3_order_id": f"{tx_id}_tp3_{window_id}",
         "entry_fingerprint": _build_entry_fingerprint(cand, vault, mmr_cell, initial_ofd),
+        "ai_features": dict(cand.get("ai_features") or {}),
+        "ai_confidence": float(cand.get("ai_confidence", 0.0)),
+        "source": cand.get("source", ""),
     }
 
 
@@ -2550,6 +2556,24 @@ def close_position(pos: dict, exit_price: float, reason: str, vault: dict, mmr_c
             update_filter_weights_from_outcome(pos, is_win, reason, vault)
         except Exception:
             pass
+    else:
+        # Okno 6: uzavretá slučka učenia – spätná väzba pre nočný tréner (daily_train.py)
+        if pos.get("ai_features"):
+            try:
+                fb_list = list(vault.get("ai_w6_feedback") or [])
+                fb_list.append({
+                    "symbol": pos.get("symbol"),
+                    "direction": pos.get("direction"),
+                    "is_win": bool(is_win),
+                    "r_multiple": round(float(r_mult), 4),
+                    "exit_reason": str(reason),
+                    "ai_confidence": float(pos.get("ai_confidence", 0.0)),
+                    "features": dict(pos.get("ai_features") or {}),
+                    "closed_ts": time.time(),
+                })
+                vault["ai_w6_feedback"] = fb_list[-250:]
+            except Exception:
+                pass
 
     hist_row = {
         "window_id": pos["window_id"],
@@ -3565,8 +3589,8 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
                 active_syms.add(c["symbol"])
                 active_secs.add(c.get("sector") or "UNKNOWN")
 
-    # ===== OKNO 6: AI LOVEC ŠAMPIÓNOV (US SESSION - XGBOOST V3) =====
-    if vault["windows"]["6"]["status"] == "WAITING":
+    # ===== OKNO 6: AI LOVEC ŠAMPIÓNOV (US SESSION - XGBOOST V3) – 1m Sniper čakáreň =====
+    if vault["windows"]["6"]["status"] == "WAITING" and "6" not in pending_setups:
         tickers_list = list(tickers.values()) if isinstance(tickers, dict) else list(tickers)
         ai_cand = await scan_ai_champion_window6(supabase, tickers_list, active_syms)
         if ai_cand:
@@ -3578,8 +3602,13 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
                     "direction": ai_cand["direction"],
                     "is_pd": False,
                     "is_funding_trap": False,
+                    "sector": sectors_map.get(sym_6, "UNKNOWN"),
+                    "ofd": float(ai_cand.get("ofd", 1.0)),
                     "klines": klines_6,
                     "exec_price": float(ai_cand["price"]),
+                    "ai_features": dict(ai_cand.get("ai_features") or {}),
+                    "ai_confidence": float(ai_cand.get("ai_confidence", 0.0)),
+                    "source": ai_cand.get("source", "AI_CHAMPION_US_V3"),
                     "entry_fingerprint": {
                         "macro_btc_1h": float(btc_veto.get("btc_1h_pct", 0.0)),
                         "liq_vol_24h": float((tickers.get(sym_6) or {}).get("volCcy24h", 0.0)),
@@ -3591,17 +3620,14 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
                     },
                     "book_levels": [],
                 }
-                setup = await build_trade_setup(cand_payload, vault["balance"], 6, vault, client=client, mmr_cache=mmr_cache)
-                if setup:
-                    setup["ai_confidence"] = ai_cand.get("ai_confidence", 0.0)
-                    setup["source"] = ai_cand.get("source", "AI_CHAMPION_US_V3")
-                    vault["windows"]["6"] = setup
-                    vault["last_trade_opened_ts"] = time.time()
-                    mkt_notional = float(setup.get("active_margin") or 0.0) * float(setup.get("leverage") or 1)
-                    vault["balance"] = round(float(vault["balance"]) - mkt_notional * 0.0005, 4)
-                    push_active_position_row(setup, vault)
-                    active_syms.add(sym_6)
-
+                pending_setups["6"] = {
+                    "window_id": 6,
+                    "cand": cand_payload,
+                    "natr": float(calculate_natr_14(klines_6)),
+                    "created_at": now_ts,
+                    "expires_at": now_ts + 1800.0,
+                }
+                active_syms.add(sym_6)
 
 # =========================================================================
 # STREAMLIT UI (základné rozhranie – nezasahuje do core logiky vyššie)
