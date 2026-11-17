@@ -6,6 +6,7 @@ import os
 import time
 import operator
 import math
+import random
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone, timedelta
@@ -79,6 +80,11 @@ def get_default_vault() -> dict:
         "pending_supabase_sync": [],
         "cell_strictness": 0.85,
         "pending_setups": {},
+        "micro_weights": {
+            "spoof_sensitivity": 1.0,
+            "wall_frontrun_mult": 3.5,
+            "dca_wob_floor": 0.10,
+        },
     }
 
 def load_vault() -> dict:
@@ -111,6 +117,11 @@ def load_vault() -> dict:
                     })
                     state.setdefault("shadow_pool", list(state.get("shadow_trades") or []))  # migrate old key
                     state.setdefault("pending_setups", {})
+                    state.setdefault("micro_weights", {
+                        "spoof_sensitivity": 1.0,
+                        "wall_frontrun_mult": 3.5,
+                        "dca_wob_floor": 0.10,
+                    })
                     state.setdefault("shadow_trades", [])  # legacy no-op list
                     state.setdefault("last_btc_veto", {
                         "veto_long": False,
@@ -154,6 +165,11 @@ def load_vault() -> dict:
             })
             state.setdefault("shadow_pool", list(state.get("shadow_trades") or []))  # migrate old key
             state.setdefault("pending_setups", {})
+            state.setdefault("micro_weights", {
+                "spoof_sensitivity": 1.0,
+                "wall_frontrun_mult": 3.5,
+                "dca_wob_floor": 0.10,
+            })
             state.setdefault("shadow_trades", [])  # legacy no-op list
             state.setdefault("last_btc_veto", {
                 "veto_long": False,
@@ -566,6 +582,72 @@ async def fetch_okx_funding(client: httpx.AsyncClient, symbol: str) -> float:
     except Exception:
         pass
     return 0.0
+
+
+async def fetch_real_tape_cvd(client: httpx.AsyncClient, symbol: str, limit: int = 100) -> dict:
+    """
+    Real Tape CVD – zrealizované nákupné a predajné príkazy z OKX public trades.
+    Vráti tape_ofd (buy/sell volume ratio), whale_ratio a ok flag.
+    """
+    fallback = {
+        "ok": False,
+        "tape_ofd": 1.0,
+        "buy_vol": 0.0,
+        "sell_vol": 0.0,
+        "whale_ratio": 0.0,
+    }
+    inst_id = to_okx_inst_id(symbol)
+    try:
+        res = await client.get(
+            f"{OKX_API}/api/v5/market/trades",
+            params={"instId": inst_id, "limit": str(limit)},
+        )
+        if res.status_code != 200:
+            return fallback
+        data = res.json()
+        if data.get("code") != "0" or not data.get("data"):
+            return fallback
+        trades = data.get("data", [])
+        if not trades:
+            return fallback
+        sizes = []
+        buy_vol = 0.0
+        sell_vol = 0.0
+        for t in trades:
+            try:
+                sz = float(t.get("sz", 0.0) or 0.0)
+            except Exception:
+                sz = 0.0
+            if sz <= 0:
+                continue
+            sizes.append(sz)
+            side = str(t.get("side", "")).lower()
+            if side == "buy":
+                buy_vol += sz
+            elif side == "sell":
+                sell_vol += sz
+        if not sizes or (buy_vol + sell_vol) <= 0:
+            return fallback
+        avg_sz = float(sum(sizes) / max(1, len(sizes)))
+        whale_vol = 0.0
+        for t in trades:
+            try:
+                sz = float(t.get("sz", 0.0) or 0.0)
+            except Exception:
+                sz = 0.0
+            if sz > 3.0 * avg_sz:
+                whale_vol += sz
+        tape_ofd = buy_vol / max(1e-9, sell_vol)
+        whale_ratio = whale_vol / max(1e-9, buy_vol + sell_vol)
+        return {
+            "ok": True,
+            "tape_ofd": float(tape_ofd),
+            "buy_vol": float(buy_vol),
+            "sell_vol": float(sell_vol),
+            "whale_ratio": float(whale_ratio),
+        }
+    except Exception:
+        return fallback
 
 
 # =========================================================================
@@ -1029,6 +1111,11 @@ def update_filter_weights_from_outcome(pos: dict, is_win: bool, reason: str, vau
         "macro": 1.0, "liq": 1.0, "ofd": 1.0,
         "shield": 1.0, "micro": 1.0, "risk": 1.0,
     })
+    mw = vault.setdefault("micro_weights", {
+        "spoof_sensitivity": 1.0,
+        "wall_frontrun_mult": 3.5,
+        "dca_wob_floor": 0.10,
+    })
     reason_u = (reason or "").upper()
     failed = (pos.get("failed_filter") or "").upper() if pos else ""
     fp = (pos.get("entry_fingerprint") or {}) if pos else {}
@@ -1041,6 +1128,29 @@ def update_filter_weights_from_outcome(pos: dict, is_win: bool, reason: str, vau
         for k in list(weights.keys()):
             weights[k] = float(np.clip(float(weights.get(k, 1.0)), 0.70, 1.40))
         vault["filter_weights"] = weights
+
+    # --- micro_weights adaptive learning (spoof / wall / DCA absorption) ---
+    if "SPOOF" in reason_u:
+        mw["spoof_sensitivity"] = float(np.clip(
+            float(mw.get("spoof_sensitivity", 1.0)) + (0.04 if not is_win else -0.02),
+            0.70, 1.40,
+        ))
+    if "WALL_FRONTRUN" in reason_u and is_win:
+        mw["wall_frontrun_mult"] = float(np.clip(
+            float(mw.get("wall_frontrun_mult", 3.5)) - 0.05,
+            2.2, 5.0,
+        ))
+    if not is_win and (bool(pos.get("dca1_filled")) or bool(pos.get("dca2_filled"))):
+        mw["dca_wob_floor"] = float(np.clip(
+            float(mw.get("dca_wob_floor", 0.10)) + 0.03,
+            -0.10, 0.35,
+        ))
+    if is_win:
+        mw["dca_wob_floor"] = float(np.clip(
+            float(mw.get("dca_wob_floor", 0.10)) - 0.01,
+            -0.10, 0.35,
+        ))
+    vault["micro_weights"] = mw
 
     # --- Shadow incubator feedback ---
     if "SHADOW_WIN" in reason_u:
@@ -1110,9 +1220,13 @@ def check_anti_extreme_shield(
     is_btc: bool = False,
     filter_ctx: dict | None = None,
 ) -> bool:
+    """
+    Hard Safety Gates only (2-layer filter).
+    Impulse size and EMA20 distance are left to 1m Sniper timing.
+    Keeps: wick > 0.50, structural side of EMA20, extreme RSI 14 (>82 / <18).
+    """
     if len(klines) < 20:
         return False
-    ctx = filter_ctx or {}
     df = pd.DataFrame(klines, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "cf"])
     for col in ("o", "h", "l", "c"):
         df[col] = df[col].astype(float)
@@ -1124,58 +1238,23 @@ def check_anti_extreme_shield(
     if candle_range > 0:
         upper_wick = last_h - max(last_o, last_c)
         lower_wick = min(last_o, last_c) - last_l
-        if direction == "LONG" and (upper_wick / candle_range) > 0.45:
+        # Hard wick gate (symmetrical)
+        if direction == "LONG" and (upper_wick / candle_range) > 0.50:
             return False
-        if direction == "SHORT" and (lower_wick / candle_range) > 0.45:
+        if direction == "SHORT" and (lower_wick / candle_range) > 0.50:
             return False
-    prev_c = df["c"].shift(1)
-    tr = pd.concat((df["h"] - df["l"], (df["h"] - prev_c).abs(), (df["l"] - prev_c).abs()), axis=1).max(axis=1)
-    atr_14 = float(tr.rolling(14).mean().iloc[-1])
     ema_20 = float(df["c"].ewm(span=20, adjust=False).mean().iloc[-1])
-    std_20 = float(df["c"].rolling(20).std().iloc[-1])
-    if atr_14 <= 0 or np.isnan(atr_14) or np.isnan(std_20):
-        return False
-    # Štrukturálny trendový filter: nekupuj pod EMA20 / neshortuj nad EMA20
+    # Structural trend: no LONG under EMA20 / no SHORT above EMA20
     if direction == "LONG" and last_c <= ema_20:
         return False
     if direction == "SHORT" and last_c >= ema_20:
         return False
-    # Anti-Chasing: aktuálna 15m sviečka už urobila príliš veľký impulz
-    if abs(last_c - last_o) > (1.25 * atr_14):
-        return False
-    # SYSTEM A: adaptive RSI from filter_ctx (strictness × w_shield)
-    ctx_rsi_high = float(ctx.get("rsi_high", 78.0))
-    ctx_rsi_low = float(ctx.get("rsi_low", 22.0))
-    if is_pd:
-        max_atr_dist = 2.0
-        rsi_high, rsi_low = max(ctx_rsi_high, 78.0), min(ctx_rsi_low, 22.0)
-        skip_bb = True
-    elif is_btc:
-        max_atr_dist = 1.4
-        rsi_high, rsi_low = min(75.0, ctx_rsi_high), max(25.0, ctx_rsi_low)
-        skip_bb = True
-    else:
-        # Štandardný režim: BB filter vypnutý; ATR + adaptive RSI
-        max_atr_dist = 1.4
-        rsi_high, rsi_low = ctx_rsi_high, ctx_rsi_low
-        skip_bb = True
-    bb_upper = ema_20 + (2.0 * std_20)
-    bb_lower = ema_20 - (2.0 * std_20)
-    if direction == "LONG":
-        if (last_c - ema_20) > (max_atr_dist * atr_14):
-            return False
-        if not skip_bb and last_c > bb_upper:
-            return False
-    else:
-        if (ema_20 - last_c) > (max_atr_dist * atr_14):
-            return False
-        if not skip_bb and last_c < bb_lower:
-            return False
+    # Extreme RSI hard caps (independent of adaptive soft thresholds)
     rsi_14 = calculate_rsi_14(df["c"])
     if not np.isnan(rsi_14):
-        if direction == "LONG" and rsi_14 > rsi_high:
+        if direction == "LONG" and rsi_14 > 82.0:
             return False
-        if direction == "SHORT" and rsi_14 < rsi_low:
+        if direction == "SHORT" and rsi_14 < 18.0:
             return False
     return True
 
@@ -1436,7 +1515,8 @@ async def evaluate_candidates(
                             )
                         return None
                     vol_norm = np.log1p(vol)
-                    sas_score = (abs(price_change_pct) + 1.0) * (ofd if direction == "LONG" else (1.0 / max(0.1, ofd))) * (10.0 / vol_norm)
+                    soft_m = float((fctx or {}).get("soft_mult", 1.0))
+                    sas_score = (abs(price_change_pct) + 1.0) * (ofd if direction == "LONG" else (1.0 / max(0.1, ofd))) * (10.0 / vol_norm) * soft_m
                     # Entry fingerprint for closed-loop credit assignment
                     # micro_* musia byť reálne z verify (inak credit assignment skresľuje MMR/filtre)
                     try:
@@ -1653,9 +1733,14 @@ async def build_trade_setup(cand: dict, balance: float, window_id: int, vault: d
     min_notional = await okx_min_notional_usd(sym, price, client=client)
     min_margin = min_notional / max(1, leverage)
 
+    hard_cap_margin = balance * max_risk_pct
     if kelly_margin < min_margin:
-        return None
-    margin_usd = kelly_margin
+        if min_margin <= hard_cap_margin and balance >= min_margin * 1.5:
+            margin_usd = min_margin
+        else:
+            return None
+    else:
+        margin_usd = kelly_margin
 
     # Exact size-dependent VWAP from Depth-20 levels captured at verify (0 extra API)
     book_levels = cand.get("book_levels") or []
@@ -1694,7 +1779,8 @@ async def build_trade_setup(cand: dict, balance: float, window_id: int, vault: d
         tp1 = price * (1.0 + dir_mult * ((1.0 * natr * tp_mod) / 100.0 + cost_rate))
         tp2 = price * (1.0 + dir_mult * ((1.8 * natr * tp_mod) / 100.0 + cost_rate))
 
-    sl_price = price * (1.0 - dir_mult * sl_pct)
+    sl_jitter = random.uniform(0.0005, 0.0018)
+    sl_price = price * (1.0 - dir_mult * (sl_pct + sl_jitter))
 
     # 8. OPRAVA ASYMETRIE LIKVIDAČNÍ ZÓNY (TP3)
     recent_klines = klines[-20:]
@@ -1746,7 +1832,7 @@ async def build_trade_setup(cand: dict, balance: float, window_id: int, vault: d
         "entry_price": price,
         "dca1_price": dca1, "dca1_filled": False,
         "dca2_price": dca2, "dca2_filled": False,
-        "dca3_price": 0.0, "dca3_filled": True,
+        "dca3_price": 0.0, "dca3_filled": False,
         "tp1_price": tp1, "tp1_hit": False,
         "tp2_price": tp2, "tp2_hit": False,
         "tp3_price": tp3,
@@ -1849,6 +1935,10 @@ def update_mmr_cell_values(rx: int, ry: int, outcome: float, r_multiple: float, 
             reason_mult = 0.45
             sl_delta = +0.015 * weight
             tp_delta = 0.0
+        elif "TIME_STOP" in reason_u:
+            reason_mult = 0.50
+            sl_delta = +0.01 * weight
+            tp_delta = -0.015 * weight
         else:
             reason_mult = 1.00
             sl_delta = +0.035 * weight
@@ -2042,31 +2132,39 @@ async def verify_execution_confirmation(
     filter_ctx: dict | None = None,
 ) -> tuple[bool, float]:
     """
-    Verifikace exekuce 2.0: Spojuje asynchronní datové mikroskopy z OKX hloubky 20.
-    Filtruje slippage, kontroluje WOB Imbalanci a aktivuje toxický VPIN štít.
+    2-vrstvový filter: Hard Safety Gates + Soft Scoring multipliers.
+    Hard gates return False; soft factors only scale soft_mult into filter_ctx.
     """
     if len(klines_15m) < 12:
         return False, 0.0
 
-    # 1. Objemový filtr aktivity (Ochrana proti šumu a nelikvidním fázím)
+    soft_mult = 1.0
+
+    # --- Soft: 15m volume impulse ---
     vols = [float(get_vol(k)) for k in klines_15m[-11:]]
     avg_prev_vol = float(np.mean(vols[:-1])) if len(vols) > 1 else 0.0
     curr_vol = vols[-1]
-    if avg_prev_vol > 0 and (curr_vol / avg_prev_vol) < 1.10:
-        return False, 0.0
+    if avg_prev_vol > 0 and curr_vol >= avg_prev_vol * 1.10:
+        soft_mult *= 1.20
+    else:
+        soft_mult *= 0.90
 
-    # 2. Makro trendový filtr (1H EMA21)
+    # --- Soft: 1H EMA21 alignment ---
     klines_1h = await fetch_okx_klines(client, symbol, "1H", 25, cache)
     if len(klines_1h) >= 21:
         closes_1h = pd.Series([float(get_close(k)) for k in klines_1h])
         ema21_1h = float(closes_1h.ewm(span=21, adjust=False).mean().iloc[-1])
         last_1h_close = float(closes_1h.iloc[-1])
-        if direction == "LONG" and last_1h_close < ema21_1h and ofd < 1.50:
-            return False, 0.0
-        if direction == "SHORT" and last_1h_close > ema21_1h and ofd > 0.65:
-            return False, 0.0
+        aligned = (
+            (direction == "LONG" and last_1h_close > ema21_1h)
+            or (direction == "SHORT" and last_1h_close < ema21_1h)
+        )
+        if aligned:
+            soft_mult *= 1.25
+        else:
+            soft_mult *= 0.85
 
-    # 3. Hĺbková mikroštruktúra (jedno API volanie cez fetch_hloubkova_mikrostruktura)
+    # --- Hard + Soft microstructure ---
     try:
         micro = await fetch_hloubkova_mikrostruktura(client, symbol, klines_15m=klines_15m, cache=cache)
         if not micro.get("ok"):
@@ -2075,31 +2173,56 @@ async def verify_execution_confirmation(
         best_ask = float(micro["best_ask"])
         best_bid = float(micro["best_bid"])
         spread_pct = float(micro["spread_pct"])
-        max_spread = 0.30 if is_pd else 0.18
+        # Hard gate: spread
+        max_spread = 0.32 if is_pd else 0.22
         if spread_pct > max_spread:
             return False, 0.0
 
-        # Preferuj VPIN z klines_15m; adaptive max from filter_ctx (SYSTEM A)
+        # Hard gate: BVC VPIN
         vpin_score = calculate_vpin_toxicity(klines_15m)
         vpin_max = float((filter_ctx or {}).get("vpin_max", 0.80))
-        if vpin_score > vpin_max:
+        if vpin_score > max(0.85, vpin_max):
             return False, 0.0
 
+        # Hard gate: extreme book imbalance only
         wob_imbalance = float(micro.get("wob_imbalance", 0.0))
-        if direction == "LONG" and wob_imbalance < -0.15:
+        if direction == "LONG" and wob_imbalance < -0.35:
             return False, 0.0
-        if direction == "SHORT" and wob_imbalance > 0.15:
+        if direction == "SHORT" and wob_imbalance > 0.35:
             return False, 0.0
 
-        # SYSTEM C – Depth-20 VWAP estimate for entry (reuse already-fetched book)
+        # Soft: Wall-to-TP1 (symmetrical – opposing side walls)
+        opp_levels = (micro.get("asks") or []) if direction == "LONG" else (micro.get("bids") or [])
+        if opp_levels and len(opp_levels) >= 5:
+            try:
+                sizes = [float(lvl[1]) for lvl in opp_levels[:15] if float(lvl[1]) > 0]
+                avg_sz = float(np.mean(sizes)) if sizes else 0.0
+                mid_px = (best_ask + best_bid) / 2.0 if (best_ask > 0 and best_bid > 0) else 0.0
+                wall_near = False
+                if avg_sz > 0 and mid_px > 0:
+                    for lvl in opp_levels[:15]:
+                        px = float(lvl[0])
+                        sz = float(lvl[1])
+                        dist_pct = abs(px - mid_px) / mid_px * 100.0
+                        if sz > 4.5 * avg_sz and dist_pct <= 1.2:
+                            wall_near = True
+                            break
+                if wall_near:
+                    soft_mult *= 0.70
+                else:
+                    soft_mult *= 1.10
+            except Exception:
+                soft_mult *= 1.0
+
+        # SYSTEM C – Depth-20 VWAP estimate for entry
         levels = (micro.get("asks") or []) if direction == "LONG" else (micro.get("bids") or [])
         fallback = best_ask if direction == "LONG" else best_bid
         exec_price = simulate_depth20_vwap(levels, notional_usd=50.0, fallback_px=fallback)
-        # Stash microstructure + raw book for exact size-dependent VWAP in build_trade_setup
         if filter_ctx is not None:
             filter_ctx["last_wob"] = float(wob_imbalance)
             filter_ctx["last_vpin"] = float(vpin_score)
             filter_ctx["book_levels"] = levels
+            filter_ctx["soft_mult"] = float(soft_mult)
         return True, exec_price
     except Exception:
         return False, 0.0
@@ -2174,21 +2297,25 @@ async def check_1m_sniper_trigger(
     direction: str,
     natr: float,
     cache: dict | None = None,
-) -> tuple[bool, float]:
+    age_sec: float = 0.0,
+) -> tuple[bool, float, bool]:
     """
-    1-minútový sniper trigger: Rolling 30m VWAP + micro break & reverse.
-    Potvrdzuje vstup až keď cena ostáva v zóne férovej hodnoty okolo VWAP
-    a aktuálna 1m sviečka prerazí high/low predchádzajúcej v smere obchodu.
+    Symetrický 1m Sniper: MM Stop-Run Reclaim, Bull/Bear Trap invalidácia,
+    Slow-Grind EMA9, Real Tape CVD potvrdenie.
+    Returns (triggered, trigger_price, invalidated).
     """
     try:
-        klines_1m = await fetch_okx_klines(client, symbol, "1m", 30, cache)
+        # Fresh data – do not rely solely on shared cache for sniper timing
+        klines_1m = await fetch_okx_klines(client, symbol, "1m", 30, None)
+        klines_15m = await fetch_okx_klines(client, symbol, "15m", 22, None)
         if not klines_1m or len(klines_1m) < 15:
-            return False, 0.0
+            return False, 0.0, False
 
-        # 30-minútový Rolling VWAP z dostupných 1m sviečok
+        # 30m Rolling VWAP
         tp_sum = 0.0
         vol_sum = 0.0
         tp_list = []
+        closes_1m = []
         for k in klines_1m:
             h = float(get_high(k))
             l = float(get_low(k))
@@ -2196,6 +2323,7 @@ async def check_1m_sniper_trigger(
             v = float(get_vol(k))
             tp = (h + l + c) / 3.0
             tp_list.append(tp)
+            closes_1m.append(c)
             tp_sum += tp * v
             vol_sum += v
         if vol_sum <= 1e-9:
@@ -2203,7 +2331,22 @@ async def check_1m_sniper_trigger(
         else:
             vwap_30m = tp_sum / vol_sum
         if vwap_30m <= 0:
-            return False, 0.0
+            return False, 0.0, False
+
+        # EMA9 on 1m closes
+        s_close = pd.Series(closes_1m, dtype=float)
+        ema9_1m = float(s_close.ewm(span=9, adjust=False).mean().iloc[-1])
+
+        # Avg volume last 5 completed 1m bars (exclude current forming if possible)
+        vols_1m = [float(get_vol(k)) for k in klines_1m]
+        avg_vol_5m = float(np.mean(vols_1m[-6:-1])) if len(vols_1m) >= 6 else float(np.mean(vols_1m[:-1] or vols_1m))
+        curr_vol = float(get_vol(klines_1m[-1]))
+
+        # EMA20 on 15m
+        ema20_15m = None
+        if klines_15m and len(klines_15m) >= 20:
+            c15 = pd.Series([float(get_close(k)) for k in klines_15m], dtype=float)
+            ema20_15m = float(c15.ewm(span=20, adjust=False).mean().iloc[-1])
 
         prev_bar = klines_1m[-2]
         curr_bar = klines_1m[-1]
@@ -2212,29 +2355,96 @@ async def check_1m_sniper_trigger(
         curr_o = float(get_open(curr_bar))
         curr_c = float(get_close(curr_bar))
 
-        max_vwap_dev = max(0.0015, (0.30 * float(natr or 1.5)) / 100.0)
+        max_vwap_dev = max(0.0020, (0.55 * float(natr or 1.5)) / 100.0)
 
+        # --- Immediate symmetrical Bull / Bear Trap invalidation ---
         if direction == "LONG":
-            # Zóna férovej ceny: nekupujeme prestrelený vrchol nad VWAP
-            if curr_c > vwap_30m * (1.0 + max_vwap_dev):
-                return False, 0.0
-            # Micro-Break & Obrat korekcie: zelená 1m + prerazenie prev high
-            if curr_c > curr_o and curr_c > prev_h:
-                return True, curr_c
-            return False, 0.0
-
-        if direction == "SHORT":
-            # Zóna férovej ceny: neshortujeme dno hlboko pod VWAP
             if curr_c < vwap_30m * (1.0 - max_vwap_dev):
-                return False, 0.0
-            # Micro-Break & Obrat korekcie: červená 1m + prerazenie prev low
-            if curr_c < curr_o and curr_c < prev_l:
-                return True, curr_c
-            return False, 0.0
+                return False, 0.0, True
+            if ema20_15m is not None and curr_c <= ema20_15m:
+                return False, 0.0, True
+        elif direction == "SHORT":
+            if curr_c > vwap_30m * (1.0 + max_vwap_dev):
+                return False, 0.0, True
+            if ema20_15m is not None and curr_c >= ema20_15m:
+                return False, 0.0, True
 
-        return False, 0.0
+        # --- 3 technical paths ---
+        tech_ok = False
+        # Path A: VWAP Pullback + Micro-Break
+        if direction == "LONG":
+            if (
+                curr_c <= vwap_30m * (1.0 + max_vwap_dev)
+                and curr_c > curr_o
+                and curr_c > prev_h
+                and curr_vol >= avg_vol_5m * 0.90
+            ):
+                tech_ok = True
+        else:
+            if (
+                curr_c >= vwap_30m * (1.0 - max_vwap_dev)
+                and curr_c < curr_o
+                and curr_c < prev_l
+                and curr_vol >= avg_vol_5m * 0.90
+            ):
+                tech_ok = True
+
+        # Path B: MM Stop-Run Reclaim
+        if not tech_ok:
+            recent_5 = klines_1m[-6:-1] if len(klines_1m) >= 6 else klines_1m[:-1]
+            if direction == "LONG":
+                dipped = any(float(get_low(k)) < vwap_30m for k in recent_5)
+                if (
+                    dipped
+                    and curr_c >= vwap_30m
+                    and curr_c > prev_h
+                    and curr_vol >= avg_vol_5m * 1.15
+                ):
+                    tech_ok = True
+            else:
+                spiked = any(float(get_high(k)) > vwap_30m for k in recent_5)
+                if (
+                    spiked
+                    and curr_c <= vwap_30m
+                    and curr_c < prev_l
+                    and curr_vol >= avg_vol_5m * 1.15
+                ):
+                    tech_ok = True
+
+        # Path C: Slow-Grind EMA9 Continuation (after age_sec >= 360)
+        if not tech_ok and float(age_sec or 0.0) >= 360.0:
+            if direction == "LONG":
+                if (
+                    curr_c >= vwap_30m
+                    and curr_c > ema9_1m
+                    and curr_c > curr_o
+                    and curr_c > prev_h
+                ):
+                    tech_ok = True
+            else:
+                if (
+                    curr_c <= vwap_30m
+                    and curr_c < ema9_1m
+                    and curr_c < curr_o
+                    and curr_c < prev_l
+                ):
+                    tech_ok = True
+
+        if not tech_ok:
+            return False, 0.0, False
+
+        # --- Real Tape CVD confirmation ---
+        tape = await fetch_real_tape_cvd(client, symbol, limit=100)
+        if tape.get("ok"):
+            tape_ofd = float(tape.get("tape_ofd", 1.0))
+            if direction == "LONG" and tape_ofd < 1.12:
+                return False, 0.0, False
+            if direction == "SHORT" and tape_ofd > 0.88:
+                return False, 0.0, False
+
+        return True, curr_c, False
     except Exception:
-        return False, 0.0
+        return False, 0.0, False
 
 
 
@@ -2569,13 +2779,18 @@ async def run_core_cycle(vault: dict):
                     if not cand.get("symbol") or not cand.get("direction"):
                         pending_setups.pop(w_idx, None)
                         continue
-                    ok_trig, trig_px = await check_1m_sniper_trigger(
+                    age_sec = now_ts - float(item.get("created_at", now_ts) or now_ts)
+                    ok_trig, trig_px, invalidated = await check_1m_sniper_trigger(
                         client,
                         cand["symbol"],
                         cand["direction"],
                         float(item.get("natr", 2.0) or 2.0),
                         cache=klines_cache,
+                        age_sec=age_sec,
                     )
+                    if invalidated:
+                        pending_setups.pop(w_idx, None)
+                        continue
                     if not ok_trig:
                         continue
                     cand = dict(cand)
@@ -2632,27 +2847,41 @@ async def run_core_cycle(vault: dict):
                         if sym in tick_micro_cache:
                             continue
                         klines = await fetch_okx_klines(client, sym, "15m", 15, klines_cache)
-                        book_data: dict = {}
                         vpin_score = 0.0
                         ofd = float(pos.get("cached_ofd", 1.0))
                         if klines:
                             ofd = compute_ofd_from_klines(klines)
                             pos["cached_ofd"] = ofd
                             vpin_score = calculate_vpin_toxicity(klines)
-                            # BOD 1: zjednotený Order Book cez fetch_hloubkova_mikrostruktura
-                            micro = await fetch_hloubkova_mikrostruktura(
-                                client, sym, klines_15m=klines, cache=klines_cache
-                            )
-                            book_data = (
-                                {"bids": micro["bids"], "asks": micro["asks"]}
-                                if micro.get("ok") else {}
-                            )
                         tick_micro_cache[sym] = {
                             "klines": klines,
-                            "book_data": book_data,
                             "vpin_score": vpin_score,
                             "ofd": ofd,
                         }
+
+                # 1s Order Book radar – výhradne pre unikátne symboly aktívnych pozícií
+                unique_syms = list({pos["symbol"] for _, pos in active_windows if pos.get("symbol")})
+                book_by_sym: dict = {}
+                if unique_syms:
+                    async def _fetch_ob_1s(sym: str):
+                        kl = (tick_micro_cache.get(sym) or {}).get("klines") or []
+                        try:
+                            micro = await fetch_hloubkova_mikrostruktura(
+                                client, sym, klines_15m=kl, cache=klines_cache
+                            )
+                            if micro.get("ok"):
+                                return sym, {
+                                    "bids": micro.get("bids") or [],
+                                    "asks": micro.get("asks") or [],
+                                    "wob": float(micro.get("wob_imbalance", 0.0)),
+                                }
+                        except Exception:
+                            pass
+                        return sym, {"bids": [], "asks": [], "wob": 0.0}
+
+                    ob_results = await asyncio.gather(*(_fetch_ob_1s(s) for s in unique_syms))
+                    for sym, pack in ob_results:
+                        book_by_sym[sym] = pack
 
                 # --- Rýchla frekvencia: kompletná správa pozície každú 1 s ---
                 for win_key, pos in list(active_windows):
@@ -2673,9 +2902,16 @@ async def run_core_cycle(vault: dict):
 
                     micro_pack = tick_micro_cache.get(sym) or {}
                     klines = micro_pack.get("klines") or []
-                    book_data = micro_pack.get("book_data") or {}
+                    ob_pack = book_by_sym.get(sym) or {}
+                    book_data = {"bids": ob_pack.get("bids") or [], "asks": ob_pack.get("asks") or []}
+                    curr_wob = float(ob_pack.get("wob", 0.0))
                     vpin_score = float(micro_pack.get("vpin_score") or 0.0)
                     ofd = float(micro_pack.get("ofd") if micro_pack.get("ofd") is not None else pos.get("cached_ofd", 1.0))
+                    mw = vault.get("micro_weights") or {
+                        "spoof_sensitivity": 1.0,
+                        "wall_frontrun_mult": 3.5,
+                        "dca_wob_floor": 0.10,
+                    }
 
                     # SYSTEM D – intrabar wick levels z aktuálnej 15m sviečky
                     # DÔLEŽITÉ: wick pred opened_at sa NESMIE použiť na Hard SL / Liquidation
@@ -2749,6 +2985,33 @@ async def run_core_cycle(vault: dict):
                             position_closed_in_tick = True
                             continue
 
+                    # A2. SPOOFING / LIQUIDITY PULL ESCAPE – kniha + Real Tape CVD
+                    prev_wob = float(pos.get("last_wob_imbalance", curr_wob))
+                    pos["last_wob_imbalance"] = float(curr_wob)
+                    spoof_drop_thr = 0.45 / max(0.5, float(mw.get("spoof_sensitivity", 1.0)))
+                    spoof_suspect = (
+                        (is_long and (prev_wob - curr_wob) > spoof_drop_thr)
+                        or ((not is_long) and (curr_wob - prev_wob) > spoof_drop_thr)
+                    )
+                    if spoof_suspect:
+                        entry_px = float(pos.get("entry_price") or curr_price)
+                        loss_pct = abs(curr_price - entry_px) / max(1e-9, entry_px) * 100.0
+                        in_loss_02 = (
+                            ((is_long and curr_price < entry_px) or ((not is_long) and curr_price > entry_px))
+                            and loss_pct > 0.20
+                        )
+                        if in_loss_02:
+                            try:
+                                tape = await fetch_real_tape_cvd(client, sym, limit=100)
+                            except Exception:
+                                tape = {"ok": False}
+                            real_flow = float(tape["tape_ofd"]) if tape.get("ok") else float(ofd)
+                            if (is_long and real_flow < 0.85) or ((not is_long) and real_flow > 1.15):
+                                close_position(pos, curr_price, "SPOOF_COLLAPSE_ESCAPE", vault, mmr_cache=mmr_cache)
+                                db_dirty = True
+                                position_closed_in_tick = True
+                                continue
+
                     # B. SHADOW OBI BARRIER (PAPER) – LONG aj SHORT
                     # SL smie posunúť len smerom k zisku a max na 40 % vzdialenosti k aktuálnej cene
                     # (zabraňuje utiahnutiu SL tesne pod/nad cenu → okamžitý wick-out)
@@ -2789,7 +3052,7 @@ async def run_core_cycle(vault: dict):
                                 paper_amend_sl(pos, shadow_sl, "SHADOW_OBI_SHORT")
                                 db_dirty = True
 
-                    # C. RISK-CAPPED DCA (max 2 úrovne) s OFD filtrom a dynamickým SL
+                    # C. RISK-CAPPED DCA (max 2 úrovne) s OFD + WOB + Real Tape CVD
                     if not pos["is_pd"]:
                         cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
                         tp_mod = pos.get("tp_mod", 1.0)
@@ -2803,6 +3066,18 @@ async def run_core_cycle(vault: dict):
                                 continue
                             # OFD filter spomalenia tlaku – nerieď v extrémnom protitlaku
                             if (is_long and ofd < 0.70) or (not is_long and ofd > 1.30):
+                                continue
+                            # Pasívna opora v 1s knihe (DCA absorption floor)
+                            wob_floor = float(mw.get("dca_wob_floor", 0.10))
+                            if (is_long and curr_wob < wob_floor) or ((not is_long) and curr_wob > -wob_floor):
+                                continue
+                            # Real Tape CVD – výplach sa už musí zastaviť
+                            try:
+                                tape_dca = await fetch_real_tape_cvd(client, sym, limit=100)
+                            except Exception:
+                                tape_dca = {"ok": False}
+                            real_flow_dca = float(tape_dca["tape_ofd"]) if tape_dca.get("ok") else float(ofd)
+                            if (is_long and real_flow_dca < 0.78) or ((not is_long) and real_flow_dca > 1.22):
                                 continue
 
                             added_m = pos["margin_usd"] * pct
@@ -2836,27 +3111,83 @@ async def run_core_cycle(vault: dict):
                             pos["tp1_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.0 * natr * tp_mod) / 100.0 + cost_rate))
                             pos["tp2_price"] = pos["entry_price"] * (1.0 + dir_mult * ((1.8 * natr * tp_mod) / 100.0 + cost_rate))
 
-                    # D. FÁZOVANÝ SCALE-OUT (TP1 & TP2) S REŽIMOVÝM TSL
+                    # D. FÁZOVANÝ SCALE-OUT (TP1 & TP2) S REŽIMOVÝM TSL + WALL FRONT-RUN
                     # ZMENA 1+3: same-bar + širší BE + 5min BE freeze / trail delay + voľnejší post-TP1 trail
                     _tp1_just_hit = False
-                    if not pos.get("tp1_hit", False):
-                        if (is_long and (curr_price >= pos["tp1_price"] or candle_high >= pos["tp1_price"])) or (not is_long and (curr_price <= pos["tp1_price"] or candle_low <= pos["tp1_price"])):
-                            # Odprodej 50 % pozice tržním scale-outem
-                            execute_scale_out(pos, curr_price, 0.50, "TP1_SCALE_OUT", vault, tick_dt)
-                            pos["tp1_hit"] = True
-                            pos["tsl_active"] = True
-                            pos["extreme_price"] = curr_price
-                            pos["tp1_hit_ts"] = float(tick_ts)
-                            _tp1_just_hit = True
+                    frontrun_mult = float(mw.get("wall_frontrun_mult", 3.5))
 
-                            # Čistý Break-Even po TP1: len krytie nákladov (cost_rate + 0.08 %)
-                            cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
-                            be_pad = float(cost_rate) + 0.0008
-                            be_lock = pos["entry_price"] * (1.0 + dir_mult * be_pad)
-                            paper_amend_sl(pos, be_lock, "BE_LOCK_AFTER_TP1")
-                            db_dirty = True
+                    def _has_massive_wall(book: dict, is_long_side: bool, px_lo: float, px_hi: float, mult: float) -> bool:
+                        levels = (book.get("asks") or []) if is_long_side else (book.get("bids") or [])
+                        if not levels:
+                            return False
+                        try:
+                            sizes = [float(lvl[1]) for lvl in levels[:20] if float(lvl[1]) > 0]
+                            if not sizes:
+                                return False
+                            avg_sz = float(sum(sizes) / len(sizes))
+                            lo, hi = (min(px_lo, px_hi), max(px_lo, px_hi))
+                            for lvl in levels[:20]:
+                                px = float(lvl[0])
+                                sz = float(lvl[1])
+                                if lo <= px <= hi and sz > mult * avg_sz:
+                                    return True
+                        except Exception:
+                            return False
+                        return False
+
+                    if not pos.get("tp1_hit", False):
+                        entry_px = float(pos.get("entry_price") or curr_price)
+                        tp1_px = float(pos.get("tp1_price") or 0.0)
+                        # Wall Front-Run pred TP1 (≥ 85 % cesty k TP1)
+                        if tp1_px > 0:
+                            path_tp1 = abs(tp1_px - entry_px)
+                            prog_tp1 = abs(curr_price - entry_px)
+                            if path_tp1 > 1e-12 and (prog_tp1 / path_tp1) >= 0.85:
+                                flow_weak = (is_long and ofd < 1.10) or ((not is_long) and ofd > 0.90)
+                                if flow_weak and _has_massive_wall(book_data, is_long, curr_price, tp1_px, frontrun_mult):
+                                    execute_scale_out(pos, curr_price, 0.50, "TP1_WALL_FRONTRUN", vault, tick_dt)
+                                    pos["tp1_hit"] = True
+                                    pos["tsl_active"] = True
+                                    pos["extreme_price"] = curr_price
+                                    pos["tp1_hit_ts"] = float(tick_ts)
+                                    _tp1_just_hit = True
+                                    cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
+                                    be_pad = float(cost_rate) + 0.0008
+                                    be_lock = pos["entry_price"] * (1.0 + dir_mult * be_pad)
+                                    paper_amend_sl(pos, be_lock, "BE_LOCK_AFTER_TP1")
+                                    db_dirty = True
+
+                        if not pos.get("tp1_hit", False):
+                            if (is_long and (curr_price >= pos["tp1_price"] or candle_high >= pos["tp1_price"])) or (not is_long and (curr_price <= pos["tp1_price"] or candle_low <= pos["tp1_price"])):
+                                # Odprodej 50 % pozice tržním scale-outem
+                                execute_scale_out(pos, curr_price, 0.50, "TP1_SCALE_OUT", vault, tick_dt)
+                                pos["tp1_hit"] = True
+                                pos["tsl_active"] = True
+                                pos["extreme_price"] = curr_price
+                                pos["tp1_hit_ts"] = float(tick_ts)
+                                _tp1_just_hit = True
+
+                                # Čistý Break-Even po TP1: len krytie nákladov (cost_rate + 0.08 %)
+                                cost_rate = pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
+                                be_pad = float(cost_rate) + 0.0008
+                                be_lock = pos["entry_price"] * (1.0 + dir_mult * be_pad)
+                                paper_amend_sl(pos, be_lock, "BE_LOCK_AFTER_TP1")
+                                db_dirty = True
 
                     if pos.get("tp1_hit", False) and not pos.get("tp2_hit", False):
+                        # Wall Front-Run pred TP2 (≥ 85 % cesty k TP2)
+                        entry_px = float(pos.get("entry_price") or curr_price)
+                        tp2_px = float(pos.get("tp2_price") or 0.0)
+                        if tp2_px > 0:
+                            path_tp2 = abs(tp2_px - entry_px)
+                            prog_tp2 = abs(curr_price - entry_px)
+                            if path_tp2 > 1e-12 and (prog_tp2 / path_tp2) >= 0.85:
+                                flow_weak2 = (is_long and ofd < 1.10) or ((not is_long) and ofd > 0.90)
+                                if flow_weak2 and _has_massive_wall(book_data, is_long, curr_price, tp2_px, frontrun_mult):
+                                    execute_scale_out(pos, curr_price, 0.60, "TP2_WALL_FRONTRUN", vault, tick_dt)
+                                    pos["tp2_hit"] = True
+                                    pos["extreme_price"] = curr_price
+                                    db_dirty = True
                         if is_long and curr_price > pos["extreme_price"]:
                             pos["extreme_price"] = curr_price
                         elif not is_long and curr_price < pos["extreme_price"]:
@@ -2905,7 +3236,7 @@ async def run_core_cycle(vault: dict):
                                 pos["tp3_zone_entered_at"] = tick_ts
 
                             time_in_zone = tick_ts - float(pos.get("tp3_zone_entered_at") or tick_ts)
-                            min_time_in_zone = 45.0  # minimálne 45 sekúnd v radarovej zóne pred climax exitom
+                            min_time_in_zone = 3.0  # minimálne 45 sekúnd v radarovej zóne pred climax exitom
 
                             # Detekce likvidačního šílenství (silné OFD vyvolané nucenými příkazy protistrany)
                             liquidation_climax = (is_long and ofd > 1.65) or (not is_long and ofd < 0.35)
@@ -2925,6 +3256,23 @@ async def run_core_cycle(vault: dict):
                             if (is_long and new_tsl > pos["sl_tsl_price"]) or (not is_long and new_tsl < pos["sl_tsl_price"]):
                                 paper_amend_sl(pos, new_tsl, "POST_TP2_TSL")
                                 db_dirty = True
+
+                    # E2. DVOJSTUPŇOVÝ TIME-STOP
+                    # Pravidlo 1: mŕtvy chop pred TP1 (≥ 90 min, pohyb < 0.45 × NATR)
+                    if not pos.get("tp1_hit", False) and age_sec >= 5400.0:
+                        entry_px_ts = float(pos.get("entry_price") or curr_price)
+                        move_pct = abs(curr_price - entry_px_ts) / max(1e-9, entry_px_ts) * 100.0
+                        if move_pct < 0.45 * float(natr or 2.0):
+                            close_position(pos, curr_price, "TIME_STOP_CHOP", vault, mmr_cache=mmr_cache)
+                            db_dirty = True
+                            position_closed_in_tick = True
+                            continue
+                    # Pravidlo 2: stagnácia po TP1 (≥ 4 hodiny)
+                    if pos.get("tp1_hit", False) and age_sec >= 14400.0:
+                        close_position(pos, curr_price, "TIME_STOP_STAGNANT", vault, mmr_cache=mmr_cache)
+                        db_dirty = True
+                        position_closed_in_tick = True
+                        continue
 
                     # F. VYHODNOCENÍ ZÁSAHU TVRDÉHO SL / TSL NA BURZE (paper)
                     # LONG:  hit ak curr_price/eff_low  <= SL
@@ -3204,7 +3552,7 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
                     "cand": c,
                     "natr": float(calculate_natr_14(c["klines"])) if c.get("klines") else 2.0,
                     "created_at": now_ts,
-                    "expires_at": now_ts + 900.0,
+                    "expires_at": now_ts + 1800.0,
                 }
                 active_syms.add(c["symbol"])
                 active_secs.add(c.get("sector") or "UNKNOWN")
@@ -3220,7 +3568,7 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
                     "cand": c,
                     "natr": float(calculate_natr_14(c["klines"])) if c.get("klines") else 2.0,
                     "created_at": now_ts,
-                    "expires_at": now_ts + 900.0,
+                    "expires_at": now_ts + 1800.0,
                 }
                 active_syms.add(c["symbol"])
                 active_secs.add(c.get("sector") or "UNKNOWN")
@@ -3804,6 +4152,35 @@ def main_ui():
         with cols[i % 3]:
             pos = windows.get(win_key, {"status": "WAITING"})
             render_window_card(win_key, pos)
+
+    # 1m Sniper čakáreň + lievik (reject_stats)
+    st.divider()
+    st.subheader("1m Sniper čakáreň & Lievik")
+    pending = vault.get("pending_setups") or {}
+    now_ui = time.time()
+    if not pending:
+        st.caption("1m Sniper čakáreň: prázdna")
+    else:
+        for pk, item in sorted(pending.items(), key=lambda x: str(x[0])):
+            cand = (item or {}).get("cand") or {}
+            sym_p = cand.get("symbol") or "?"
+            dir_p = cand.get("direction") or "?"
+            exp_at = float((item or {}).get("expires_at", 0) or 0)
+            left = max(0, int(exp_at - now_ui))
+            st.write(
+                f"Okno {pk}: **{sym_p}** ({dir_p}) – čaká na 1m VWAP/Tape trigger, "
+                f"vyprší za **{left}s**"
+            )
+    rs = vault.get("reject_stats") or {}
+    st.caption(
+        "Lievik zamietnutí — "
+        f"Macro: {int(rs.get('macro', 0))} · "
+        f"Liq: {int(rs.get('liq', 0))} · "
+        f"OFD: {int(rs.get('ofd', 0))} · "
+        f"Shield: {int(rs.get('shield', 0))} · "
+        f"Micro: {int(rs.get('micro', 0))} · "
+        f"Risk: {int(rs.get('risk', 0))}"
+    )
 
     # BTC Veto info
     st.divider()
