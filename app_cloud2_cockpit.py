@@ -335,6 +335,132 @@ if st.sidebar.button("🔄 Obnoviť dáta Kokpitu"):
     st.cache_data.clear()
     st.rerun()
 
+# -------------------------------------------------------------------------
+# 🖥️ DIAĽKOVÉ OVLÁDANIE CORE 1 (Oracle VPS) – príznaky v bot_vault_state.state_json (id=1)
+# -------------------------------------------------------------------------
+def _vps_update_state_json(updates: dict) -> bool:
+    """Načíta čerstvý state_json (id=1), upraví len dané kľúče a zapíše späť."""
+    try:
+        res = supabase.table("bot_vault_state").select("state_json").eq("id", 1).execute()
+        if not res.data:
+            st.sidebar.error("bot_vault_state (id=1) sa nenašiel – zápis zrušený, aby sa nepoškodil trezor.")
+            return False
+        raw = res.data[0].get("state_json") or {}
+        if isinstance(raw, str):
+            raw = json.loads(raw) or {}
+        state = dict(raw) if isinstance(raw, dict) else {}
+        state.update(updates)
+        supabase.table("bot_vault_state").upsert({
+            "id": 1,
+            "state_json": state,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+        fetch_cached_vault_state.clear()
+        return True
+    except Exception as e:
+        st.sidebar.error(f"Zápis do bot_vault_state zlyhal: {e}")
+        return False
+
+
+st.sidebar.divider()
+st.sidebar.subheader("🖥️ Ovládanie Core 1 (Oracle VPS)")
+
+vault_state = fetch_cached_vault_state()
+try:
+    _vps_hb = float(vault_state.get("last_heartbeat") or 0)
+except (TypeError, ValueError):
+    _vps_hb = 0.0
+
+_vps_online = (time.time() - _vps_hb) < 20
+_engine_cfg_on = bool(vault_state.get("auto_refresh_enabled", False))
+
+if _vps_online:
+    if _engine_cfg_on:
+        st.sidebar.success("🟢 VPS Worker: ONLINE (Engine zapnutý)")
+    else:
+        st.sidebar.success("🟢 VPS Worker: ONLINE (STANDBY – Engine vypnutý)")
+else:
+    st.sidebar.error("🔴 VPS Worker: OFFLINE")
+
+engine_on = st.sidebar.toggle(
+    "🚀 Core 1 Engine (24/7)",
+    value=bool(vault_state.get("auto_refresh_enabled", False))
+)
+if engine_on != bool(vault_state.get("auto_refresh_enabled", False)):
+    if _vps_update_state_json({"auto_refresh_enabled": bool(engine_on)}):
+        fetch_cached_vault_state.clear()
+        st.rerun()
+
+_vps_active_windows = load_active_windows(quiet=True)
+_vps_any_active = any(
+    (w or {}).get("status") == "ACTIVE" for w in _vps_active_windows.values()
+)
+
+if vault_state.get("pretrain_running"):
+    st.sidebar.info("⏳ Pre-Trainer práve beží na VPS...")
+else:
+    _pretrain_disabled = bool(engine_on) or _vps_any_active
+    if st.sidebar.button(
+        "🧠 Spustiť 7-dňový Pre-Trainer (VPS)",
+        disabled=_pretrain_disabled,
+        use_container_width=True,
+    ):
+        if _vps_update_state_json({"run_pretrain_requested": True}):
+            fetch_cached_vault_state.clear()
+            st.sidebar.success("✅ Požiadavka na Pre-Trainer odoslaná na VPS.")
+    if _pretrain_disabled:
+        st.sidebar.caption("Pre-Trainer je dostupný len keď je Engine vypnutý a žiadne okno nie je ACTIVE.")
+
+with st.sidebar.expander("🛠️ Núdzové uvoľnenie okna (VPS)", expanded=False):
+    sel_win = st.selectbox(
+        "Okno na uvoľnenie",
+        [1, 2, 3, 4, 5, 6],
+        key="vps_force_clear_win",
+    )
+    if st.button("Uvoľniť vybrané okno (WAITING)", use_container_width=True, key="vps_force_clear_btn"):
+        if _vps_update_state_json({"force_clear_window_id": int(sel_win)}):
+            try:
+                _fc_row = {
+                    "window_id": int(sel_win),
+                    "status": "WAITING",
+                    "symbol": "BTCUSDT" if int(sel_win) == 1 else None,
+                    "direction": None,
+                    "regime": None,
+                    "leverage": None,
+                    "entry_price": None,
+                    "margin_usd": 0.0,
+                    "active_margin": 0.0,
+                    "dca1_price": 0.0,
+                    "dca2_price": 0.0,
+                    "dca3_price": 0.0,
+                    "dca1_filled": False,
+                    "dca2_filled": False,
+                    "dca3_filled": False,
+                    "tp1_price": 0.0,
+                    "tp2_price": 0.0,
+                    "tp3_price": 0.0,
+                    "tp1_hit": False,
+                    "tp2_hit": False,
+                    "sl_tsl_price": 0.0,
+                    "tsl_active": False,
+                    "pnl_usd": 0.0,
+                    "pnl_percent": 0.0,
+                    "mandate_expires_at": None,
+                    "opened_at": None,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "okx_entry_order_id": None,
+                    "okx_sl_order_id": None,
+                    "okx_tp1_order_id": None,
+                    "okx_tp2_order_id": None,
+                    "okx_tp3_order_id": None,
+                }
+                _fc_res = supabase.table("active_positions").update(_fc_row).eq("window_id", int(sel_win)).execute()
+                if not _fc_res.data:
+                    supabase.table("active_positions").upsert(_fc_row, on_conflict="window_id").execute()
+                st.success(f"Okno {int(sel_win)} bolo nastavené na WAITING.")
+            except Exception as e:
+                st.error(f"Uvoľnenie okna v active_positions zlyhalo: {e}")
+
 st.sidebar.divider()
 
 window_titles = {
