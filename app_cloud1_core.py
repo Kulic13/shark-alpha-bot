@@ -84,7 +84,7 @@ def get_default_vault() -> dict:
         "last_market_breadth": 0.5,
         "last_market_dispersion": 2.0,
         "last_btc_2h_pct": 0.0,
-        "auto_refresh_enabled": True,
+        "auto_refresh_enabled": False,
         "micro_weights": {
             "spoof_sensitivity": 1.0,
             "wall_frontrun_mult": 3.5,
@@ -126,7 +126,7 @@ def load_vault() -> dict:
                     state.setdefault("last_market_breadth", 0.5)
                     state.setdefault("last_market_dispersion", 2.0)
                     state.setdefault("last_btc_2h_pct", 0.0)
-                    state.setdefault("auto_refresh_enabled", True)
+                    state.setdefault("auto_refresh_enabled", False)
                     state.setdefault("micro_weights", {
                         "spoof_sensitivity": 1.0,
                         "wall_frontrun_mult": 3.5,
@@ -176,7 +176,7 @@ def load_vault() -> dict:
             state.setdefault("shadow_pool", list(state.get("shadow_trades") or []))  # migrate old key
             state.setdefault("pending_setups", {})
             state.setdefault("ai_w6_feedback", [])
-            state.setdefault("auto_refresh_enabled", True)
+            state.setdefault("auto_refresh_enabled", False)
             state.setdefault("micro_weights", {
                 "spoof_sensitivity": 1.0,
                 "wall_frontrun_mult": 3.5,
@@ -812,6 +812,14 @@ def calculate_natr_14(klines: list) -> float:
     return float(natr)
 
 
+
+def compute_theta_timers(natr: float) -> tuple[float, float]:
+    safe_natr = max(0.5, float(natr or 1.5))
+    sniper_ttl_sec = float(np.clip(720.0 / safe_natr, 240.0, 720.0))
+    max_hold_sec = float(np.clip(2400.0 / safe_natr, 900.0, 2400.0))
+    return sniper_ttl_sec, max_hold_sec
+
+
 def compute_ofd_from_klines(klines: list) -> float:
     """
     Order-Flow Delta aproximácia z 15m sviečok.
@@ -1258,7 +1266,8 @@ def update_filter_weights_from_outcome(pos: dict, is_win: bool, reason: str, vau
         return
 
     # --- Real trade: WIN → gently relax all weights toward 1.0 ---
-    if is_win:
+    # THETA_DECAY_PROFIT_EXIT is a profit-taking exit, equivalent to TP1_WALL_FRONTRUN.
+    if is_win or reason_u in {"THETA_DECAY_PROFIT_EXIT", "TP1_WALL_FRONTRUN"}:
         for k in list(weights.keys()):
             w0 = float(weights.get(k, 1.0))
             weights[k] = float(np.clip(w0 * 0.98 + 1.0 * 0.02, 0.70, 1.40))
@@ -1998,6 +2007,7 @@ async def build_trade_setup(cand: dict, balance: float, window_id: int, vault: d
         "is_pd": is_pd,
         "is_funding_trap": cand["is_funding_trap"],
         "natr": natr,
+        "max_hold_sec": compute_theta_timers(natr)[1],
         "cost_rate": cost_rate,
         "tp_mod": tp_mod,
         "margin_usd": margin_usd,
@@ -2957,7 +2967,12 @@ async def run_core_cycle(vault: dict):
 
     pending_setups = vault.setdefault("pending_setups", {})
     for _pk in list(pending_setups.keys()):
-        if now_ts >= float((pending_setups.get(_pk) or {}).get("expires_at", 0) or 0):
+        _pending = pending_setups.get(_pk) or {}
+        _queued_ts = float(_pending.get("created_at", now_ts) or now_ts)
+        _pending_natr = float(_pending.get("natr", 1.5) or 1.5)
+        _ttl_default = compute_theta_timers(_pending_natr)[0]
+        _ttl_limit = float(_pending.get("sniper_ttl_sec") or _ttl_default)
+        if (now_ts - _queued_ts) > _ttl_limit:
             pending_setups.pop(_pk, None)
 
     active_windows = [
@@ -2988,7 +3003,11 @@ async def run_core_cycle(vault: dict):
         if pending_setups and not ny_lock:
             for w_idx, item in list(pending_setups.items()):
                 try:
-                    if now_ts >= float((item or {}).get("expires_at", 0) or 0):
+                    queued_ts = float((item or {}).get("created_at", now_ts) or now_ts)
+                    item_natr = float((item or {}).get("natr", 1.5) or 1.5)
+                    ttl_defaults = compute_theta_timers(item_natr)
+                    ttl_limit = float((item or {}).get("sniper_ttl_sec") or ttl_defaults[0])
+                    if (now_ts - queued_ts) > ttl_limit:
                         pending_setups.pop(w_idx, None)
                         continue
                     win_state = (vault.get("windows") or {}).get(w_idx) or {}
@@ -3020,6 +3039,8 @@ async def run_core_cycle(vault: dict):
                         client=client, mmr_cache=mmr_cache,
                     )
                     if setup:
+                        entry_natr = float(setup.get("natr") or item_natr)
+                        setup["max_hold_sec"] = compute_theta_timers(entry_natr)[1]
                         vault["windows"][w_idx] = setup
                         vault["last_trade_opened_ts"] = time.time()
                         mkt_notional = float(setup.get("active_margin") or 0.0) * float(setup.get("leverage") or 1)
@@ -3527,17 +3548,54 @@ async def run_core_cycle(vault: dict):
                                 pos_changed_in_tick = True
                                 db_dirty = True
 
-                    # E2. DVOJSTUPŇOVÝ TIME-STOP
-                    # Pravidlo 1: mŕtvy chop pred TP1 (≥ 90 min, pohyb < 0.45 × NATR)
-                    if not pos.get("tp1_hit", False) and age_sec >= 5400.0:
+                    # E2. VOLATILITY-ADAPTIVE THETA TIME-STOP
+                    # Všetky výpočty výnosu používajú dir_mult, takže LONG/SHORT sú symetrické.
+                    max_hold_defaults = compute_theta_timers(natr)
+                    max_hold = float(pos.get("max_hold_sec") or max_hold_defaults[1])
+                    if not pos.get("tp1_hit", False):
                         entry_px_ts = float(pos.get("entry_price") or curr_price)
-                        move_pct = abs(curr_price - entry_px_ts) / max(1e-9, entry_px_ts) * 100.0
-                        if move_pct < 0.45 * float(natr or 2.0):
-                            close_position(pos, curr_price, "TIME_STOP_CHOP", vault, mmr_cache=mmr_cache)
-                            db_dirty = True
-                            position_closed_in_tick = True
-                            continue
-                    # Pravidlo 2: stagnácia po TP1 (≥ 4 hodiny)
+                        raw_pnl_pct = (
+                            dir_mult
+                            * ((curr_price - entry_px_ts) / max(1e-9, entry_px_ts))
+                            * 100.0
+                        )
+                        cost_pct = float(
+                            pos.get("cost_rate", compute_roundtrip_cost_rate(win_id))
+                        ) * 100.0
+
+                        # Theta kompresia: od 55 % životnosti vyber čistý zisk nad nákladmi.
+                        if age_sec >= (0.55 * max_hold):
+                            if raw_pnl_pct >= (cost_pct + 0.10):
+                                close_position(
+                                    pos,
+                                    curr_price,
+                                    "THETA_DECAY_PROFIT_EXIT",
+                                    vault,
+                                    mmr_cache=mmr_cache,
+                                )
+                                db_dirty = True
+                                position_closed_in_tick = True
+                                continue
+
+                        # Dynamický chop stop: od 100 % max_hold, najneskôr pri 120 %.
+                        if age_sec >= max_hold:
+                            move_pct = abs(curr_price - entry_px_ts) / max(1e-9, entry_px_ts) * 100.0
+                            if (
+                                move_pct < 0.45 * float(natr or 1.5)
+                                or age_sec >= (1.20 * max_hold)
+                            ):
+                                close_position(
+                                    pos,
+                                    curr_price,
+                                    "TIME_STOP_CHOP",
+                                    vault,
+                                    mmr_cache=mmr_cache,
+                                )
+                                db_dirty = True
+                                position_closed_in_tick = True
+                                continue
+
+                    # Stagnácia po TP1 zostáva zachovaná (4 hodiny).
                     if pos.get("tp1_hit", False) and age_sec >= 14400.0:
                         close_position(pos, curr_price, "TIME_STOP_STAGNANT", vault, mmr_cache=mmr_cache)
                         db_dirty = True
@@ -3828,12 +3886,16 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
                         "risk_wr": 52.0,
                     },
                 }
+                btc_natr = float(calculate_natr_14(btc_klines))
+                sniper_ttl_sec, max_hold_sec = compute_theta_timers(btc_natr)
                 pending_setups["1"] = {
                     "window_id": 1,
                     "cand": btc_cand,
-                    "natr": float(calculate_natr_14(btc_klines)),
+                    "natr": btc_natr,
+                    "sniper_ttl_sec": sniper_ttl_sec,
+                    "max_hold_sec": max_hold_sec,
                     "created_at": now_ts,
-                    "expires_at": now_ts + 1800.0,
+                    "expires_at": now_ts + sniper_ttl_sec,
                 }
                 active_syms.add("BTCUSDT")
 
@@ -3843,12 +3905,16 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
             cands = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 7_000_000.0, 1e12, btc_veto, klines_cache, is_pd_mode=False, vault=vault, sectors_map=sectors_map, metrics_24h=metrics_24h)
             if cands:
                 c = cands[0]
+                cand_natr = float(calculate_natr_14(c["klines"])) if c.get("klines") else 2.0
+                sniper_ttl_sec, max_hold_sec = compute_theta_timers(cand_natr)
                 pending_setups[w_idx] = {
                     "window_id": int(w_idx),
                     "cand": c,
-                    "natr": float(calculate_natr_14(c["klines"])) if c.get("klines") else 2.0,
+                    "natr": cand_natr,
+                    "sniper_ttl_sec": sniper_ttl_sec,
+                    "max_hold_sec": max_hold_sec,
                     "created_at": now_ts,
-                    "expires_at": now_ts + 1800.0,
+                    "expires_at": now_ts + sniper_ttl_sec,
                 }
                 active_syms.add(c["symbol"])
                 active_secs.add(c.get("sector") or "UNKNOWN")
@@ -3859,12 +3925,16 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
             cands = await evaluate_candidates(client, tickers, oi_map, active_syms, active_secs, 3_500_000.0, 9_999_999.0, btc_veto, klines_cache, is_pd_mode=False, vault=vault, sectors_map=sectors_map, metrics_24h=metrics_24h)
             if cands:
                 c = cands[0]
+                cand_natr = float(calculate_natr_14(c["klines"])) if c.get("klines") else 2.0
+                sniper_ttl_sec, max_hold_sec = compute_theta_timers(cand_natr)
                 pending_setups[w_idx] = {
                     "window_id": int(w_idx),
                     "cand": c,
-                    "natr": float(calculate_natr_14(c["klines"])) if c.get("klines") else 2.0,
+                    "natr": cand_natr,
+                    "sniper_ttl_sec": sniper_ttl_sec,
+                    "max_hold_sec": max_hold_sec,
                     "created_at": now_ts,
-                    "expires_at": now_ts + 1800.0,
+                    "expires_at": now_ts + sniper_ttl_sec,
                 }
                 active_syms.add(c["symbol"])
                 active_secs.add(c.get("sector") or "UNKNOWN")
@@ -3901,12 +3971,16 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
                     },
                     "book_levels": [],
                 }
+                cand_natr = float(calculate_natr_14(klines_6))
+                sniper_ttl_sec, max_hold_sec = compute_theta_timers(cand_natr)
                 pending_setups["6"] = {
                     "window_id": 6,
                     "cand": cand_payload,
-                    "natr": float(calculate_natr_14(klines_6)),
+                    "natr": cand_natr,
+                    "sniper_ttl_sec": sniper_ttl_sec,
+                    "max_hold_sec": max_hold_sec,
                     "created_at": now_ts,
-                    "expires_at": now_ts + 1800.0,
+                    "expires_at": now_ts + sniper_ttl_sec,
                 }
                 active_syms.add(sym_6)
 
@@ -4422,7 +4496,7 @@ def main_ui():
     with c1:
         run_once = st.button("▶ Spustiť 1 cyklus", type="primary", use_container_width=True)
     with c2:
-        default_ar = bool(vault.get("auto_refresh_enabled", True))
+        default_ar = bool(vault.get("auto_refresh_enabled", False))
         auto_refresh = st.toggle("Auto-refresh (15s)", value=default_ar)
         if auto_refresh != default_ar:
             vault["auto_refresh_enabled"] = bool(auto_refresh)
