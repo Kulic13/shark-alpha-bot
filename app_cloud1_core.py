@@ -1,9 +1,12 @@
-import streamlit as st
 import httpx
 import asyncio
 import json
 import os
+import sys
 import time
+import signal
+import logging
+import threading
 import operator
 import math
 import random
@@ -13,7 +16,59 @@ from datetime import datetime, timezone, timedelta
 from supabase import create_client, Client
 from ai_window6 import scan_ai_champion_window6
 
-st.set_page_config(page_title="Shark Alpha Core (Cloud 1 - OKX)", layout="centered")
+# --- Logging (stdout -> systemd journal) ---------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+logger = logging.getLogger("core1_worker")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# --- Načítanie .env (python-dotenv + čistý ručný fallback parser) -------------------------
+def _manual_load_env_file(path: str) -> bool:
+    """Ručný parser .env súboru (KEY=VALUE, komentáre #, voliteľné úvodzovky, 'export ')."""
+    try:
+        if not os.path.isfile(path):
+            return False
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                if k and k not in os.environ:
+                    os.environ[k] = v
+        return True
+    except Exception as e:
+        logger.warning(f"Ručné načítanie .env zlyhalo ({path}): {e}")
+        return False
+
+def _load_env():
+    _base_dir = os.path.dirname(os.path.abspath(__file__))
+    _candidates = [os.path.join(_base_dir, ".env"), os.path.join(os.getcwd(), ".env")]
+    try:
+        from dotenv import load_dotenv
+        loaded_any = False
+        for _p in _candidates:
+            if os.path.isfile(_p):
+                load_dotenv(_p)
+                loaded_any = True
+        if not loaded_any:
+            load_dotenv()
+    except Exception:
+        for _p in _candidates:
+            _manual_load_env_file(_p)
+
+_load_env()
 
 # =========================================================================
 # BLOK 1: INFRAŠTRUKTÚRA, CLOUD TREZOR (SUPABASE) & ZÁLOŽNÁ CACHE
@@ -27,12 +82,13 @@ get_low = operator.itemgetter(3)
 get_close = operator.itemgetter(4)
 get_vol = operator.itemgetter(5)
 
-@st.cache_resource
 def init_supabase() -> Client:
-    url = st.secrets["SUPABASE_URL"].strip().rstrip("/")
+    url = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
     if url.endswith("/rest/v1"):
         url = url[:-8]
-    key = st.secrets["SUPABASE_KEY"].strip()
+    key = (os.environ.get("SUPABASE_KEY") or "").strip()
+    if not url or not key:
+        raise RuntimeError("Chýba SUPABASE_URL alebo SUPABASE_KEY v .env / premenných prostredia.")
     return create_client(url, key)
 
 supabase = init_supabase()
@@ -195,9 +251,35 @@ def load_vault() -> dict:
             save_vault_local(state)
             return state
     except Exception as e:
-        st.warning(f"Upozornenie: Čítanie trezoru zo Supabase zlyhalo ({e}), inicializujem predvolený trezor.")
+        logger.warning(f"Upozornenie: Čítanie trezoru zo Supabase zlyhalo ({e}), inicializujem predvolený trezor.")
 
     return get_default_vault()
+
+# Riadiace príznaky vlastní Kokpit (zapisuje ich do state_json). Worker ich pri každom
+# uložení trezoru znovu prečíta zo Supabase a stará kópia vo vault ich nesmie prepísať.
+_REMOTE_CONTROL_KEYS = ("auto_refresh_enabled", "run_pretrain_requested", "force_clear_window_id")
+# Zmeny príznakov, ktoré vykonal sám worker (napr. "Pre-Trainer prevzatý") – aplikujú sa
+# po merge so vzdialeným stavom a zmažú sa až po úspešnom zápise do Supabase.
+_PENDING_CONTROL_OVERRIDES: dict = {}
+
+def _merge_remote_control_flags_into(state: dict) -> bool:
+    """Do `state` skopíruje aktuálne riadiace príznaky zo Supabase (remote wins), potom aplikuje
+    lokálne overrides workera. Vráti False, ak sa vzdialený stav nepodarilo prečítať."""
+    try:
+        res = supabase.table("bot_vault_state").select("state_json").eq("id", 1).execute()
+        remote = res.data[0].get("state_json") if res.data else None
+        if isinstance(remote, str):
+            remote = json.loads(remote)
+        if isinstance(remote, dict):
+            for _k in _REMOTE_CONTROL_KEYS:
+                if _k in remote:
+                    state[_k] = remote[_k]
+    except Exception as e:
+        logger.warning(f"Merge riadiacich príznakov zo Supabase zlyhal: {e}")
+        return False
+    for _k, _v in _PENDING_CONTROL_OVERRIDES.items():
+        state[_k] = _v
+    return True
 
 def save_vault_local(state: dict):
     try:
@@ -209,6 +291,12 @@ def save_vault_local(state: dict):
         pass
 
 def save_vault(state: dict, sync_cloud: bool = True):
+    if sync_cloud:
+        # Race-safe: najprv čerstvé riadiace príznaky z Kokpitu, až potom zápis celého trezoru
+        if not _merge_remote_control_flags_into(state):
+            save_vault_local(state)
+            logger.warning("Cloud sync trezoru preskočený (vzdialený stav nečitateľný) – skúsim nabudúce.")
+            return
     save_vault_local(state)
     if sync_cloud:
         try:
@@ -218,8 +306,9 @@ def save_vault(state: dict, sync_cloud: bool = True):
                 "updated_at": datetime.now(timezone.utc).isoformat()
             }).execute()
             state["last_db_sync"] = time.time()
+            _PENDING_CONTROL_OVERRIDES.clear()
         except Exception as e:
-            st.error(f"Chyba ukladania trezoru do Supabase: {e}")
+            logger.error(f"Chyba ukladania trezoru do Supabase: {e}")
 
 def safe_supabase_upsert(table: str, data: dict, vault: dict):
     """
@@ -246,7 +335,7 @@ def safe_supabase_upsert(table: str, data: dict, vault: dict):
     except Exception as e:
         # neschovávať chybu úplne – aspoň do pending + varovanie
         try:
-            st.warning(f"Supabase upsert zlyhal ({table}): {e}")
+            logger.warning(f"Supabase upsert zlyhal ({table}): {e}")
         except Exception:
             pass
         vault.setdefault("pending_supabase_sync", []).append({
@@ -305,7 +394,7 @@ def force_clear_active_position(window_id: int, vault: dict):
             supabase.table("active_positions").upsert(row, on_conflict="window_id").execute()
     except Exception as e:
         try:
-            st.warning(f"Clear active_positions window {window_id} zlyhal: {e}")
+            logger.warning(f"Clear active_positions window {window_id} zlyhal: {e}")
         except Exception:
             pass
         vault.setdefault("pending_supabase_sync", []).append({
@@ -3985,45 +4074,6 @@ async def process_global_market_scanning(client: httpx.AsyncClient, vault: dict,
                 active_syms.add(sym_6)
 
 # =========================================================================
-# STREAMLIT UI (základné rozhranie – nezasahuje do core logiky vyššie)
-# =========================================================================
-
-def render_window_card(win_key: str, pos: dict):
-    """Jednoduchá karta pre jedno okno."""
-    status = pos.get("status", "WAITING")
-    symbol = pos.get("symbol") or "—"
-    direction = pos.get("direction", "")
-    leverage = pos.get("leverage", "—")
-    entry = pos.get("entry_price")
-    live_pnl_usd = pos.get("live_pnl_usd")
-    live_pnl_pct = pos.get("live_pnl_pct")
-    regime = pos.get("regime", "")
-    natr = pos.get("natr")
-
-    with st.container(border=True):
-        st.markdown(f"**Okno {win_key}**  |  `{status}`")
-        ticker_error = str(pos.get("last_ticker_error") or "").strip()
-        if ticker_error:
-            st.caption(f":red[⚠️ {ticker_error}]")
-        if status == "ACTIVE" and symbol:
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.write(f"**{symbol}**")
-                st.caption(f"{direction} ×{leverage}  |  {regime}")
-            with col2:
-                if entry is not None:
-                    st.metric("Entry", f"{entry:.6g}")
-                if natr is not None:
-                    st.caption(f"NATR: {natr:.2f}%")
-            with col3:
-                if live_pnl_usd is not None:
-                    st.metric("Live PnL", f"{live_pnl_usd:+.2f} $", f"{live_pnl_pct:+.2f}%")
-        else:
-            st.caption("Čaká na signál…")
-
-
-
-# =========================================================================
 # MODULE 4: ISOLATED HISTORICAL DRY-RUN PRE-TRAINER
 # =========================================================================
 # Sandbox ONLY updates ai_mmr_matrix + vault filter_weights / natr_history_30d.
@@ -4454,184 +4504,171 @@ async def run_historical_pretrain(vault: dict):
     save_vault(vault, sync_cloud=True)
 
 
+# =========================================================================
+# BLOK W: VPS WORKER – DIAĽKOVÉ OVLÁDANIE (SUPABASE) & 24/7 HLAVNÁ SLUČKA
+# =========================================================================
+stop_event = threading.Event()
 
-def main_ui():
-    st.title("Shark Alpha Core – Paper Trade")
-    st.caption("Cloud 1 · OKX public data · Fiktívne obchody")
 
-    # Načítanie trezoru
-    if "vault" not in st.session_state:
-        st.session_state.vault = load_vault()
+def _coerce_bool(val, default: bool = False) -> bool:
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return default
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return default
 
-    vault = st.session_state.vault
 
-    # Pri otvorení stránky: ak offline > 10 min, zmaž visuté pozície
-    purged = purge_stale_open_positions(vault)
-    if purged > 0:
-        st.warning(
-            f"Appka bola offline viac ako 10 minút. "
-            f"Zmazaných otvorených pozícií: **{purged}** (neuložené do histórie)."
+def pull_remote_control_flags(vault: dict):
+    """
+    Načíta state_json z bot_vault_state (id=1) a aktualizuje vo vault LEN riadiace kľúče:
+    auto_refresh_enabled, run_pretrain_requested, force_clear_window_id.
+    Pri sieťovom výpadku nič nemení a nikdy nehodí výnimku.
+    """
+    try:
+        res = supabase.table("bot_vault_state").select("state_json").eq("id", 1).execute()
+        if not res.data:
+            return
+        remote = res.data[0].get("state_json") or {}
+        if not isinstance(remote, dict):
+            return
+
+        vault["auto_refresh_enabled"] = _coerce_bool(
+            remote.get("auto_refresh_enabled"), _coerce_bool(vault.get("auto_refresh_enabled"), False)
         )
-        st.session_state.vault = vault
+        vault["run_pretrain_requested"] = _coerce_bool(
+            remote.get("run_pretrain_requested"), False
+        )
 
-    # Horný panel – balance + ovládanie
-    top1, top2, top3 = st.columns([2, 1, 1])
-    with top1:
-        st.metric("Balance (paper)", f"{vault.get('balance', 0):.2f} USDT")
-    with top2:
-        last_scan = vault.get("last_main_scan", 0)
-        if last_scan:
-            ago = int(time.time() - last_scan)
-            st.metric("Posledný scan", f"pred {ago}s")
-        else:
-            st.metric("Posledný scan", "—")
-    with top3:
-        ny_lock = vault.get("ny_open_lock", False)
-        st.metric("NY Lock", "AKTÍVNY" if ny_lock else "OFF")
+        raw_fc = remote.get("force_clear_window_id")
+        try:
+            fc_wid = int(raw_fc) if raw_fc is not None else None
+        except (TypeError, ValueError):
+            fc_wid = None
+        vault["force_clear_window_id"] = fc_wid
 
-    st.divider()
-
-    # Tlačidlá
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        run_once = st.button("▶ Spustiť 1 cyklus", type="primary", use_container_width=True)
-    with c2:
-        default_ar = bool(vault.get("auto_refresh_enabled", False))
-        auto_refresh = st.toggle("Auto-refresh (15s)", value=default_ar)
-        if auto_refresh != default_ar:
-            vault["auto_refresh_enabled"] = bool(auto_refresh)
+        if fc_wid is not None and 1 <= fc_wid <= 6:
+            logger.warning(f"Dialkové núdzové uvoľnenie okna {fc_wid} z Kokpitu.")
+            force_clear_active_position(fc_wid, vault)
+            vault.setdefault("windows", {})[str(fc_wid)] = {
+                "status": "WAITING",
+                "symbol": "BTCUSDT" if fc_wid == 1 else None,
+                "mandate_until": 0,
+            }
+            (vault.setdefault("pending_setups", {})).pop(str(fc_wid), None)
+            vault["force_clear_window_id"] = None
+            _PENDING_CONTROL_OVERRIDES["force_clear_window_id"] = None
             save_vault(vault, sync_cloud=True)
-    with c3:
-        if st.button("🔄 Reload vault", use_container_width=True):
-            st.session_state.vault = load_vault()
-            st.rerun()
-
-    # Spustenie jadra (zámok proti súbehu + ukladanie riadi run_core_cycle)
-    st.session_state.setdefault("is_running", False)
-    had_active_at_start = any(
-        (w or {}).get("status") == "ACTIVE"
-        for w in (vault.get("windows") or {}).values()
-    )
-    if (run_once or auto_refresh) and not st.session_state.is_running:
-        st.session_state.is_running = True
-        with st.spinner("Beží core cyklus…"):
-            try:
-                asyncio.run(run_core_cycle(st.session_state.vault))
-            except Exception as e:
-                st.error(f"Chyba v core cykle: {e}")
-            finally:
-                st.session_state.is_running = False
-
-    st.divider()
-
-    # 6 okien
-    st.subheader("Obchodné okná")
-    cols = st.columns(3)
-    windows = vault.get("windows", {})
-    for i, win_key in enumerate(["1", "2", "3", "4", "5", "6"]):
-        with cols[i % 3]:
-            pos = windows.get(win_key, {"status": "WAITING"})
-            render_window_card(win_key, pos)
-
-    with st.expander("🛠️ Núdzové uvoľnenie okna (pri zaseknutí)", expanded=False):
-        sel_win = st.selectbox(
-            "Číslo okna",
-            options=[1, 2, 3, 4, 5, 6],
-            format_func=lambda value: f"Okno {value}",
-            key="emergency_clear_window",
-        )
-        if st.button("Uvoľniť vybrané okno (WAITING)", use_container_width=True):
-            force_clear_active_position(int(sel_win), vault)
-            vault.setdefault("windows", {})[str(sel_win)] = {"status": "WAITING"}
+        elif fc_wid is not None:
+            # neplatné ID okna – zahodiť príznak aj vo Supabase, aby sa nezasekol
+            vault["force_clear_window_id"] = None
+            _PENDING_CONTROL_OVERRIDES["force_clear_window_id"] = None
             save_vault(vault, sync_cloud=True)
-            st.success(f"Okno {int(sel_win)} bolo nastavené na WAITING.")
-            st.rerun()
+    except Exception as e:
+        logger.warning(f"pull_remote_control_flags zlyhalo: {e}")
 
-    # 1m Sniper čakáreň + lievik (reject_stats)
-    st.divider()
-    st.subheader("1m Sniper čakáreň & Lievik")
-    pending = vault.get("pending_setups") or {}
-    now_ui = time.time()
-    if not pending:
-        st.caption("1m Sniper čakáreň: prázdna")
-    else:
-        for pk, item in sorted(pending.items(), key=lambda x: str(x[0])):
-            cand = (item or {}).get("cand") or {}
-            sym_p = cand.get("symbol") or "?"
-            dir_p = cand.get("direction") or "?"
-            exp_at = float((item or {}).get("expires_at", 0) or 0)
-            left = max(0, int(exp_at - now_ui))
-            st.write(
-                f"Okno {pk}: **{sym_p}** ({dir_p}) – čaká na 1m VWAP/Tape trigger, "
-                f"vyprší za **{left}s**"
-            )
-    rs = vault.get("reject_stats") or {}
-    st.caption(
-        "Lievik zamietnutí — "
-        f"Macro: {int(rs.get('macro', 0))} · "
-        f"Liq: {int(rs.get('liq', 0))} · "
-        f"OFD: {int(rs.get('ofd', 0))} · "
-        f"Shield: {int(rs.get('shield', 0))} · "
-        f"Micro: {int(rs.get('micro', 0))} · "
-        f"Risk: {int(rs.get('risk', 0))}"
-    )
 
-    # BTC Veto info
-    st.divider()
-    btc_veto = vault.get("last_btc_veto", {})
-    v1, v2, v3, v4 = st.columns(4)
-    with v1:
-        st.metric("BTC 15m %", f"{btc_veto.get('btc_15m_pct', 0):+.3f}%")
-    with v2:
-        st.metric("BTC 1h %", f"{btc_veto.get('btc_1h_pct', 0):+.3f}%")
-    with v3:
-        st.metric("Veto LONG", "ÁNO" if btc_veto.get("veto_long") else "nie")
-    with v4:
-        st.metric("Veto SHORT", "ÁNO" if btc_veto.get("veto_short") else "nie")
+def _install_signal_handlers():
+    def _handler(signum, frame):
+        logger.info(f"Prijatý signál {signum} – ukončujem worker po dokončení aktuálneho kroku...")
+        stop_event.set()
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(_sig, _handler)
+        except Exception as e:
+            logger.warning(f"Nepodarilo sa nastaviť handler pre signál {_sig}: {e}")
 
-    # ----- MODULE 4: Historické učenie (izolovaný sandbox) -----
-    st.divider()
-    st.subheader("Kalibrácia & Historické učenie")
-    has_active_trades = any(
-        (w or {}).get("status") == "ACTIVE"
-        for w in (vault.get("windows") or {}).values()
-    )
-    if has_active_trades:
-        st.info(
-            "Historické učenie je uzamknuté, kým prebieha aktívny obchod. "
-            "Odomkne sa automaticky po uzavretí všetkých pozícií."
-        )
-    pretrain_btn = st.button(
-        "Spustiť historické učenie (posledných 7 dní)",
-        disabled=has_active_trades,
-        use_container_width=True,
-    )
-    if pretrain_btn and not has_active_trades:
-        with st.spinner("Prebieha 7-dňová historická simulácia a kalibrácia matice..."):
+
+async def main_worker_loop():
+    vault = load_vault()
+    logger.info("=== Shark Alpha Core 1 Worker štartuje (headless VPS) ===")
+    logger.info(f"Aktuálny zostatok: {float(vault.get('balance', 0) or 0):.2f} USDT")
+
+    if vault.get("pretrain_running"):
+        logger.warning("Zistený zostatkový príznak pretrain_running po páde – resetujem.")
+        vault["pretrain_running"] = False
+        try:
+            save_vault(vault, sync_cloud=True)
+        except Exception as e:
+            logger.error(f"Reset pretrain_running zlyhal: {e}")
+
+    last_cloud_hb_sync = 0.0
+    try:
+        while not stop_event.is_set():
             try:
-                asyncio.run(run_historical_pretrain(st.session_state.vault))
-                st.success(
-                    "Historické učenie dokončené. "
-                    "Aktualizované: ai_mmr_matrix + filter_weights (+ NATR história). "
-                    "Live balance a okná neboli zmenené."
-                )
+                pull_remote_control_flags(vault)
+
+                if not bool(vault.get("auto_refresh_enabled", False)):
+                    # ---------------- STANDBY režim ----------------
+                    has_active = any(
+                        (w or {}).get("status") == "ACTIVE"
+                        for w in (vault.get("windows") or {}).values()
+                    )
+                    if bool(vault.get("run_pretrain_requested", False)) and not has_active:
+                        logger.info("Spúšťam 7-dňový Pre-Trainer na požiadanie z Kokpitu...")
+                        vault["pretrain_running"] = True
+                        vault["run_pretrain_requested"] = False
+                        _PENDING_CONTROL_OVERRIDES["run_pretrain_requested"] = False
+                        save_vault(vault, sync_cloud=True)
+                        try:
+                            await run_historical_pretrain(vault)
+                            logger.info("Pre-Trainer dokončený.")
+                        finally:
+                            vault["pretrain_running"] = False
+                            save_vault(vault, sync_cloud=True)
+                        last_cloud_hb_sync = time.time()
+                    else:
+                        vault["last_heartbeat"] = time.time()
+                        save_vault_local(vault)
+                        if (time.time() - last_cloud_hb_sync) >= 10.0:
+                            save_vault(vault, sync_cloud=True)
+                            last_cloud_hb_sync = time.time()
+                        await asyncio.sleep(2.0)
+                else:
+                    # ---------------- ACTIVE režim ----------------
+                    if bool(vault.get("run_pretrain_requested", False)):
+                        logger.warning("Pre-Trainer požiadavka zahodená – Engine je zapnutý.")
+                        vault["run_pretrain_requested"] = False
+                        _PENDING_CONTROL_OVERRIDES["run_pretrain_requested"] = False
+                        save_vault(vault, sync_cloud=True)
+                    await run_core_cycle(vault)
+
+                    # Kokpit číta heartbeat zo Supabase – zaisti sync aspoň každých 10 s
+                    if (time.time() - last_cloud_hb_sync) >= 10.0:
+                        if (time.time() - float(vault.get("last_db_sync", 0) or 0)) >= 10.0:
+                            save_vault(vault, sync_cloud=True)
+                        last_cloud_hb_sync = time.time()
+
+                    still_active = any(
+                        (w or {}).get("status") == "ACTIVE"
+                        for w in (vault.get("windows") or {}).values()
+                    )
+                    if still_active or bool(vault.get("pending_setups")):
+                        await asyncio.sleep(0.5)
+                    else:
+                        await asyncio.sleep(2.0)
             except Exception as e:
-                st.error(f"Historické učenie zlyhalo: {e}")
-        st.rerun()
+                logger.error(f"Neočakávaná chyba v hlavnej slučke: {e}", exc_info=True)
+                await asyncio.sleep(5.0)
+    finally:
+        logger.info("Ukladám trezor pred ukončením...")
+        try:
+            save_vault(vault, sync_cloud=True)
+        except Exception as e:
+            logger.error(f"Finálne uloženie trezoru zlyhalo: {e}")
+            try:
+                save_vault_local(vault)
+            except Exception:
+                pass
+        logger.info("=== Shark Alpha Core 1 Worker ukončený ===")
 
-    # Auto-refresh: po dual-speed 15s slučke len krátka pauza, inak 15s idle
-    if auto_refresh:
-        still_active = any(
-            (w or {}).get("status") == "ACTIVE"
-            for w in (st.session_state.vault.get("windows") or {}).values()
-        )
-        if had_active_at_start or still_active:
-            time.sleep(0.5)
-        else:
-            time.sleep(15)
-        st.rerun()
 
-
-# Vstupný bod Streamlit
-if __name__ == "__main__" or True:  # Streamlit vždy spúšťa modul
-    main_ui()
+if __name__ == "__main__":
+    _install_signal_handlers()
+    try:
+        asyncio.run(main_worker_loop())
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt – koniec.")
