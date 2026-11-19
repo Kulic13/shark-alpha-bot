@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from supabase import create_client
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.utils.class_weight import compute_sample_weight
@@ -121,6 +122,8 @@ def fetch_okx_history(symbol: str = "BTC-USDT-SWAP", total_candles: int = 3500) 
         seen.add(ts)
         uniq.append(row)
 
+    # Produkčný Window 6 používa výhradne uzatvorené 15m sviečky (OKX confirm=1).
+    uniq = [row for row in uniq if len(row) >= 9 and str(row[8]) == "1"]
     uniq = uniq[-total_candles:]
     df = pd.DataFrame(uniq, columns=["ts", "o", "h", "l", "c", "v", "vc", "vq", "cf"])
     for col in ["o", "h", "l", "c", "v"]:
@@ -145,11 +148,13 @@ def _compute_us_vwap_zscore(df: pd.DataFrame) -> pd.Series:
     z_scores = np.zeros(len(df), dtype=float)
     for i in range(len(df)):
         now_utc = times_utc.iloc[i]
-        us_open_today = now_utc.replace(hour=14, minute=30, second=0, microsecond=0)
-        if now_utc < us_open_today:
-            us_start = us_open_today - pd.Timedelta(days=1)
+        now_new_york = now_utc.tz_convert(ZoneInfo("America/New_York"))
+        us_open_today = now_new_york.replace(hour=9, minute=30, second=0, microsecond=0)
+        if now_new_york < us_open_today:
+            us_start_local = us_open_today - pd.Timedelta(days=1)
         else:
-            us_start = us_open_today
+            us_start_local = us_open_today
+        us_start = us_start_local.tz_convert("UTC")
 
         mask = times_utc.iloc[: i + 1] >= us_start
         session_idx = np.where(mask.values)[0]
@@ -261,23 +266,20 @@ def triple_barrier_labels(df: pd.DataFrame, horizon: int = 12) -> pd.Series:
             long_first = False
             short_first = False
 
-            if long_hit_tp and long_hit_sl:
-                # ambiguous same bar for LONG path
-                pass
-            elif long_hit_tp:
-                long_first = True
-            elif long_hit_sl:
-                pass  # SL first for long → not a long win
+            # OHLC bars do not reveal intrabar ordering. If both barriers for
+            # either directional path are touched in one candle, classify the
+            # observation as ambiguous WAIT immediately; never look through it.
+            if (long_hit_tp and long_hit_sl) or (short_hit_tp and short_hit_sl):
+                label = 0
+                break
 
-            if short_hit_tp and short_hit_sl:
-                pass
-            elif short_hit_tp:
+            if long_hit_tp:
+                long_first = True
+            if short_hit_tp:
                 short_first = True
-            elif short_hit_sl:
-                pass
 
             if long_first and short_first:
-                label = 0  # both sides hit same bar → WAIT
+                label = 0  # both directions touched in the same bar → WAIT
                 break
             if long_first:
                 label = 1
@@ -406,7 +408,14 @@ for frame in train_frames:
     if split < 50 or (n - split) < 20:
         print(f"  skip small frame {frame['symbol'].iloc[0]} n={n}")
         continue
-    train_part = frame.iloc[:split]
+    # Triple-barrier labels at the end of train_part may inspect up to `horizon`
+    # future candles. Purge those rows so no training label can consume test-period OHLC.
+    purge_bars = 12
+    train_end = max(0, split - purge_bars)
+    if train_end < 50:
+        print(f"  skip after purge {frame['symbol'].iloc[0]} n={n} train={train_end}")
+        continue
+    train_part = frame.iloc[:train_end]
     test_part = frame.iloc[split:]
     X_train_list.append(train_part[FEATURES])
     y_train_list.append(train_part["target"])
@@ -427,6 +436,7 @@ print(f"Test  class dist: {y_test.value_counts().to_dict()}")
 feedback_vectors = []
 feedback_targets = []
 feedback_source_weights = []
+feedback_r_multipliers = []
 feedback_count = 0
 
 try:
@@ -440,7 +450,6 @@ try:
     if feedback_res.data:
         feedback_state = feedback_res.data[0].get("state_json") or {}
         if isinstance(feedback_state, str):
-            import json
             feedback_state = json.loads(feedback_state)
 
     feedback_rows = feedback_state.get("ai_w6_feedback", []) if isinstance(feedback_state, dict) else []
@@ -465,25 +474,39 @@ try:
                 continue
 
             is_win = feedback_row.get("is_win")
+            outcome = str(feedback_row.get("outcome") or "").upper()
             direction = str(feedback_row.get("direction") or "").upper()
             if is_win is True and direction == "LONG":
                 fb_target = 1
             elif is_win is True and direction == "SHORT":
                 fb_target = 2
-            elif is_win is False:
+            elif is_win is False or outcome == "TIMEOUT":
+                # Existing loss semantics remain WAIT; expired shadow candidates
+                # are explicitly WAIT rather than silently discarded.
                 fb_target = 0
             else:
+                continue
+
+            try:
+                r_value = float(feedback_row.get("r_multiple", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(r_value):
                 continue
 
             feedback_vectors.append(feature_vector)
             feedback_targets.append(fb_target)
             source = str(feedback_row.get("source") or "SHADOW_POOL").upper()
             if source == "W6_REAL":
-                feedback_source_weights.append(3.5)
+                source_weight = 3.5
             elif source == "W15_REAL":
-                feedback_source_weights.append(2.5)
+                source_weight = 2.5
             else:
-                feedback_source_weights.append(1.5)
+                source_weight = 1.5
+            feedback_source_weights.append(source_weight)
+            # Magnitude-aware weighting: preserve the direction/WAIT labels while
+            # giving materially larger realized R outcomes more learning influence.
+            feedback_r_multipliers.append(float(np.clip(0.50 + 0.50 * abs(r_value), 0.50, 2.00)))
 except Exception as feedback_error:
     print(f"Upozornenie: ai_w6_feedback sa nepodarilo načítať: {feedback_error}")
 
@@ -498,7 +521,10 @@ if feedback_count:
 
 sample_weights = compute_sample_weight("balanced", y_train)
 if feedback_count:
-    sample_weights[-feedback_count:] = np.asarray(feedback_source_weights, dtype=float)
+    sample_weights[-feedback_count:] *= (
+        np.asarray(feedback_source_weights, dtype=float)
+        * np.asarray(feedback_r_multipliers, dtype=float)
+    )
 
 print("Trénujem XGBoost multi:softprob V5...")
 model = xgb.XGBClassifier(
@@ -520,9 +546,9 @@ preds = model.predict(X_test)
 acc = float(accuracy_score(y_test, preds))
 print(f"\nOverall accuracy (WAIT/LONG/SHORT): {acc * 100:.2f} %")
 print("\nClassification report:")
-print(classification_report(y_test, preds, target_names=["WAIT", "LONG", "SHORT"], digits=3))
+print(classification_report(y_test, preds, labels=[0, 1, 2], target_names=["WAIT", "LONG", "SHORT"], digits=3, zero_division=0))
 
-# Trading audit: rovnaký prah 0.46 a dominancia nad WAIT ako v ai_window6.
+# Trading audit: prah 0.39 + margin +0.03 nad WAIT – parity s live ai_window6.
 probs = model.predict_proba(X_test)
 # class order: 0=WAIT, 1=LONG, 2=SHORT
 prob_wait = probs[:, 0]
@@ -530,8 +556,8 @@ prob_long = probs[:, 1]
 prob_short = probs[:, 2]
 y_true = y_test.values
 
-long_mask = (prob_long >= 0.46) & (prob_long > prob_short) & (prob_long > prob_wait)
-short_mask = (prob_short >= 0.46) & (prob_short > prob_long) & (prob_short > prob_wait)
+long_mask = (prob_long >= 0.39) & (prob_long > prob_short) & (prob_long >= (prob_wait + 0.03))
+short_mask = (prob_short >= 0.39) & (prob_short > prob_long) & (prob_short >= (prob_wait + 0.03))
 
 n_long_sig = int(long_mask.sum())
 n_short_sig = int(short_mask.sum())
@@ -544,13 +570,14 @@ n_trade_sig = n_long_sig + n_short_sig
 trade_hits = long_hits + short_hits
 trade_wr = (trade_hits / n_trade_sig * 100.0) if n_trade_sig > 0 else 0.0
 
-print("\n--- Trading Audit (prob >= 0.46 and dominates WAIT) ---")
+print("\n--- Trading Audit (prob >= 0.39 and >= WAIT + 0.03) ---")
 print(f"LONG  signals: {n_long_sig:4d} | hits: {long_hits:4d} | WR: {long_wr:.2f}%")
 print(f"SHORT signals: {n_short_sig:4d} | hits: {short_hits:4d} | WR: {short_wr:.2f}%")
 print(f"COMBINED      : {n_trade_sig:4d} | hits: {trade_hits:4d} | WR: {trade_wr:.2f}%")
 
-# Store high-confidence WR if we have trades, else overall accuracy
-accuracy_to_store = trade_wr if n_trade_sig > 0 else (acc * 100.0)
+# Keep ai_models.accuracy semantically stable: always store overall test accuracy.
+# Trading win-rate remains a separate diagnostic and is printed above.
+accuracy_to_store = acc * 100.0
 
 # Feature importance (diagnostic)
 try:
@@ -580,6 +607,6 @@ supabase.table("ai_models").upsert(
 print("\n" + "=" * 60)
 print("ÚSPECH! Model V5 (xgboost_us_champion_v5) uložený v Supabase ai_models id=1.")
 print(f"accuracy field = {accuracy_to_store:.2f} % "
-      f"({'high-conf trade WR' if n_trade_sig > 0 else 'overall acc'})")
+      f"(overall test accuracy)")
 print(f"features_list = {FEATURES}")
 print("=" * 60)
