@@ -459,6 +459,91 @@ def render_dashboard_and_telemetry():
             }
             SCALE_OUT = {"TP1_SCALE_OUT", "TP2_SCALE_OUT"}
 
+            def _row_is_win(row, columns) -> bool:
+                """Single source of truth for Win/Fail classification (top summary + tab stats)."""
+                reason = str(row.get("exit_reason") or "")
+                tp1 = bool(row.get("tp1_hit", False)) if "tp1_hit" in columns else False
+                tp2 = bool(row.get("tp2_hit", False)) if "tp2_hit" in columns else False
+                try:
+                    pnl = float(row.get("pnl_usd") or 0.0)
+                except (TypeError, ValueError):
+                    pnl = 0.0
+
+                if reason in WIN_REASONS:
+                    return True
+                elif tp1 or tp2:
+                    # dosiahnutý TP → počítame ako WIN (aj keď zvyšok dotrailoval na BE)
+                    return True
+                elif reason == "HARD_SL_HIT":
+                    # Legacy MFE-ratcheted profitable stops (pre-V5.8) are wins; only pnl <= 0 is a fail.
+                    return pnl > 0
+                elif reason in FAIL_REASONS:
+                    return False
+                return pnl > 0
+
+            def _compute_tab_trade_stats(df_sub: pd.DataFrame) -> dict:
+                """Per-tab stats: 1 closed trade = 1 row (partial scale-outs excluded from Win Rate / counts)."""
+                if "exit_reason" in df_sub.columns:
+                    _r = df_sub["exit_reason"].fillna("").astype(str)
+                    df_closed = df_sub.loc[~_r.isin(SCALE_OUT)].copy()
+                else:
+                    df_closed = df_sub.copy()
+
+                wins = 0
+                losses = 0
+                for _, _row in df_closed.iterrows():
+                    if _row_is_win(_row, df_closed.columns):
+                        wins += 1
+                    else:
+                        losses += 1
+                closed_count = wins + losses
+                win_rate = (wins / closed_count) * 100.0 if closed_count > 0 else 0.0
+
+                if "pnl_usd" in df_sub.columns:
+                    pnl_all = pd.to_numeric(df_sub["pnl_usd"], errors="coerce").fillna(0.0)
+                else:
+                    pnl_all = pd.Series(0.0, index=df_sub.index)
+                raw_pnl_sum = float(pnl_all.sum())
+                gross_profit = float(pnl_all.loc[pnl_all > 0].sum())
+                gross_loss = float(abs(pnl_all.loc[pnl_all < 0].sum()))
+                profit_factor = (gross_profit / gross_loss) if gross_loss > 1e-9 else (99.99 if gross_profit > 0 else 0.0)
+
+                est_entry_fees = 0.0
+                if "margin_usd" in df_closed.columns and "leverage" in df_closed.columns:
+                    est_entry_fees = float(
+                        (
+                            pd.to_numeric(df_closed["margin_usd"], errors="coerce").fillna(0.0)
+                            * pd.to_numeric(df_closed["leverage"], errors="coerce").fillna(1.0)
+                            * 0.0005
+                        ).sum()
+                    )
+                net_pnl_after_entry_fee = raw_pnl_sum - est_entry_fees
+
+                return {
+                    "wins": wins,
+                    "losses": losses,
+                    "closed_count": closed_count,
+                    "win_rate": win_rate,
+                    "raw_pnl_sum": raw_pnl_sum,
+                    "gross_profit": gross_profit,
+                    "gross_loss": gross_loss,
+                    "profit_factor": profit_factor,
+                    "est_entry_fees": est_entry_fees,
+                    "net_pnl_after_entry_fee": net_pnl_after_entry_fee,
+                    "ledger_count": int(len(df_sub)),
+                }
+
+            def _render_tab_stats_row(df_sub: pd.DataFrame):
+                st_ = _compute_tab_trade_stats(df_sub)
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Čistý PnL ($)", f"${st_['raw_pnl_sum']:+.2f}")
+                c1.caption(
+                    f"Po odpočte vstup. poplatkov (~${st_['est_entry_fees']:.2f}): ${st_['net_pnl_after_entry_fee']:+.2f}"
+                )
+                c2.metric("Reálny Win Rate", f"{st_['win_rate']:.1f} %", f"{st_['wins']} Win / {st_['losses']} Fail")
+                c3.metric("Profit Factor", f"{st_['profit_factor']:.2f}" if st_["profit_factor"] < 99.0 else "∞")
+                c4.metric("Uzavreté obchody", f"{st_['closed_count']}", f"{st_['ledger_count']} ledger záznamov")
+
             if "exit_reason" in history_df.columns:
                 _reasons = history_df["exit_reason"].fillna("").astype(str)
                 _pdf = history_df.loc[~_reasons.isin(SCALE_OUT)].copy()
@@ -469,28 +554,7 @@ def render_dashboard_and_telemetry():
             fail_trades = 0
             if len(_pdf) > 0:
                 for _, row in _pdf.iterrows():
-                    reason = str(row.get("exit_reason") or "")
-                    tp1 = bool(row.get("tp1_hit", False)) if "tp1_hit" in _pdf.columns else False
-                    tp2 = bool(row.get("tp2_hit", False)) if "tp2_hit" in _pdf.columns else False
-                    pnl = 0.0
-                    try:
-                        pnl = float(row.get("pnl_usd") or 0.0)
-                    except (TypeError, ValueError):
-                        pnl = 0.0
-
-                    is_win = False
-                    if reason in WIN_REASONS:
-                        is_win = True
-                    elif tp1 or tp2:
-                        # dosiahnutý TP → počítame ako WIN (aj keď zvyšok dotrailoval na BE)
-                        is_win = True
-                    elif reason == "HARD_SL_HIT":
-                        # Legacy MFE-ratcheted profitable stops (pre-V5.8) are wins; only pnl <= 0 is a fail.
-                        is_win = pnl > 0
-                    elif reason in FAIL_REASONS:
-                        is_win = False
-                    else:
-                        is_win = pnl > 0
+                    is_win = _row_is_win(row, _pdf.columns)
 
                     if is_win:
                         win_trades += 1
@@ -540,14 +604,7 @@ def render_dashboard_and_telemetry():
             with tab_w15:
                 n15 = len(df_w15)
                 if n15 > 0:
-                    wins15 = int((df_w15["pnl_usd"] > 0).sum()) if "pnl_usd" in df_w15.columns else 0
-                    fails15 = n15 - wins15
-                    wr15 = (wins15 / n15) * 100.0
-                    pnl15 = float(df_w15["pnl_usd"].sum()) if "pnl_usd" in df_w15.columns else 0.0
-                    a1, a2, a3 = st.columns(3)
-                    a1.metric("Čistý PnL ($)", f"${pnl15:+.2f}")
-                    a2.metric("Win / Fail Ratio (%)", f"{wr15:.1f} %", f"{wins15} / {n15}")
-                    a3.metric("Počet záznamov", f"{n15}")
+                    _render_tab_stats_row(df_w15)
 
                     x15, eq15 = build_fresh_equity(df_w15)
                     if len(eq15) > 0:
@@ -592,14 +649,7 @@ def render_dashboard_and_telemetry():
 
                 n6 = len(df_w6)
                 if n6 > 0:
-                    wins6 = int((df_w6["pnl_usd"] > 0).sum()) if "pnl_usd" in df_w6.columns else 0
-                    fails6 = n6 - wins6
-                    wr6 = (wins6 / n6) * 100.0
-                    pnl6 = float(df_w6["pnl_usd"].sum()) if "pnl_usd" in df_w6.columns else 0.0
-                    b1, b2, b3 = st.columns(3)
-                    b1.metric("AI Čistý PnL ($)", f"${pnl6:+.2f}")
-                    b2.metric("AI Win / Fail Ratio (%)", f"{wr6:.1f} %", f"{wins6} / {n6}")
-                    b3.metric("Počet AI záznamov", f"{n6}")
+                    _render_tab_stats_row(df_w6)
 
                     x6, eq6 = build_fresh_equity(df_w6)
                     if len(eq6) > 0:
