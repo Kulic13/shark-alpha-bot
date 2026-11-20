@@ -29,74 +29,6 @@ def symbol_to_okx_swap(sym: str) -> str:
     return sym
 
 # =========================================================================
-# BLOK 2: OPČNÉ STENY A MAX PAIN (OKX Options API + Piatkový Hard-Reset)
-# =========================================================================
-@st.cache_data(ttl=43200)
-def fetch_btc_options_walls(day_epoch_key: str) -> dict:
-    try:
-        with httpx.Client(timeout=10.0) as client:
-            res = client.get(
-                f"{OKX_API}/api/v5/public/open-interest",
-                params={"instType": "OPTION", "uly": "BTC-USD"}
-            )
-            res.raise_for_status()
-            payload = res.json()
-
-        data = payload.get("data", [])
-        calls, puts = {}, {}
-
-        for item in data:
-            inst_id = item.get("instId", "")
-            # Formát OKX opcie: BTC-USD-261108-70000-C
-            parts = inst_id.split("-")
-            if len(parts) < 5:
-                continue
-            try:
-                strike = float(parts[3])
-            except ValueError:
-                continue
-            opt_type = parts[4]
-            # Preferujeme oiCcy ak existuje, inak oi (počet kontraktov)
-            oi = float(item.get("oiCcy") or item.get("oi") or 0)
-            if oi <= 0:
-                continue
-
-            if opt_type == "C":
-                calls[strike] = calls.get(strike, 0.0) + oi
-            elif opt_type == "P":
-                puts[strike] = puts.get(strike, 0.0) + oi
-
-        if not calls or not puts:
-            return {}
-
-        call_wall = max(calls, key=calls.get)
-        put_wall = max(puts, key=puts.get)
-
-        strikes = sorted(list(set(list(calls.keys()) + list(puts.keys()))))
-        s_arr = np.array(strikes)
-        c_oi = np.array([calls.get(s, 0.0) for s in strikes])
-        p_oi = np.array([puts.get(s, 0.0) for s in strikes])
-
-        # Vektorový výpočet Max Pain
-        pain_matrix = np.maximum(0, s_arr[:, None] - s_arr[None, :]) * c_oi[None, :] + \
-                      np.maximum(0, s_arr[None, :] - s_arr[:, None]) * p_oi[None, :]
-        max_pain = float(s_arr[np.argmin(pain_matrix.sum(axis=1))])
-
-        return {"call_wall": call_wall, "put_wall": put_wall, "max_pain": max_pain}
-    except Exception:
-        return {}
-
-def get_btc_options_with_friday_reset() -> dict:
-    now_utc = datetime.now(timezone.utc)
-    # Piatok (weekday == 4) po 00:01 UTC zmaže hladiny v deň expirácie
-    if now_utc.weekday() == 4 and (now_utc.hour > 0 or now_utc.minute >= 1):
-        return {}
-    # Unikátny kľúč pre 12h blok a týždeň
-    half_day = "AM" if now_utc.hour < 12 else "PM"
-    epoch_key = f"{now_utc.strftime('%Y-%W-%d')}-{half_day}"
-    return fetch_btc_options_walls(epoch_key)
-
-# =========================================================================
 # BLOK 1: ZAKEŠOVANÉ DÁTOVÉ POMOCNÍKY (bez duplicitného sťahovania)
 # =========================================================================
 @st.cache_data(ttl=3)
@@ -312,6 +244,8 @@ def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
             "SPOOF_COLLAPSE_ESCAPE": "👻 Spoofing únik",
             "TIME_STOP_CHOP": "⏳ Time-Stop (Chop)",
             "TIME_STOP_STAGNANT": "⏳ Time-Stop (Stagnácia)",
+            "MFE_PROFIT_LOCK": "🛡️ MFE Zámok zisku",
+            "THETA_DECAY_PROFIT_EXIT": "⏱️ Theta Decay (zisk)",
         }
         reason_counts = reasons_all.replace("", "UNKNOWN").value_counts()
         for reason, cnt in reason_counts.items():
@@ -335,141 +269,15 @@ if st.sidebar.button("🔄 Obnoviť dáta Kokpitu"):
     st.cache_data.clear()
     st.rerun()
 
-# -------------------------------------------------------------------------
-# 🖥️ DIAĽKOVÉ OVLÁDANIE CORE 1 (Oracle VPS) – príznaky v bot_vault_state.state_json (id=1)
-# -------------------------------------------------------------------------
-def _vps_update_state_json(updates: dict) -> bool:
-    """Načíta čerstvý state_json (id=1), upraví len dané kľúče a zapíše späť."""
-    try:
-        res = supabase.table("bot_vault_state").select("state_json").eq("id", 1).execute()
-        if not res.data:
-            st.sidebar.error("bot_vault_state (id=1) sa nenašiel – zápis zrušený, aby sa nepoškodil trezor.")
-            return False
-        raw = res.data[0].get("state_json") or {}
-        if isinstance(raw, str):
-            raw = json.loads(raw) or {}
-        state = dict(raw) if isinstance(raw, dict) else {}
-        state.update(updates)
-        supabase.table("bot_vault_state").upsert({
-            "id": 1,
-            "state_json": state,
-            "updated_at": datetime.now(timezone.utc).isoformat()
-        }).execute()
-        fetch_cached_vault_state.clear()
-        return True
-    except Exception as e:
-        st.sidebar.error(f"Zápis do bot_vault_state zlyhal: {e}")
-        return False
-
-
-st.sidebar.divider()
-st.sidebar.subheader("🖥️ Ovládanie Core 1 (Oracle VPS)")
-
-vault_state = fetch_cached_vault_state()
-try:
-    _vps_hb = float(vault_state.get("last_heartbeat") or 0)
-except (TypeError, ValueError):
-    _vps_hb = 0.0
-
-_vps_online = (time.time() - _vps_hb) < 20
-_engine_cfg_on = bool(vault_state.get("auto_refresh_enabled", False))
-
-if _vps_online:
-    if _engine_cfg_on:
-        st.sidebar.success("🟢 VPS Worker: ONLINE (Engine zapnutý)")
-    else:
-        st.sidebar.success("🟢 VPS Worker: ONLINE (STANDBY – Engine vypnutý)")
-else:
-    st.sidebar.error("🔴 VPS Worker: OFFLINE")
-
-engine_on = st.sidebar.toggle(
-    "🚀 Core 1 Engine (24/7)",
-    value=bool(vault_state.get("auto_refresh_enabled", False))
-)
-if engine_on != bool(vault_state.get("auto_refresh_enabled", False)):
-    if _vps_update_state_json({"auto_refresh_enabled": bool(engine_on)}):
-        fetch_cached_vault_state.clear()
-        st.rerun()
-
-_vps_active_windows = load_active_windows(quiet=True)
-_vps_any_active = any(
-    (w or {}).get("status") == "ACTIVE" for w in _vps_active_windows.values()
-)
-
-if vault_state.get("pretrain_running"):
-    st.sidebar.info("⏳ Pre-Trainer práve beží na VPS...")
-else:
-    _pretrain_disabled = bool(engine_on) or _vps_any_active
-    if st.sidebar.button(
-        "🧠 Spustiť 7-dňový Pre-Trainer (VPS)",
-        disabled=_pretrain_disabled,
-        use_container_width=True,
-    ):
-        if _vps_update_state_json({"run_pretrain_requested": True}):
-            fetch_cached_vault_state.clear()
-            st.sidebar.success("✅ Požiadavka na Pre-Trainer odoslaná na VPS.")
-    if _pretrain_disabled:
-        st.sidebar.caption("Pre-Trainer je dostupný len keď je Engine vypnutý a žiadne okno nie je ACTIVE.")
-
-with st.sidebar.expander("🛠️ Núdzové uvoľnenie okna (VPS)", expanded=False):
-    sel_win = st.selectbox(
-        "Okno na uvoľnenie",
-        [1, 2, 3, 4, 5, 6],
-        key="vps_force_clear_win",
-    )
-    if st.button("Uvoľniť vybrané okno (WAITING)", use_container_width=True, key="vps_force_clear_btn"):
-        if _vps_update_state_json({"force_clear_window_id": int(sel_win)}):
-            try:
-                _fc_row = {
-                    "window_id": int(sel_win),
-                    "status": "WAITING",
-                    "symbol": "BTCUSDT" if int(sel_win) == 1 else None,
-                    "direction": None,
-                    "regime": None,
-                    "leverage": None,
-                    "entry_price": None,
-                    "margin_usd": 0.0,
-                    "active_margin": 0.0,
-                    "dca1_price": 0.0,
-                    "dca2_price": 0.0,
-                    "dca3_price": 0.0,
-                    "dca1_filled": False,
-                    "dca2_filled": False,
-                    "dca3_filled": False,
-                    "tp1_price": 0.0,
-                    "tp2_price": 0.0,
-                    "tp3_price": 0.0,
-                    "tp1_hit": False,
-                    "tp2_hit": False,
-                    "sl_tsl_price": 0.0,
-                    "tsl_active": False,
-                    "pnl_usd": 0.0,
-                    "pnl_percent": 0.0,
-                    "mandate_expires_at": None,
-                    "opened_at": None,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                    "okx_entry_order_id": None,
-                    "okx_sl_order_id": None,
-                    "okx_tp1_order_id": None,
-                    "okx_tp2_order_id": None,
-                    "okx_tp3_order_id": None,
-                }
-                _fc_res = supabase.table("active_positions").update(_fc_row).eq("window_id", int(sel_win)).execute()
-                if not _fc_res.data:
-                    supabase.table("active_positions").upsert(_fc_row, on_conflict="window_id").execute()
-                st.success(f"Okno {int(sel_win)} bolo nastavené na WAITING.")
-            except Exception as e:
-                st.error(f"Uvoľnenie okna v active_positions zlyhalo: {e}")
-
 st.sidebar.divider()
 
 window_titles = {
     1: "1️⃣ Makrokotva BTC",
-    2: "2️⃣ Elitný ≥10M (A)",
-    3: "3️⃣ Elitný ≥10M (B)",
-    4: "4️⃣ Nízka likvidita 5-9.9M (A)",
-    5: "5️⃣ Nízka likvidita 5-9.9M (B)",
-    6: "6️⃣ AI Lovec (XGBoost V3)"
+    2: "2️⃣ Elitný ≥7M (A)",
+    3: "3️⃣ Elitný ≥7M (B)",
+    4: "4️⃣ Stredná likvidita 3.5-9.9M (A)",
+    5: "5️⃣ Stredná likvidita 3.5-9.9M (B)",
+    6: "6️⃣ AI Lovec (XGBoost V5)"
 }
 
 
@@ -526,6 +334,17 @@ def render_live_sidebar_positions():
                 else:
                     phase = "⏳ Fáza 1 – Čaká na TP1"
                 st.caption(phase)
+
+                # Anti-MM defense badges (live flags from vault_state["windows"][wid])
+                w_vault = (vault_state.get("windows") or {}).get(str(wid), {}) or {}
+                if w_vault.get("mfe_half_profit_locked"):
+                    st.success("🛡️ MFE 80% Half-Profit Lock aktívny")
+                elif w_vault.get("mfe_be_locked"):
+                    st.info("🔒 MFE 75% Break-Even Lock aktívny")
+                if w_vault.get("dca_rescue_active"):
+                    st.warning("🚑 DCA Rescue Exit aktívny (komprimovaný TP1)")
+                if int(w_vault.get("spoof_streak") or 0) > 0:
+                    st.caption(f"👁️ Spoof radar streak: {int(w_vault.get('spoof_streak'))}/3")
 
                 # Live PnL
                 pnl_u = safe_float(w.get("pnl_usd"))
@@ -599,8 +418,7 @@ def render_dashboard_and_telemetry():
     with top_col1:
         st.subheader("📈 Dynamický Equity Dashboard")
         # --- Kapitál: po SQL wipe nespoliehať sa len na vault.balance (býva starý/seknutý) ---
-        # Zdroj pravdy v cockpite = EQUITY_BASELINE + Σ realized pnl z trade_history + unrealized
-        vault_bal = safe_float(vault_state.get("balance"), EQUITY_BASELINE)
+        # Hlavná metrika = autoritatívny vault balance z workera; ledger (baseline + realized + unrealized) je v caption.
 
         realized_pnl = 0.0
         if not history_df.empty and "pnl_usd" in history_df.columns:
@@ -615,6 +433,7 @@ def render_dashboard_and_telemetry():
         # Rekonštruovaný kapitál (fresh baseline) – to, čo má user vidieť ako „Aktuálny zostatok“
         curr_bal = EQUITY_BASELINE + realized_pnl + unrealized
         total_pnl = realized_pnl + unrealized  # delta voči baseline
+        vault_bal = safe_float(vault_state.get("balance"), curr_bal)
 
         if not history_df.empty:
             # Win/Fail: 1 obchod = 1 finálny close (bez TP1/TP2 scale-out ledger riadkov).
@@ -627,6 +446,8 @@ def render_dashboard_and_telemetry():
                 "TP2_SCALE_OUT",  # ak by finálny close omylom niesol tento reason
                 "TP1_WALL_FRONTRUN",
                 "TP2_WALL_FRONTRUN",
+                "MFE_PROFIT_LOCK",
+                "THETA_DECAY_PROFIT_EXIT",
             }
             FAIL_REASONS = {
                 "HARD_SL_HIT",
@@ -663,6 +484,9 @@ def render_dashboard_and_telemetry():
                     elif tp1 or tp2:
                         # dosiahnutý TP → počítame ako WIN (aj keď zvyšok dotrailoval na BE)
                         is_win = True
+                    elif reason == "HARD_SL_HIT":
+                        # Legacy MFE-ratcheted profitable stops (pre-V5.8) are wins; only pnl <= 0 is a fail.
+                        is_win = pnl > 0
                     elif reason in FAIL_REASONS:
                         is_win = False
                     else:
@@ -680,10 +504,10 @@ def render_dashboard_and_telemetry():
                 n_scale = int(history_df["exit_reason"].fillna("").astype(str).isin(list(SCALE_OUT)).sum())
 
             m1, m2, m3 = st.columns(3)
-            m1.metric("Aktuálny Kapitál", f"${curr_bal:.2f}", f"{total_pnl:+.2f} USD")
+            m1.metric("Aktuálny Kapitál (OKX Vault)", f"${vault_bal:.2f}", f"{vault_bal - EQUITY_BASELINE:+.2f} USD")
             m1.caption(
-                f"baseline {EQUITY_BASELINE:.0f} + realized {realized_pnl:+.2f} + unrealized {unrealized:+.2f}"
-                + (f"  | vault: ${vault_bal:.2f}" if abs(vault_bal - curr_bal) > 0.5 else "")
+                f"Ledger (trade_history): baseline {EQUITY_BASELINE:.0f} + realized {realized_pnl:+.2f} "
+                f"+ unrealized {unrealized:+.2f} = ${curr_bal:.2f}"
             )
             m2.metric("Celková Úspešnosť", f"{wr_total:.1f} %", f"{total_trades} obchodov")
             m2.caption(
@@ -703,7 +527,7 @@ def render_dashboard_and_telemetry():
 
             tab_w15, tab_w6 = st.tabs([
                 "📊 Okná 1–5 (Adaptívne MMR)",
-                "🤖 AI Okno 6 (XGBoost V3)",
+                "🤖 AI Okno 6 (XGBoost V5)",
             ])
 
             def _equity_xcol(df_sub: pd.DataFrame) -> str:
@@ -756,7 +580,7 @@ def render_dashboard_and_telemetry():
                     model_res = supabase.table("ai_models").select("model_name, accuracy, trained_at").eq("id", 1).execute()
                     if model_res.data and len(model_res.data) > 0:
                         mrow = model_res.data[0]
-                        m_name = mrow.get("model_name") or "xgboost_us_champion_v3"
+                        m_name = mrow.get("model_name") or "xgboost_us_champion_v5"
                         m_acc = mrow.get("accuracy")
                         m_trained = mrow.get("trained_at") or "—"
                         acc_txt = f"{float(m_acc) * 100:.1f}%" if m_acc is not None else "—"
@@ -940,11 +764,6 @@ chart_interval = ("5s" if timeframe == "1m" else "15s") if live_mode else None
 def render_live_charts_section(tf: str):
     active_windows = load_active_windows()
 
-    # Opčné steny BTC sťahuj iba keď je Okno 1 ACTIVE (inak BTC neobchoduje)
-    btc_options = {}
-    if (active_windows.get(1) or {}).get("status") == "ACTIVE":
-        btc_options = get_btc_options_with_friday_reset()
-
     for wid in (1, 2, 3, 4, 5, 6):
         w = active_windows.get(wid, {})
         status = w.get("status", "WAITING")
@@ -970,19 +789,8 @@ def render_live_charts_section(tf: str):
         )])
 
         # --- Y-rozsah: prioritne okolo ceny (sviečky + entry/TP/SL/DCA), aby graf nebol stlačený ---
-        # Opčné steny (call/put wall) môžu byť veľmi ďaleko → nechávame ich mimo default view.
-        # Po odzoomovaní (zoom out) budú stále viditeľné.
         price_low = float(df_k["l"].min())
         price_high = float(df_k["h"].max())
-
-        # Vykreslenie opčných stien pre BTC (Okno 1) – len ako referencie, mimo auto-range
-        if wid == 1 and btc_options:
-            fig.add_hline(y=btc_options["call_wall"], line_dash="dot", line_color="cyan",
-                          annotation_text="Call Wall", annotation_position="top left")
-            fig.add_hline(y=btc_options["put_wall"], line_dash="dot", line_color="magenta",
-                          annotation_text="Put Wall", annotation_position="top left")
-            fig.add_hline(y=btc_options["max_pain"], line_dash="dash", line_color="yellow",
-                          annotation_text="Max Pain", annotation_position="top left")
 
         # Vykreslenie živých obchodných hladín z Cloudu 1
         if status == "ACTIVE":
@@ -1013,7 +821,15 @@ def render_live_charts_section(tf: str):
 
             tsl_active = bool(w.get("tsl_active", False))
             sl_txt = "TSL" if tsl_active else "SL"
-            fig.add_hline(y=sl, line_color="#ff3355", line_width=2, annotation_text=sl_txt)
+            sl_color = "#ff3355"
+            w_vault = (fetch_cached_vault_state().get("windows") or {}).get(str(wid), {}) or {}
+            if w_vault.get("mfe_half_profit_locked"):
+                sl_txt = "MFE 80% LOCK"
+                sl_color = "#00ffaa"
+            elif w_vault.get("mfe_be_locked"):
+                sl_txt = "MFE BE LOCK"
+                sl_color = "#00ccff"
+            fig.add_hline(y=sl, line_color=sl_color, line_width=2, annotation_text=sl_txt)
 
             # DCA hladiny – oranžové; kreslíme iba tie s cenou > 0 (DCA3 = 0.0 nesmie deformovať os Y)
             dca1_p = safe_float(w.get("dca1_price"))
