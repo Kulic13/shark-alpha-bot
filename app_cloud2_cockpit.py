@@ -31,7 +31,7 @@ def symbol_to_okx_swap(sym: str) -> str:
 # =========================================================================
 # BLOK 1: ZAKEŠOVANÉ DÁTOVÉ POMOCNÍKY (bez duplicitného sťahovania)
 # =========================================================================
-@st.cache_data(ttl=3)
+@st.cache_data(ttl=15)
 def fetch_cached_vault_state() -> dict:
     """state_json z bot_vault_state (id == 1) – cache 3 s, aby 1s sidebar nezahlcoval Supabase."""
     try:
@@ -45,6 +45,64 @@ def fetch_cached_vault_state() -> dict:
     except Exception:
         pass
     return {}
+
+
+@st.cache_data(ttl=25)
+def fetch_cached_trade_history() -> pd.DataFrame:
+    try:
+        res = supabase.table("trade_history").select(
+            "id,window_id,symbol,direction,regime,leverage,entry_price,exit_price,margin_usd,pnl_usd,pnl_percent,exit_reason,closed_at,open_at,dca1_filled,dca2_filled,dca3_filled,tp1_hit,tp2_hit"
+        ).order("id", desc=True).limit(300).execute()
+        df = pd.DataFrame(res.data) if res.data else pd.DataFrame()
+        if not df.empty and "id" in df.columns:
+            df = df.sort_values("id", ascending=True).reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=25)
+def fetch_cached_mmr_matrix() -> pd.DataFrame:
+    try:
+        res = supabase.table("ai_mmr_matrix").select("*").order("total_trades", desc=True).execute()
+        return pd.DataFrame(res.data) if res.data else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=60)
+def fetch_cached_ai_model_info() -> dict:
+    try:
+        res = supabase.table("ai_models").select("model_name,accuracy,trained_at").eq("id", 1).execute()
+        return res.data[0] if res.data else {}
+    except Exception:
+        return {}
+
+
+def write_remote_control_flag(updates: dict) -> bool:
+    allowed = {"auto_refresh_enabled", "run_pretrain_requested", "force_clear_window_id"}
+    if not isinstance(updates, dict) or not updates or not set(updates).issubset(allowed):
+        return False
+    try:
+        res = supabase.table("bot_vault_state").select("state_json").eq("id", 1).execute()
+        if res.data:
+            raw = res.data[0].get("state_json") or {}
+            state = json.loads(raw) if isinstance(raw, str) else dict(raw) if isinstance(raw, dict) else {}
+            state.update(updates)
+            supabase.table("bot_vault_state").update({
+                "state_json": state,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }).eq("id", 1).execute()
+        else:
+            state = dict(updates)
+            supabase.table("bot_vault_state").insert({
+                "id": 1, "state_json": state,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }).execute()
+        fetch_cached_vault_state.clear()
+        return True
+    except Exception:
+        return False
 
 
 def _fetch_okx_candles_df(symbol: str, bar: str, limit: int) -> pd.DataFrame:
@@ -99,10 +157,11 @@ def fetch_visual_klines(symbol: str, interval: str) -> pd.DataFrame:
     return fetch_visual_klines_15m(symbol)
 
 
+@st.cache_data(ttl=2)
 def load_active_windows(quiet: bool = False) -> dict:
     """Čerstvé active_positions zo Supabase (order by window_id) ako {window_id: row}."""
     try:
-        pos_res = supabase.table("active_positions").select("*").order("window_id").execute()
+        pos_res = supabase.table("active_positions").select("window_id,status,symbol,direction,regime,leverage,entry_price,margin_usd,active_margin,dca1_price,dca2_price,dca3_price,dca1_filled,dca2_filled,dca3_filled,tp1_price,tp2_price,tp3_price,tp1_hit,tp2_hit,sl_tsl_price,tsl_active,pnl_usd,pnl_percent,mandate_expires_at,opened_at,updated_at").order("window_id").execute()
         return {int(r["window_id"]): r for r in pos_res.data} if pos_res.data else {}
     except Exception as e:
         if quiet:
@@ -269,6 +328,39 @@ if st.sidebar.button("🔄 Obnoviť dáta Kokpitu"):
     st.cache_data.clear()
     st.rerun()
 
+st.sidebar.markdown("### 🤖 Ovládanie VPS Enginu (`core1_version3`)")
+vault_control = fetch_cached_vault_state()
+engine_on = bool(vault_control.get("auto_refresh_enabled", False))
+st.sidebar.markdown("🟢 **ENGINE BEŽÍ**" if engine_on else "🔴 **STANDBY (VYPNUTÝ)**")
+if st.sidebar.button("⏻ " + ("Vypnúť Engine" if engine_on else "Spustiť Engine"), key="engine_master_toggle"):
+    if write_remote_control_flag({"auto_refresh_enabled": not engine_on}):
+        st.rerun()
+    else:
+        st.sidebar.error("Zápis ovládania VPS zlyhal.")
+
+remote_active_windows = load_active_windows(quiet=True)
+has_active_position = any(w.get("status") == "ACTIVE" for w in remote_active_windows.values())
+pretrain_running = bool(vault_control.get("pretrain_running"))
+if pretrain_running:
+    st.sidebar.info("⏳ Pre-Trainer práve beží...")
+else:
+    if st.sidebar.button(
+        "🧠 Spustiť 7d Pre-Trainer",
+        disabled=engine_on or has_active_position,
+        key="pretrain_trigger",
+    ):
+        if write_remote_control_flag({"run_pretrain_requested": True}):
+            st.rerun()
+        else:
+            st.sidebar.error("Zápis Pre-Trainer triggeru zlyhal.")
+
+selected_wid = st.sidebar.selectbox("Okno na vyčistenie", [1, 2, 3, 4, 5, 6], key="force_clear_window")
+if st.sidebar.button("🧹 Vyčistiť okno", key="force_clear_window_button"):
+    if write_remote_control_flag({"force_clear_window_id": int(selected_wid)}):
+        st.rerun()
+    else:
+        st.sidebar.error("Zápis Force Clear požiadavky zlyhal.")
+
 st.sidebar.divider()
 
 window_titles = {
@@ -281,7 +373,7 @@ window_titles = {
 }
 
 
-@st.fragment(run_every="1s" if live_mode else None)
+@st.fragment(run_every="3s" if live_mode else None)
 def render_live_sidebar_positions():
     active_windows = load_active_windows(quiet=True)
     vault_state = fetch_cached_vault_state()
@@ -337,10 +429,6 @@ def render_live_sidebar_positions():
 
                 # Anti-MM defense badges (live flags from vault_state["windows"][wid])
                 w_vault = (vault_state.get("windows") or {}).get(str(wid), {}) or {}
-                if w_vault.get("mfe_half_profit_locked"):
-                    st.success("🛡️ MFE 80% Half-Profit Lock aktívny")
-                elif w_vault.get("mfe_be_locked"):
-                    st.info("🔒 MFE 75% Break-Even Lock aktívny")
                 if w_vault.get("dca_rescue_active"):
                     st.warning("🚑 DCA Rescue Exit aktívny (komprimovaný TP1)")
                 if int(w_vault.get("spoof_streak") or 0) > 0:
@@ -386,26 +474,13 @@ def render_live_sidebar_positions():
                     st.caption("Stav: Čaká na vhodný signál z Cloudu 1...")
 
 
-@st.fragment(run_every="15s" if live_mode else None)
+@st.fragment(run_every="30s" if live_mode else None)
 def render_dashboard_and_telemetry():
     # Každý fragment si stiahne iba to, čo potrebuje
     active_windows = load_active_windows()
 
-    try:
-        hist_res = supabase.table("trade_history").select("*").order("id", desc=True).limit(1000).execute()
-        history_df = pd.DataFrame(hist_res.data) if hist_res.data else pd.DataFrame()
-        if not history_df.empty and "id" in history_df.columns:
-            history_df = history_df.sort_values("id", ascending=True).reset_index(drop=True)
-    except Exception as e:
-        st.error(f"Chyba načítania trade_history: {e}")
-        history_df = pd.DataFrame()
-
-    try:
-        ai_res = supabase.table("ai_mmr_matrix").select("*").order("total_trades", desc=True).execute()
-        ai_df = pd.DataFrame(ai_res.data) if ai_res.data else pd.DataFrame()
-    except Exception as e:
-        st.error(f"Chyba načítania ai_mmr_matrix: {e}")
-        ai_df = pd.DataFrame()
+    history_df = fetch_cached_trade_history()
+    ai_df = fetch_cached_mmr_matrix()
 
     # Live vault JSONB (System F telemetry source – no extra columns)
     vault_state = fetch_cached_vault_state()
@@ -633,19 +708,15 @@ def render_dashboard_and_telemetry():
 
             with tab_w6:
                 # AI model status (id=1)
-                try:
-                    model_res = supabase.table("ai_models").select("model_name, accuracy, trained_at").eq("id", 1).execute()
-                    if model_res.data and len(model_res.data) > 0:
-                        mrow = model_res.data[0]
-                        m_name = mrow.get("model_name") or "xgboost_us_champion_v5"
-                        m_acc = mrow.get("accuracy")
-                        m_trained = mrow.get("trained_at") or "—"
-                        acc_txt = f"{float(m_acc) * 100:.1f}%" if m_acc is not None else "—"
-                        st.caption(f"Model: **{m_name}**  |  Accuracy: **{acc_txt}**  |  Trained at: **{m_trained}**")
-                    else:
-                        st.caption("AI model (id=1) zatiaľ nie je v `ai_models`.")
-                except Exception as e:
-                    st.caption(f"ai_models nedostupné: {e}")
+                mrow = fetch_cached_ai_model_info()
+                if mrow:
+                    m_name = mrow.get("model_name") or "xgboost_us_champion_v5"
+                    m_acc = mrow.get("accuracy")
+                    m_trained = mrow.get("trained_at") or "—"
+                    acc_txt = f"{float(m_acc) * 100:.1f}%" if m_acc is not None else "—"
+                    st.caption(f"Model: **{m_name}**  |  Accuracy: **{acc_txt}**  |  Trained at: **{m_trained}**")
+                else:
+                    st.caption("AI model (id=1) zatiaľ nie je v `ai_models`.")
 
                 n6 = len(df_w6)
                 if n6 > 0:
@@ -706,7 +777,7 @@ def render_dashboard_and_telemetry():
         rs = vault_state.get("reject_stats") or {
             "macro": 0, "liq": 0, "ofd": 0, "shield": 0, "micro": 0, "risk": 0,
         }
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("Strictness LONG", f"{safe_float(vault_state.get('strictness_long'), 1.0):.2f}")
         c2.metric("Strictness SHORT", f"{safe_float(vault_state.get('strictness_short'), 1.0):.2f}")
         c3.metric("Daily PnL ($)", f"{safe_float(vault_state.get('daily_pnl_usd'), 0.0):+.2f}")
@@ -714,6 +785,9 @@ def render_dashboard_and_telemetry():
         scout_on = bool(vault_state.get("scout_mode", False))
         c4.metric("Shield Mode", "AKTÍVNY" if shield_on else "OFF")
         c5.metric("Scout Mode", "AKTÍVNY" if scout_on else "OFF")
+        long_cnt = sum(1 for w in active_windows.values() if w.get("status") == "ACTIVE" and str(w.get("direction", "")).upper() == "LONG")
+        short_cnt = sum(1 for w in active_windows.values() if w.get("status") == "ACTIVE" and str(w.get("direction", "")).upper() == "SHORT")
+        c6.metric("Portfolio Exposure", f"LONG {long_cnt}/3 | SHORT {short_cnt}/3")
 
         keys = ["macro", "liq", "ofd", "shield", "micro", "risk"]
         weights = [safe_float(fw.get(k), 1.0) for k in keys]
@@ -807,7 +881,7 @@ st.divider()
 # -------------------------------------------------------------------------
 st.subheader("📊 Živé Trhové Grafy & Exekučné Hladiny")
 
-chart_interval = ("5s" if timeframe == "1m" else "15s") if live_mode else None
+chart_interval = ("10s" if timeframe == "1m" else "20s") if live_mode else None
 
 
 @st.fragment(run_every=chart_interval)
@@ -872,13 +946,6 @@ def render_live_charts_section(tf: str):
             tsl_active = bool(w.get("tsl_active", False))
             sl_txt = "TSL" if tsl_active else "SL"
             sl_color = "#ff3355"
-            w_vault = (fetch_cached_vault_state().get("windows") or {}).get(str(wid), {}) or {}
-            if w_vault.get("mfe_half_profit_locked"):
-                sl_txt = "MFE 80% LOCK"
-                sl_color = "#00ffaa"
-            elif w_vault.get("mfe_be_locked"):
-                sl_txt = "MFE BE LOCK"
-                sl_color = "#00ccff"
             fig.add_hline(y=sl, line_color=sl_color, line_width=2, annotation_text=sl_txt)
 
             # DCA hladiny – oranžové; kreslíme iba tie s cenou > 0 (DCA3 = 0.0 nesmie deformovať os Y)
@@ -994,4 +1061,4 @@ def render_live_charts_section(tf: str):
 render_live_charts_section(timeframe)
 
 st.divider()
-st.caption("Shark Alpha Cockpit Cloud 2 • System F telemetry • fresh equity baseline 1000 USD (Σ pnl, ignore old SQL balance) • y-range okolo ceny / OPEN v-line / DCA & TP stavy")
+st.caption("Shark Alpha Cockpit Cloud 2 • core1_version3 MM Engine • System F telemetry • fresh equity baseline 1000 USD")
