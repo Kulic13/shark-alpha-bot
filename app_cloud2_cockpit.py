@@ -365,8 +365,8 @@ st.sidebar.divider()
 
 window_titles = {
     1: "1️⃣ Makrokotva BTC",
-    2: "2️⃣ Elitný ≥7M (A)",
-    3: "3️⃣ Elitný ≥7M (B)",
+    2: "2️⃣ Elitný ≥10M (A)",
+    3: "3️⃣ Elitný ≥10M (B)",
     4: "4️⃣ Stredná likvidita 3.5-9.9M (A)",
     5: "5️⃣ Stredná likvidita 3.5-9.9M (B)",
     6: "6️⃣ AI Lovec (XGBoost V5)"
@@ -771,102 +771,156 @@ def render_dashboard_and_telemetry():
     ])
 
     with tab_meta:
-        fw = vault_state.get("filter_weights") or {
-            "macro": 1.0, "liq": 1.0, "ofd": 1.0, "shield": 1.0, "micro": 1.0, "risk": 1.0,
+        TIER_LABELS = {
+            "TIER_1_BTC": "1️⃣ Tier 1 — BTC Makrokotva",
+            "TIER_2_ELITE": "2️⃣ Tier 2 — Elitné Alty (≥10M)",
+            "TIER_3_LOWCAP": "3️⃣ Tier 3 — Low-Cap Alty (3.5–9.99M)",
         }
-        rs = vault_state.get("reject_stats") or {
-            "macro": 0, "liq": 0, "ofd": 0, "shield": 0, "micro": 0, "risk": 0,
-        }
+        DIRECTIONS = ["LONG", "SHORT"]
+        tiers = list(TIER_LABELS.keys())
+        tier_weights_root = vault_state.get("tier_filter_weights") or {}
+        tier_strictness_root = vault_state.get("tier_strictness") or {}
+        tier_reject_root = vault_state.get("tier_reject_stats") or {}
+        tier_tensors_root = vault_state.get("mmr_tensors") or {}
+
+        sel_tier = st.radio("Tier", tiers, horizontal=True, format_func=lambda k: TIER_LABELS[k], key="v7_tier_choice")
+        sel_dir = st.radio("Smer", DIRECTIONS, horizontal=True, key="v7_direction_choice")
+        strictness = safe_float(((tier_strictness_root.get(sel_tier) or {}).get(sel_dir)), 0.90)
+        tw = ((tier_weights_root.get(sel_tier) or {}).get(sel_dir) or {"w_flow": 1.0, "w_book": 1.0, "w_shield": 1.0, "w_tox": 1.0})
+        rs = ((tier_reject_root.get(sel_tier) or {}).get(sel_dir) or {"macro": 0, "flow": 0, "book": 0, "shield": 0, "tox": 0})
+        if not isinstance(tw, dict): tw = {"w_flow": 1.0, "w_book": 1.0, "w_shield": 1.0, "w_tox": 1.0}
+        if not isinstance(rs, dict): rs = {"macro": 0, "flow": 0, "book": 0, "shield": 0, "tox": 0}
+
+        st.markdown(f"#### {TIER_LABELS[sel_tier]} · {sel_dir}")
         c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Strictness LONG", f"{safe_float(vault_state.get('strictness_long'), 1.0):.2f}")
-        c2.metric("Strictness SHORT", f"{safe_float(vault_state.get('strictness_short'), 1.0):.2f}")
-        c3.metric("Daily PnL ($)", f"{safe_float(vault_state.get('daily_pnl_usd'), 0.0):+.2f}")
+        c1.metric(f"Strictness ({sel_tier} | {sel_dir})", f"{strictness:.3f}")
+        c2.metric("Daily PnL ($)", f"{safe_float(vault_state.get('daily_pnl_usd'), 0.0):+.2f}")
         shield_on = bool(vault_state.get("shield_mode_active", False))
         scout_on = bool(vault_state.get("scout_mode", False))
-        c4.metric("Shield Mode", "AKTÍVNY" if shield_on else "OFF")
-        c5.metric("Scout Mode", "AKTÍVNY" if scout_on else "OFF")
+        c3.metric("Shield Mode", "AKTÍVNY" if shield_on else "OFF")
+        c4.metric("Scout Mode", "AKTÍVNY" if scout_on else "OFF")
         long_cnt = sum(1 for w in active_windows.values() if w.get("status") == "ACTIVE" and str(w.get("direction", "")).upper() == "LONG")
         short_cnt = sum(1 for w in active_windows.values() if w.get("status") == "ACTIVE" and str(w.get("direction", "")).upper() == "SHORT")
-        c6.metric("Portfolio Exposure", f"LONG {long_cnt}/3 | SHORT {short_cnt}/3")
+        c5.metric("Portfolio Exposure LONG", f"{long_cnt}/3")
+        c6.metric("Portfolio Exposure SHORT", f"{short_cnt}/3")
 
-        keys = ["macro", "liq", "ofd", "shield", "micro", "risk"]
-        weights = [safe_float(fw.get(k), 1.0) for k in keys]
-        rejects = [int(rs.get(k, 0) or 0) for k in keys]
-        fig_w = go.Figure()
-        fig_w.add_trace(go.Bar(
-            name="filter_weight",
-            x=keys, y=weights,
-            marker_color="#00ffcc",
-            text=[f"{w:.2f}" for w in weights],
-            textposition="outside",
-        ))
-        fig_w.add_hline(y=1.0, line_dash="dot", line_color="white", annotation_text="baseline 1.0")
-        fig_w.update_layout(
-            height=280, template="plotly_dark",
-            margin=dict(l=10, r=10, t=30, b=10),
-            yaxis=dict(range=[0.7, 1.35], title="weight"),
-            title="Váhy 6-stupňového lievika",
-        )
-        st.plotly_chart(fig_w, use_container_width=True, key="filter_weights_chart")
+        active_weight_keys = ["w_flow", "w_book", "w_shield", "w_tox"]
+        active_weights = [safe_float(tw.get(k), 1.0) for k in active_weight_keys]
+        fig_w = go.Figure(go.Bar(x=active_weight_keys, y=active_weights, text=[f"{v:.3f}" for v in active_weights], textposition="outside"))
+        fig_w.add_hline(y=1.0, line_dash="dot", annotation_text="baseline 1.0")
+        fig_w.update_layout(height=300, template="plotly_dark", title=f"System F weights · {sel_tier} · {sel_dir}", yaxis_title="Weight", yaxis=dict(range=[0.70, 1.40]), margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig_w, use_container_width=True, key=f"v7_weights_{sel_tier}_{sel_dir}")
 
-        mw = vault_state.get("micro_weights") or {
-            "spoof_sensitivity": 1.0, "wall_frontrun_mult": 3.5, "dca_wob_floor": 0.10,
-        }
-        mw1, mw2, mw3 = st.columns(3)
-        mw1.metric("Spoof citlivosť", f"{safe_float(mw.get('spoof_sensitivity'), 1.0):.2f}")
-        mw2.metric("Wall Front-Run mult", f"{safe_float(mw.get('wall_frontrun_mult'), 3.5):.2f}")
-        mw3.metric("DCA WOB podlaha", f"{safe_float(mw.get('dca_wob_floor'), 0.10):.2f}")
+        st.markdown("#### Súhrn všetkých 6 izolácií")
+        summary_rows = []
+        for t in tiers:
+            for d in DIRECTIONS:
+                wdict = ((tier_weights_root.get(t) or {}).get(d) or {})
+                rdict = ((tier_reject_root.get(t) or {}).get(d) or {})
+                sd = safe_float(((tier_strictness_root.get(t) or {}).get(d)), 0.90)
+                summary_rows.append({"Tier": t, "Direction": d, "Strictness": sd,
+                    "w_flow": safe_float(wdict.get("w_flow"), 1.0), "w_book": safe_float(wdict.get("w_book"), 1.0),
+                    "w_shield": safe_float(wdict.get("w_shield"), 1.0), "w_tox": safe_float(wdict.get("w_tox"), 1.0),
+                    "reject_macro": safe_float(rdict.get("macro"), 0), "reject_flow": safe_float(rdict.get("flow"), 0),
+                    "reject_book": safe_float(rdict.get("book"), 0), "reject_shield": safe_float(rdict.get("shield"), 0),
+                    "reject_tox": safe_float(rdict.get("tox"), 0)})
+        st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
 
-        stats_df = pd.DataFrame({"filter": keys, "weight": weights, "reject_count": rejects})
-        st.dataframe(stats_df, hide_index=True, use_container_width=True)
+        st.markdown("#### Existujúce micro_weights")
+        micro_weights = vault_state.get("micro_weights") or {}
+        if isinstance(micro_weights, dict) and micro_weights:
+            st.dataframe(pd.DataFrame([{"metric": k, "value": v} for k, v in micro_weights.items()]), hide_index=True, use_container_width=True)
+        else:
+            st.caption("micro_weights v state_json zatiaľ nie sú dostupné.")
+        st.caption("Read-only System F telemetria z bot_vault_state.state_json; Supabase schéma sa nemení.")
 
     with tab_mmr:
-        if not ai_df.empty and {"regime_x", "regime_y"}.issubset(set(ai_df.columns)):
-            x_map = {1: "BEAR", 2: "SIDE", 3: "BULL"}
-            y_map = {1: "LOW_VOL", 2: "MID_VOL", 3: "HIGH_VOL"}
-            tmp = ai_df.copy()
-            tmp["rx"] = tmp["regime_x"].map(lambda v: x_map.get(int(v), str(v)))
-            tmp["ry"] = tmp["regime_y"].map(lambda v: y_map.get(int(v), str(v)))
-            # win_rate pivot
-            if "win_rate" in tmp.columns:
-                piv_wr = tmp.pivot_table(index="ry", columns="rx", values="win_rate", aggfunc="mean")
-                # ordered axes
-                piv_wr = piv_wr.reindex(index=["LOW_VOL", "MID_VOL", "HIGH_VOL"], columns=["BEAR", "SIDE", "BULL"])
-                st.markdown("**Win rate (%)**")
-                st.dataframe(piv_wr.round(1), use_container_width=True)
-            if "total_trades" in tmp.columns:
-                piv_n = tmp.pivot_table(index="ry", columns="rx", values="total_trades", aggfunc="sum")
-                piv_n = piv_n.reindex(index=["LOW_VOL", "MID_VOL", "HIGH_VOL"], columns=["BEAR", "SIDE", "BULL"])
-                st.markdown("**Total trades**")
-                st.dataframe(piv_n.fillna(0).astype(int), use_container_width=True)
-            mod_cols = [c for c in ("sl_modifier", "tp_modifier") if c in tmp.columns]
-            if mod_cols:
-                st.markdown("**SL / TP modifiers**")
-                show = tmp[["rx", "ry"] + mod_cols + (["win_rate", "total_trades"] if "win_rate" in tmp.columns else [])]
-                st.dataframe(show, hide_index=True, use_container_width=True)
+        TIER_LABELS_MMR = {
+            "TIER_1_BTC": "Tier 1 — BTC Makrokotva",
+            "TIER_2_ELITE": "Tier 2 — Elitné Alty (≥10M)",
+            "TIER_3_LOWCAP": "Tier 3 — Low-Cap (3.5–9.99M)",
+        }
+        mmr_choices = [f"{t} | {d}" for t in TIER_LABELS_MMR for d in DIRECTIONS] + ["Agregovaný súhrn (DB)"]
+        mmr_sel = st.radio("MMR izolovaný tensor", mmr_choices, horizontal=True, key="v7_mmr_selector")
+        if mmr_sel == "Agregovaný súhrn (DB)":
+            if not ai_df.empty and {"regime_x", "regime_y"}.issubset(set(ai_df.columns)):
+                x_map = {1: "BEAR", 2: "SIDE", 3: "BULL"}; y_map = {1: "LOW_VOL", 2: "MID_VOL", 3: "HIGH_VOL"}
+                tmp = ai_df.copy()
+                tmp["rx"] = tmp["regime_x"].map(lambda v: x_map.get(int(v), str(v)))
+                tmp["ry"] = tmp["regime_y"].map(lambda v: y_map.get(int(v), str(v)))
+                if "win_rate" in tmp.columns:
+                    piv = tmp.pivot_table(index="ry", columns="rx", values="win_rate", aggfunc="mean").reindex(index=["LOW_VOL", "MID_VOL", "HIGH_VOL"], columns=["BEAR", "SIDE", "BULL"])
+                    st.markdown("**Win Rate (%) — DB agregát**"); st.dataframe(piv.round(1), use_container_width=True)
+                if "total_trades" in tmp.columns:
+                    piv = tmp.pivot_table(index="ry", columns="rx", values="total_trades", aggfunc="sum").reindex(index=["LOW_VOL", "MID_VOL", "HIGH_VOL"], columns=["BEAR", "SIDE", "BULL"])
+                    st.markdown("**Total Trades — DB agregát**"); st.dataframe(piv.fillna(0).astype(int), use_container_width=True)
+                st.markdown("**Detailed Cell Table — DB agregát**")
+                cols = [c for c in ["rx", "ry", "win_rate", "avg_win_r", "avg_loss_r", "sl_modifier", "tp_modifier", "total_trades"] if c in tmp.columns]
+                st.dataframe(tmp[cols], hide_index=True, use_container_width=True)
+            else: st.info("AI Matica DB ešte nemá dostupné agregované dáta.")
         else:
-            st.info("AI Matica ešte neobsahuje dáta pre heatmapu režimov.")
+            sel_tier, sel_dir = mmr_sel.split(" | ", 1)
+            tensor = ((vault_state.get("mmr_tensors") or {}).get(sel_tier) or {}).get(sel_dir) or {}
+            rows = []
+            rx_labels = {1: "BEAR", 2: "SIDE", 3: "BULL"}; ry_labels = {1: "LOW_VOL", 2: "MID_VOL", 3: "HIGH_VOL"}
+            for ry in range(1, 4):
+                for rx in range(1, 4):
+                    cell = tensor.get(f"{rx}_{ry}", {}) if isinstance(tensor, dict) else {}
+                    if not isinstance(cell, dict): cell = {}
+                    rows.append({"rx": rx_labels[rx], "ry": ry_labels[ry], "win_rate": safe_float(cell.get("win_rate"), 0.0),
+                        "avg_win_r": safe_float(cell.get("avg_win_r"), 0.0), "avg_loss_r": safe_float(cell.get("avg_loss_r"), 0.0),
+                        "sl_modifier": safe_float(cell.get("sl_modifier"), 1.0), "tp_modifier": safe_float(cell.get("tp_modifier"), 1.0),
+                        "total_trades": int(safe_float(cell.get("total_trades"), 0))})
+            cell_df = pd.DataFrame(rows)
+            st.markdown("**Win Rate (%)**")
+            wr_pivot = cell_df.pivot(index="ry", columns="rx", values="win_rate").reindex(index=["LOW_VOL", "MID_VOL", "HIGH_VOL"], columns=["BEAR", "SIDE", "BULL"])
+            st.dataframe(wr_pivot.round(1), use_container_width=True)
+            st.markdown("**Total Trades**")
+            n_pivot = cell_df.pivot(index="ry", columns="rx", values="total_trades").reindex(index=["LOW_VOL", "MID_VOL", "HIGH_VOL"], columns=["BEAR", "SIDE", "BULL"])
+            st.dataframe(n_pivot.astype(int), use_container_width=True)
+            st.markdown("**Detailed Cell Table**")
+            st.dataframe(cell_df, hide_index=True, use_container_width=True)
 
     with tab_shadow:
-        pool = vault_state.get("shadow_pool") or vault_state.get("shadow_trades") or []
-        if not pool:
-            st.info("Shadow pool je prázdny – žiadne virtuálne blokované signály.")
-        else:
-            now_ts = time.time()
-            rows = []
-            for sh in pool:
+        TIER_LABELS_SHADOW = {
+            "TIER_1_BTC": "Tier 1 (BTC)",
+            "TIER_2_ELITE": "Tier 2 (Elitné ≥10M)",
+            "TIER_3_LOWCAP": "Tier 3 (Low-Cap 3.5–9.99M)",
+        }
+        tier_pools = vault_state.get("tier_shadow_pools") or {}
+        tier_keys = list(TIER_LABELS_SHADOW)
+        def _shadow_list(obj):
+            if isinstance(obj, list): return obj
+            if isinstance(obj, dict):
+                # Flatten direction-separated pool lists, if present.
+                return [item for val in obj.values() if isinstance(val, list) for item in val]
+            return []
+        if not tier_pools:
+            legacy = vault_state.get("shadow_pool") or []
+            tier_pools = {"LEGACY": legacy}
+        tier_counts = {t: len(_shadow_list(tier_pools.get(t, []))) for t in tier_keys}
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Tier 1 (BTC)", tier_counts["TIER_1_BTC"])
+        m2.metric("Tier 2 (Elitné ≥10M)", tier_counts["TIER_2_ELITE"])
+        m3.metric("Tier 3 (Low-Cap 3.5–9.99M)", tier_counts["TIER_3_LOWCAP"])
+        shadow_filter = st.selectbox("Tier filter", ["Všetky tiery"] + tier_keys, format_func=lambda k: "Všetky tiery" if k == "Všetky tiery" else TIER_LABELS_SHADOW[k], key="v7_shadow_filter")
+        selected_tiers = tier_keys if shadow_filter == "Všetky tiery" else [shadow_filter]
+        now_ts = time.time(); shadow_rows = []
+        for tier in selected_tiers:
+            for sh in _shadow_list(tier_pools.get(tier, [])):
+                if not isinstance(sh, dict): continue
                 ts0 = safe_float(sh.get("ts") or sh.get("opened_ts"), 0.0)
-                age_min = round((now_ts - ts0) / 60.0, 1) if ts0 > 0 else None
-                rows.append({
-                    "symbol": sh.get("symbol"),
-                    "direction": sh.get("direction"),
+                shadow_rows.append({"tier": tier, "symbol": sh.get("symbol"), "direction": sh.get("direction"),
                     "blocked_by": sh.get("blocked_by") or sh.get("failed_filter"),
                     "reject_price": safe_float(sh.get("reject_price") or sh.get("entry_price")),
                     "virtual_tp1": safe_float(sh.get("virtual_tp1") or sh.get("tp1_price")),
                     "virtual_sl": safe_float(sh.get("virtual_sl") or sh.get("sl_price")),
-                    "age_min": age_min,
-                })
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                    "cost_rate": safe_float(sh.get("cost_rate"), 0.0),
+                    "age_min": round((now_ts-ts0)/60.0, 1) if ts0 > 0 else None})
+        if shadow_rows:
+            st.dataframe(pd.DataFrame(shadow_rows, columns=["tier", "symbol", "direction", "blocked_by", "reject_price", "virtual_tp1", "virtual_sl", "cost_rate", "age_min"]), hide_index=True, use_container_width=True)
+        else:
+            st.info("Shadow pools neobsahujú kandidátov pre zvolený filter.")
 
 
 render_dashboard_and_telemetry()
@@ -1046,7 +1100,7 @@ def render_live_charts_section(tf: str):
         fig.update_layout(
             height=520,
             uirevision=f"{wid}_{sym}_{tf}",   # zachová manuálny zoom/pan pri live aktualizácii
-            xaxis_rangeslider_visible=False,
+            xaxis_rangeslider_visible=False,https://github.com/Kulic13/shark-alpha-bot/blob/main/app_cloud2_cockpit.py
             template="plotly_dark",
             margin=dict(l=10, r=10, t=20, b=10),
             yaxis=dict(
