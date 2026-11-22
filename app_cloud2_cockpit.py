@@ -1100,7 +1100,7 @@ def render_live_charts_section(tf: str):
         fig.update_layout(
             height=520,
             uirevision=f"{wid}_{sym}_{tf}",   # zachová manuálny zoom/pan pri live aktualizácii
-            xaxis_rangeslider_visible=False,https://github.com/Kulic13/shark-alpha-bot/blob/main/app_cloud2_cockpit.py
+            xaxis_rangeslider_visible=False,
             template="plotly_dark",
             margin=dict(l=10, r=10, t=20, b=10),
             yaxis=dict(
