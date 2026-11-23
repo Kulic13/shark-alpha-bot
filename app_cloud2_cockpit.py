@@ -1049,14 +1049,6 @@ st.subheader("📊 Živé Trhové Grafy & Exekučné Hladiny")
 
 chart_interval = ("10s" if timeframe == "1m" else "20s") if live_mode else None
 
-# V8.2 farby likviditných poolov (symetrické pre LONG aj SHORT)
-DCA_GREEN = "rgba(0, 230, 118, 0.70)"
-DCA_GREEN_WALL = "rgba(0, 230, 118, 0.85)"
-TP_RED = "rgba(255, 82, 82, 0.70)"
-TP_RED_POOL30 = "rgba(255, 82, 82, 0.80)"
-TP_RED_WALL = "rgba(255, 82, 82, 0.85)"
-
-
 @st.fragment(run_every=chart_interval)
 def render_live_charts_section(tf: str):
     active_windows = load_active_windows()
@@ -1100,7 +1092,12 @@ def render_live_charts_section(tf: str):
             sl = safe_float(w.get("sl_tsl_price"))
 
             # Horizontálna ENTRY (cena)
-            fig.add_hline(y=entry, line_color="white", line_width=2, annotation_text="ENTRY")
+            fig.add_hline(
+                y=entry, line_color="white", line_width=2,
+                annotation_text="ENTRY", annotation_position="top right",
+                annotation_font=dict(size=13, color="white"),
+                annotation_bgcolor="rgba(14, 17, 23, 0.85)",
+            )
 
             # TP1 / TP2 – zelené, ak už hitnuté tak hrubšie / iný štýl
             tp1_hit = bool(w.get("tp1_hit", False))
@@ -1109,21 +1106,37 @@ def render_live_charts_section(tf: str):
             fig.add_hline(
                 y=tp1, line_dash="dash", line_color="#00ff88",
                 line_width=3 if tp1_hit else 1.5,
-                annotation_text="TP1 executed" if tp1_hit else "TP1"
+                annotation_text="TP1 executed" if tp1_hit else "TP1",
+                annotation_position="top right",
+                annotation_font=dict(size=13, color="#00ff88"),
+                annotation_bgcolor="rgba(14, 17, 23, 0.85)",
             )
             fig.add_hline(
                 y=tp2, line_dash="dash", line_color="#00cc66",
                 line_width=3 if tp2_hit else 1.5,
-                annotation_text="TP2 executed" if tp2_hit else "TP2"
+                annotation_text="TP2 executed" if tp2_hit else "TP2",
+                annotation_position="top right",
+                annotation_font=dict(size=13, color="#00cc66"),
+                annotation_bgcolor="rgba(14, 17, 23, 0.85)",
             )
             # V8.2: TP3 sa nikdy nekreslí na 0.0
             if tp3 > 0:
-                fig.add_hline(y=tp3, line_dash="dash", line_color="#009944", annotation_text="TP3")
+                fig.add_hline(
+                    y=tp3, line_dash="dash", line_color="#009944",
+                    annotation_text="TP3", annotation_position="top right",
+                    annotation_font=dict(size=13, color="#009944"),
+                    annotation_bgcolor="rgba(14, 17, 23, 0.85)",
+                )
 
             tsl_active = bool(w.get("tsl_active", False))
             sl_txt = "TSL" if tsl_active else "SL"
             sl_color = "#ff3355"
-            fig.add_hline(y=sl, line_color=sl_color, line_width=2, annotation_text=sl_txt)
+            fig.add_hline(
+                y=sl, line_color=sl_color, line_width=2,
+                annotation_text=sl_txt, annotation_position="bottom right",
+                annotation_font=dict(size=13, color="#ff3355"),
+                annotation_bgcolor="rgba(14, 17, 23, 0.85)",
+            )
 
             # DCA hladiny – oranžové; kreslíme iba tie s cenou > 0 (DCA3 = 0.0 nesmie deformovať os Y)
             dca1_p = safe_float(w.get("dca1_price"))
@@ -1140,7 +1153,10 @@ def render_live_charts_section(tf: str):
                         line_dash="solid" if _filled else "dot",
                         line_color="orange",
                         line_width=2 if _filled else 1,
-                        annotation_text=f"{_lbl} executed" if _filled else _lbl
+                        annotation_text=f"{_lbl} executed" if _filled else _lbl,
+                        annotation_position="bottom right",
+                        annotation_font=dict(size=13, color="orange"),
+                        annotation_bgcolor="rgba(14, 17, 23, 0.85)",
                     )
 
             # ---------------------------------------------------------------
@@ -1157,48 +1173,6 @@ def render_live_charts_section(tf: str):
             bid_wall = safe_float(walls.get("bid_wall"))
             ask_wall = safe_float(walls.get("ask_wall"))
 
-            def _green_pool(_y: float, _txt: str, _color: str = DCA_GREEN, _dash: str = "dot"):
-                fig.add_hline(
-                    y=_y, line_color=_color, line_dash=_dash, line_width=1.2,
-                    annotation_text=_txt, annotation_position="bottom left",
-                    annotation_font_color=_color,
-                )
-
-            def _red_pool(_y: float, _txt: str, _color: str = TP_RED, _dash: str = "dot"):
-                fig.add_hline(
-                    y=_y, line_color=_color, line_dash=_dash, line_width=1.2,
-                    annotation_text=_txt, annotation_position="top left",
-                    annotation_font_color=_color,
-                )
-
-            # 🟢 DCA pooly (Market Makers absorbujú flow a bránia pozíciu)
-            if poc > 0:
-                _green_pool(poc, "🟢 DCA Pool: Volume POC", "#00e676")
-            if direction == "LONG":
-                if val > 0:
-                    _green_pool(val, "🟢 DCA Pool: VAL", DCA_GREEN)
-                if bid_wall > 0:
-                    _green_pool(bid_wall, "🟢 DCA L2 Bid Wall", DCA_GREEN_WALL, "dashdot")
-            elif direction == "SHORT":
-                if vah > 0:
-                    _green_pool(vah, "🟢 DCA Pool: VAH", DCA_GREEN)
-                if ask_wall > 0:
-                    _green_pool(ask_wall, "🟢 DCA L2 Ask Wall", DCA_GREEN_WALL, "dashdot")
-
-            # 🔴 TP pooly (opačná likvidita – cieľ pre TP1_WALL_FRONTRUN / TP1 / TP2)
-            if pool30 > 0:
-                _red_pool(pool30, "🔴 TP Pool 30", TP_RED_POOL30)
-            if direction == "LONG":
-                if vah > 0:
-                    _red_pool(vah, "🔴 TP Pool: VAH", TP_RED)
-                if ask_wall > 0:
-                    _red_pool(ask_wall, "🔴 TP L2 Ask Wall", TP_RED_WALL, "dashdot")
-            elif direction == "SHORT":
-                if val > 0:
-                    _red_pool(val, "🔴 TP Pool: VAL", TP_RED)
-                if bid_wall > 0:
-                    _red_pool(bid_wall, "🔴 TP L2 Bid Wall", TP_RED_WALL, "dashdot")
-
             # Rozšírenie y-range o obchodné hladiny (entry/TP/SL/DCA), nie o vzdialené walls/pooly
             level_prices = [p for p in [entry, tp1, tp2, sl, dca1_p, dca2_p, dca3_p] if p > 0]
             if tp3 > 0:
@@ -1206,6 +1180,80 @@ def render_live_charts_section(tf: str):
             if level_prices:
                 price_low = min(price_low, min(level_prices))
                 price_high = max(price_high, max(level_prices))
+
+            # ---------------------------------------------------------------
+            # V8.2: Likviditné ZÓNY (add_hrect) – 🟢 DCA zóna / 🔴 TP zóna
+            # Zóny NEROZŠIRUJÚ y-range (level_prices ostáva bez nich).
+            # ---------------------------------------------------------------
+            min_band = max((price_high - price_low) * 0.025, entry * 0.0008)
+
+            # 🟢 DCA zóna (Market Makers absorbujú flow a bránia pozíciu)
+            dca_zone_levels = []
+            if poc > 0:
+                dca_zone_levels.append(poc)
+            if direction == "LONG":
+                if val > 0:
+                    dca_zone_levels.append(val)
+                if bid_wall > 0:
+                    dca_zone_levels.append(bid_wall)
+            elif direction == "SHORT":
+                if vah > 0:
+                    dca_zone_levels.append(vah)
+                if ask_wall > 0:
+                    dca_zone_levels.append(ask_wall)
+
+            if dca_zone_levels:
+                z_low = min(dca_zone_levels)
+                z_high = max(dca_zone_levels)
+                if (z_high - z_low) < (2 * min_band):
+                    mid = 0.5 * (z_low + z_high)
+                    z_low = mid - min_band
+                    z_high = mid + min_band
+                fig.add_hrect(
+                    y0=z_low,
+                    y1=z_high,
+                    fillcolor="rgba(0, 230, 118, 0.14)",
+                    line_width=1,
+                    line_color="rgba(0, 230, 118, 0.45)",
+                    annotation_text="🟢 DCA Liquidity Zone (POC / Wall)",
+                    annotation_position="top left",
+                    annotation_font=dict(size=13, color="#00e676"),
+                    annotation_bgcolor="rgba(14, 17, 23, 0.78)",
+                )
+
+            # 🔴 TP zóna (opačná likvidita – cieľ pre TP1_WALL_FRONTRUN / TP1 / TP2)
+            tp_zone_levels = []
+            if pool30 > 0:
+                tp_zone_levels.append(pool30)
+            if direction == "LONG":
+                if vah > 0:
+                    tp_zone_levels.append(vah)
+                if ask_wall > 0:
+                    tp_zone_levels.append(ask_wall)
+            elif direction == "SHORT":
+                if val > 0:
+                    tp_zone_levels.append(val)
+                if bid_wall > 0:
+                    tp_zone_levels.append(bid_wall)
+
+            if tp_zone_levels:
+                t_low = min(tp_zone_levels)
+                t_high = max(tp_zone_levels)
+                if (t_high - t_low) < (2 * min_band):
+                    mid = 0.5 * (t_low + t_high)
+                    t_low = mid - min_band
+                    t_high = mid + min_band
+                fig.add_hrect(
+                    y0=t_low,
+                    y1=t_high,
+                    fillcolor="rgba(255, 82, 82, 0.14)",
+                    line_width=1,
+                    line_color="rgba(255, 82, 82, 0.45)",
+                    annotation_text="🔴 TP Liquidity Zone (Pool 30 / Wall)",
+                    annotation_position="bottom left",
+                    annotation_font=dict(size=13, color="#ff5252"),
+                    annotation_bgcolor="rgba(14, 17, 23, 0.78)",
+                )
 
             # Biela VERTIKÁLNA čiara = moment otvorenia obchodu (z core1)
             # Priorita: opened_at → mandate_expires_at - 30min. Žiadny updated_at / prvá sviečka.
@@ -1261,7 +1309,8 @@ def render_live_charts_section(tf: str):
                     text="OPEN" if in_range else "OPEN (mimo rozsahu grafu)",
                     showarrow=False,
                     yanchor="bottom",
-                    font=dict(color="white", size=12),
+                    font=dict(color="white", size=13),
+                    bgcolor="rgba(14, 17, 23, 0.85)",
                 )
                 st.caption(
                     f"Otvorené: **{entry_ts.strftime('%Y-%m-%d %H:%M:%S')} UTC**"
@@ -1282,10 +1331,12 @@ def render_live_charts_section(tf: str):
             xaxis_rangeslider_visible=False,
             template="plotly_dark",
             margin=dict(l=10, r=10, t=20, b=10),
+            xaxis=dict(tickfont=dict(size=12)),
             yaxis=dict(
                 range=[y_min, y_max],
                 autorange=False,          # pevný range okolo ceny – walls sú mimo, po zoom out ich uvidíš
-                fixedrange=False          # používateľ môže stále zoomovať / panovať
+                fixedrange=False,         # používateľ môže stále zoomovať / panovať
+                tickfont=dict(size=12)
             )
         )
         st.plotly_chart(fig, use_container_width=True, key=f"chart_w{wid}_{tf}")
