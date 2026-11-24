@@ -51,7 +51,7 @@ def fetch_cached_vault_state() -> dict:
 def fetch_cached_trade_history() -> pd.DataFrame:
     try:
         res = supabase.table("trade_history").select(
-            "id,window_id,symbol,direction,regime,leverage,entry_price,exit_price,margin_usd,pnl_usd,pnl_percent,exit_reason,closed_at,open_at,dca1_filled,dca2_filled,dca3_filled,tp1_hit,tp2_hit"
+            "id,window_id,symbol,direction,regime,leverage,entry_price,exit_price,margin_usd,pnl_usd,pnl_percent,exit_reason,current_balance,closed_at,open_at,dca1_filled,dca2_filled,dca3_filled,tp1_hit,tp2_hit"
         ).order("id", desc=True).limit(300).execute()
         df = pd.DataFrame(res.data) if res.data else pd.DataFrame()
         if not df.empty and "id" in df.columns:
@@ -233,10 +233,17 @@ def safe_float(val, default=0.0) -> float:
 EQUITY_BASELINE = 1000.0
 
 
-def build_fresh_equity(df_sub: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+# Scale-out riadky (partial exits) nenesú vlastný vstupný poplatok – ten sa účtuje raz na finálnom close
+SCALE_OUT_REASONS = {"TP1_SCALE_OUT", "TP2_SCALE_OUT"}
+ENTRY_FEE_RATE = 0.0005  # odhad vstupného poplatku: 0.05 % z notionalu (margin * leverage)
+
+
+def build_fresh_equity(df_sub: pd.DataFrame, net_of_entry_fees: bool = True) -> tuple[pd.Series, pd.Series]:
     """
-    Equity od EQUITY_BASELINE + kumulatívny súčet pnl_usd.
-    Ignoruje current_balance z DB (po mazaní SQL býva nekonzistentný).
+    Per-window segment equity: EQUITY_BASELINE + kumulatívny súčet (pnl_usd - odhad vstupného poplatku).
+    Odhad vstupného poplatku = 0.0005 * margin_usd * leverage, účtovaný raz na finálnom close
+    (scale-out riadky TP1/TP2 sa nepoplatkujú, aby sa poplatok nezdvojil).
+    current_balance sa tu NEPOUŽÍVA, lebo je account-wide (celkový účet má vlastný graf).
     Triedi chronologicky; vynechá riadky bez pnl_usd.
     """
     if df_sub is None or df_sub.empty or "pnl_usd" not in df_sub.columns:
@@ -258,11 +265,25 @@ def build_fresh_equity(df_sub: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     else:
         d["_t"] = np.arange(len(d))
 
-    d = d.dropna(subset=["_t"]).sort_values("_t")
+    d = d.dropna(subset=["_t"])
     if d.empty:
         return pd.Series(dtype=float), pd.Series(dtype=float)
+    if "id" in d.columns:
+        d = d.sort_values(["_t", "id"], kind="stable")
+    else:
+        d = d.sort_values("_t", kind="stable")
 
-    equity = EQUITY_BASELINE + d["pnl_usd"].cumsum()
+    step = d["pnl_usd"].copy()
+    if net_of_entry_fees and "margin_usd" in d.columns and "leverage" in d.columns:
+        margin = pd.to_numeric(d["margin_usd"], errors="coerce").fillna(0.0)
+        lev = pd.to_numeric(d["leverage"], errors="coerce").fillna(1.0)
+        fee = ENTRY_FEE_RATE * margin * lev
+        if "exit_reason" in d.columns:
+            is_scale = d["exit_reason"].fillna("").astype(str).isin(SCALE_OUT_REASONS)
+            fee = fee.where(~is_scale, 0.0)
+        step = step - fee
+
+    equity = EQUITY_BASELINE + step.cumsum()
     return d["_t"].reset_index(drop=True), equity.reset_index(drop=True)
 
 
@@ -356,6 +377,10 @@ def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
             "THETA_DECAY_PROFIT_EXIT": "⏱️ Theta Decay (zisk)",
             "MM_EXHAUSTION_UNWIND": "🐋 MM Exhaustion Unwind (zisk)",
             "WALL_STEPPING_SL": "🧱 Wall-Stepping SL",
+            "TP1_ICEBERG_FRONTRUN": "🧊 TP1 Iceberg Front-Run",
+            "DCA_RESCUE_ABSORPTION_EXIT": "🚑 DCA Rescue Absorpcia (zisk)",
+            "TIME_STOP_DOA": "⏱️ Time-Stop DOA (50% času)",
+            "TIME_STOP_DCA_RESCUE": "🚑 Time-Stop DCA Rescue (75% času)",
         }
         reason_counts = reasons_all.replace("", "UNKNOWN").value_counts()
         for reason, cnt in reason_counts.items():
@@ -570,10 +595,17 @@ def render_dashboard_and_telemetry():
             if w.get("status") == "ACTIVE"
         )
 
-        # Rekonštruovaný kapitál (fresh baseline) – to, čo má user vidieť ako „Aktuálny zostatok“
-        curr_bal = EQUITY_BASELINE + realized_pnl + unrealized
-        total_pnl = realized_pnl + unrealized  # delta voči baseline
-        vault_bal = safe_float(vault_state.get("balance"), curr_bal)
+        # Autoritatívny zatvorený zostatok z workera (core1 ledger) – už obsahuje vstupné, DCA aj funding poplatky
+        vault_bal = safe_float(vault_state.get("balance"), EQUITY_BASELINE)
+        # Reálna equity účtu v reálnom čase = zatvorený vault + nerealizované PnL otvorených pozícií
+        live_equity = vault_bal + unrealized
+        # Čistý PnL účtu (realized + unrealized po všetkých poplatkoch) voči baseline
+        net_vault_pnl = live_equity - EQUITY_BASELINE
+        # Rozdiel medzi hrubým súčtom exit pnl_usd a skutočným vault balance = vstupné/DCA/funding poplatky
+        total_fees_drag = (EQUITY_BASELINE + realized_pnl) - vault_bal
+        # Aliasy pre vetvu bez histórie obchodov
+        curr_bal = live_equity
+        total_pnl = net_vault_pnl
 
         if not history_df.empty:
             # Win/Fail: 1 obchod = 1 finálny close (bez TP1/TP2 scale-out ledger riadkov).
@@ -590,6 +622,8 @@ def render_dashboard_and_telemetry():
                 "THETA_DECAY_PROFIT_EXIT",
                 "MM_EXHAUSTION_UNWIND",
                 "WALL_STEPPING_SL",
+                "TP1_ICEBERG_FRONTRUN",
+                "DCA_RESCUE_ABSORPTION_EXIT",
             }
             FAIL_REASONS = {
                 "HARD_SL_HIT",
@@ -598,6 +632,8 @@ def render_dashboard_and_telemetry():
                 "LIQUIDATION_HIT",
                 "SPOOF_COLLAPSE_ESCAPE",
                 "TIME_STOP_CHOP",
+                "TIME_STOP_DOA",
+                "TIME_STOP_DCA_RESCUE",
             }
             SCALE_OUT = {"TP1_SCALE_OUT", "TP2_SCALE_OUT"}
 
@@ -712,8 +748,12 @@ def render_dashboard_and_telemetry():
             m1, m2, m3 = st.columns(3)
             m1.metric("Aktuálny Kapitál (OKX Vault)", f"${vault_bal:.2f}", f"{vault_bal - EQUITY_BASELINE:+.2f} USD")
             m1.caption(
-                f"Ledger (trade_history): baseline {EQUITY_BASELINE:.0f} + realized {realized_pnl:+.2f} "
-                f"+ unrealized {unrealized:+.2f} = ${curr_bal:.2f}"
+                f"Živá Equity (vrátane open PnL): **${live_equity:.2f}** | "
+                f"Vstupné/DCA/Funding poplatky spolu: **-${max(0.0, total_fees_drag):.2f}**"
+            )
+            m1.caption(
+                f"Čistý PnL účtu (realized + unrealized po poplatkoch): {net_vault_pnl:+.2f} USD | "
+                f"Σ gross exit pnl_usd: {realized_pnl:+.2f} | baseline {EQUITY_BASELINE:.0f}"
             )
             m2.metric("Celková Úspešnosť", f"{wr_total:.1f} %", f"{total_trades} obchodov")
             m2.caption(
@@ -730,6 +770,66 @@ def render_dashboard_and_telemetry():
             else:
                 df_w15 = history_df.copy()
                 df_w6 = history_df.iloc[0:0].copy()
+
+            # ----- Celková Equity Krivka účtu (current_balance = pravda z core1 ledgeru) -----
+            if "current_balance" in history_df.columns:
+                d_bal = history_df.copy()
+                d_bal["current_balance"] = pd.to_numeric(d_bal["current_balance"], errors="coerce")
+                d_bal = d_bal.dropna(subset=["current_balance"])
+                bal_time_axis = False
+                if not d_bal.empty:
+                    if "closed_at" in d_bal.columns and d_bal["closed_at"].notna().any():
+                        d_bal["_t"] = pd.to_datetime(d_bal["closed_at"], utc=True, errors="coerce")
+                        bal_time_axis = True
+                    elif "id" in d_bal.columns:
+                        d_bal["_t"] = pd.to_numeric(d_bal["id"], errors="coerce")
+                    else:
+                        d_bal["_t"] = np.arange(len(d_bal))
+                    d_bal = d_bal.dropna(subset=["_t"])
+                    if "id" in d_bal.columns:
+                        d_bal = d_bal.sort_values(["_t", "id"], kind="stable")
+                    else:
+                        d_bal = d_bal.sort_values("_t", kind="stable")
+                    d_bal = d_bal.reset_index(drop=True)
+
+                if not d_bal.empty:
+                    st.markdown("##### 📈 Celková Equity Krivka účtu (`current_balance`)")
+                    last_bal = float(d_bal["current_balance"].iloc[-1])
+                    last_t = d_bal["_t"].iloc[-1]
+
+                    fig_acc = go.Figure()
+                    fig_acc.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray",
+                                      annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
+                    fig_acc.add_trace(go.Scatter(
+                        x=d_bal["_t"], y=d_bal["current_balance"],
+                        mode="lines+markers", name="Equity účtu – current_balance ($)",
+                        line=dict(color="#4da3ff", width=3),
+                    ))
+                    if abs(unrealized) > 1e-9:
+                        if bal_time_axis:
+                            x_live = max(pd.Timestamp.now(tz="UTC"), last_t)
+                        else:
+                            x_live = last_t + 1
+                        fig_acc.add_trace(go.Scatter(
+                            x=[last_t, x_live], y=[last_bal, live_equity],
+                            mode="lines+markers", name="Živá equity (vrátane open PnL)",
+                            line=dict(color="#ffaa00", width=3, dash="dash"),
+                        ))
+                    fig_acc.update_layout(
+                        height=300, margin=dict(l=10, r=10, t=10, b=10),
+                        template="plotly_dark",
+                        yaxis_title="Equity ($)",
+                        uirevision="account_equity_curve",
+                    )
+                    st.plotly_chart(fig_acc, use_container_width=True, key="equity_chart_account")
+
+                    acc_caption = (
+                        f"Posledný current_balance: **${last_bal:.2f}** | Vault balance: **${vault_bal:.2f}** "
+                        f"| Živá equity: **${live_equity:.2f}**"
+                    )
+                    if abs(last_bal - vault_bal) > 0.005:
+                        acc_caption += f" | ⚠ rozdiel ledger vs vault: {last_bal - vault_bal:+.2f} USD (možné oneskorenie cache)"
+                    st.caption(acc_caption)
 
             tab_w15, tab_w6 = st.tabs([
                 "📊 Okná 1–5 (Adaptívne MMR)",
@@ -755,7 +855,7 @@ def render_dashboard_and_telemetry():
                                         annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
                         fig15.add_trace(go.Scatter(
                             x=x15, y=eq15,
-                            mode="lines+markers", name="Equity W1–5 ($)",
+                            mode="lines+markers", name="Equity W1–5 (po vstup. poplatkoch) ($)",
                             line=dict(color="#00ffcc", width=3),
                         ))
                         fig15.update_layout(
@@ -764,7 +864,10 @@ def render_dashboard_and_telemetry():
                             yaxis_title="Equity ($)",
                         )
                         st.plotly_chart(fig15, use_container_width=True, key="equity_chart_w15")
-                        st.caption(f"Equity od baseline **{EQUITY_BASELINE:.0f} $** + Σ pnl (aktuálne dáta, bez starej SQL histórie balance).")
+                        st.caption(
+                            f"Segmentová equity okien 1–5: baseline **{EQUITY_BASELINE:.0f} $** + Σ (pnl_usd − odhad vstupného poplatku "
+                            f"{ENTRY_FEE_RATE} × margin × leverage). Account-wide current_balance je v grafe nad záložkami."
+                        )
                     else:
                         st.info("Okná 1–5: žiadne platné pnl_usd na vykreslenie equity.")
                 else:
@@ -796,7 +899,7 @@ def render_dashboard_and_telemetry():
                                        annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
                         fig6.add_trace(go.Scatter(
                             x=x6, y=eq6,
-                            mode="lines+markers", name="Equity AI W6 ($)",
+                            mode="lines+markers", name="Equity AI W6 (po vstup. poplatkoch) ($)",
                             line=dict(color="#00FFAA", width=3),
                         ))
                         fig6.update_layout(
@@ -805,7 +908,10 @@ def render_dashboard_and_telemetry():
                             yaxis_title="Equity ($)",
                         )
                         st.plotly_chart(fig6, use_container_width=True, key="equity_chart_w6")
-                        st.caption(f"AI Equity od baseline **{EQUITY_BASELINE:.0f} $** + Σ pnl (fresh restart).")
+                        st.caption(
+                            f"Segmentová AI equity: baseline **{EQUITY_BASELINE:.0f} $** + Σ (pnl_usd − odhad vstupného poplatku "
+                            f"{ENTRY_FEE_RATE} × margin × leverage). Account-wide current_balance je v grafe nad záložkami."
+                        )
                     else:
                         st.info("AI Okno 6: žiadne platné pnl_usd na vykreslenie equity.")
                 else:
@@ -1378,4 +1484,4 @@ def render_live_charts_section(tf: str):
 render_live_charts_section(timeframe)
 
 st.divider()
-st.caption("Shark Alpha Cockpit Cloud 2 • core1_version3 V8.2 MM Engine • System F telemetry • fresh equity baseline 1000 USD")
+st.caption("Shark Alpha Cockpit Cloud 2 • core1_version3 V8.8 MM Engine • System F telemetry • true ledger equity")
