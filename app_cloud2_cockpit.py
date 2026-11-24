@@ -288,13 +288,7 @@ def build_fresh_equity(df_sub: pd.DataFrame, net_of_entry_fees: bool = True) -> 
 
 
 def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
-    """3-stĺpcový breakdown: Take Profit hits / DCA fills / Dôvod zatvorenia pre daný subset histórie.
-
-    trade_history obsahuje aj partial scale-out riadky (TP1_SCALE_OUT / TP2_SCALE_OUT).
-    - TP hits: počítame eventy (scale-out riadky + finálne TP3 close).
-    - DCA fills: počítame len na finálnych close riadkoch (flags dca*_filled z core1).
-    - Dôvod zatvorenia: všetky riadky (vrátane scale-outov).
-    """
+    """Štatistiky TP/DCA a dôvody zatvorenia v širokom dvojpanelovom layoute."""
     n_all = len(df_subset)
     if n_all == 0:
         st.info(f"{title_prefix}: Zatiaľ žiadne uzavreté obchody.")
@@ -305,7 +299,6 @@ def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
     else:
         reasons_all = pd.Series([""] * n_all, index=df_subset.index)
 
-    # Finálne close = všetko okrem partial scale-out ledger riadkov
     scale_out_reasons = {"TP1_SCALE_OUT", "TP2_SCALE_OUT"}
     is_final = ~reasons_all.isin(scale_out_reasons)
     df_final = df_subset.loc[is_final].copy()
@@ -316,71 +309,47 @@ def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
         else reasons_all
     )
 
-    c1, c2, c3 = st.columns(3)
+    sec_left, sec_right = st.columns([0.42, 0.58], gap="large")
+    with sec_left:
+        st.markdown(f"#### 📊 {title_prefix}")
+        tp_col, dca_col = st.columns(2)
+        with tp_col:
+            st.markdown("**Take Profit hits**")
+            tp1_cnt = int((reasons_all == "TP1_SCALE_OUT").sum())
+            tp2_cnt = int((reasons_all == "TP2_SCALE_OUT").sum())
+            tp3_cnt = int(reasons_all.str.contains("LIQUIDATION_CLIMAX|TP3", regex=True, na=False).sum())
+            if tp1_cnt == 0 and "tp1_hit" in df_final.columns and len(df_final) > 0:
+                tp1_cnt = int(df_final["tp1_hit"].fillna(False).astype(bool).sum())
+            if tp2_cnt == 0 and "tp2_hit" in df_final.columns and len(df_final) > 0:
+                tp2_cnt = int(df_final["tp2_hit"].fillna(False).astype(bool).sum())
+            st.write(f"TP1 executed: **{tp1_cnt}** / {n_trades}")
+            st.write(f"TP2 executed: **{tp2_cnt}** / {n_trades}")
+            st.write(f"TP3 / Climax hit: **{tp3_cnt}** / {n_trades}")
+        with dca_col:
+            st.markdown("**DCA fills**")
+            src = df_final if len(df_final) > 0 else df_subset
+            n_dca_base = len(src) if len(src) > 0 else n_all
+            dca_counts = [int(src[c].fillna(False).astype(bool).sum()) if c in src.columns else 0 for c in ("dca1_filled", "dca2_filled", "dca3_filled")]
+            st.write(f"DCA1 filled: **{dca_counts[0]}** / {n_dca_base}")
+            st.write(f"DCA2 filled: **{dca_counts[1]}** / {n_dca_base}")
+            st.write(f"DCA3 filled: **{dca_counts[2]}** / {n_dca_base}")
+            if "dca1_filled" not in df_subset.columns:
+                st.caption("⚠ Stĺpce dca*_filled ešte nie sú v trade_history (deploy core1 fix).")
 
-    with c1:
-        st.markdown("**Take Profit hits**")
-        # Event-based: scale-out riadky + finálne TP3/climax
-        tp1_cnt = int((reasons_all == "TP1_SCALE_OUT").sum())
-        tp2_cnt = int((reasons_all == "TP2_SCALE_OUT").sum())
-        tp3_cnt = int(reasons_all.str.contains("LIQUIDATION_CLIMAX|TP3", regex=True, na=False).sum())
-        # Fallback z boolean flags na finálnych close (ak core1 zapísal tp*_hit)
-        if tp1_cnt == 0 and "tp1_hit" in df_final.columns and len(df_final) > 0:
-            tp1_cnt = int(df_final["tp1_hit"].fillna(False).astype(bool).sum())
-        if tp2_cnt == 0 and "tp2_hit" in df_final.columns and len(df_final) > 0:
-            tp2_cnt = int(df_final["tp2_hit"].fillna(False).astype(bool).sum())
-        st.write(f"TP1 executed: **{tp1_cnt}** / {n_trades}")
-        st.write(f"TP2 executed: **{tp2_cnt}** / {n_trades}")
-        st.write(f"TP3 / Climax hit: **{tp3_cnt}** / {n_trades}")
-
-    with c2:
-        st.markdown("**DCA fills**")
-        # Trade-level: flags len na finálnych close riadkoch (core1 close_position)
-        src = df_final if len(df_final) > 0 else df_subset
-        n_dca_base = len(src) if len(src) > 0 else n_all
-        if "dca1_filled" in src.columns:
-            dca1_cnt = int(src["dca1_filled"].fillna(False).astype(bool).sum())
-        else:
-            dca1_cnt = 0
-        if "dca2_filled" in src.columns:
-            dca2_cnt = int(src["dca2_filled"].fillna(False).astype(bool).sum())
-        else:
-            dca2_cnt = 0
-        if "dca3_filled" in src.columns:
-            dca3_cnt = int(src["dca3_filled"].fillna(False).astype(bool).sum())
-        else:
-            dca3_cnt = 0
-        st.write(f"DCA1 filled: **{dca1_cnt}** / {n_dca_base}")
-        st.write(f"DCA2 filled: **{dca2_cnt}** / {n_dca_base}")
-        st.write(f"DCA3 filled: **{dca3_cnt}** / {n_dca_base}")
-        if "dca1_filled" not in df_subset.columns:
-            st.caption("⚠ Stĺpce dca*_filled ešte nie sú v trade_history (deploy core1 fix).")
-
-    with c3:
-        st.markdown("**Dôvod zatvorenia**")
+    with sec_right:
+        st.markdown("#### 🧾 Dôvod zatvorenia")
         reason_labels = {
-            "HARD_SL_HIT": "🔴 Hard SL / Wall SL",
-            "BE_STOP_AFTER_TP1": "🟡 BE stop po TP1",
-            "TP1_SCALE_OUT": "TP1_SCALE_OUT",
-            "TRAILING_SL_PROFIT": "🟢 Trailing SL (zisk)",
-            "EARLY_ORDERFLOW_ESCAPE": "⚠️ Early OF escape",
-            "TP2_SCALE_OUT": "TP2_SCALE_OUT",
-            "LIQUIDATION_CLIMAX_HIT": "🎯 TP3 Liquidation Climax",
-            "TP3_LIQUIDATION_HIT": "🎯 TP3",
-            "VPIN_EMERGENCY_ESCAPE": "☠️ VPIN Emergency",
-            "TP1_WALL_FRONTRUN": "🧱 TP1 Front-Run steny",
-            "TP2_WALL_FRONTRUN": "🧱 TP2 Front-Run steny",
-            "SPOOF_COLLAPSE_ESCAPE": "👻 Spoofing únik",
-            "TIME_STOP_CHOP": "⏳ Time-Stop (Chop)",
-            "TIME_STOP_STAGNANT": "⏳ Time-Stop (Stagnácia)",
-            "MFE_PROFIT_LOCK": "🛡️ MFE Zámok zisku",
-            "THETA_DECAY_PROFIT_EXIT": "⏱️ Theta Decay (zisk)",
-            "MM_EXHAUSTION_UNWIND": "🐋 MM Exhaustion Unwind (zisk)",
-            "WALL_STEPPING_SL": "🧱 Wall-Stepping SL",
-            "TP1_ICEBERG_FRONTRUN": "🧊 TP1 Iceberg Front-Run",
-            "DCA_RESCUE_ABSORPTION_EXIT": "🚑 DCA Rescue Absorpcia (zisk)",
-            "TIME_STOP_DOA": "⏱️ Time-Stop DOA (50% času)",
-            "TIME_STOP_DCA_RESCUE": "🚑 Time-Stop DCA Rescue (75% času)",
+            "HARD_SL_HIT": "🔴 Hard SL / Wall SL", "BE_STOP_AFTER_TP1": "🟡 BE stop po TP1",
+            "TP1_SCALE_OUT": "TP1_SCALE_OUT", "TRAILING_SL_PROFIT": "🟢 Trailing SL (zisk)",
+            "EARLY_ORDERFLOW_ESCAPE": "⚠️ Early OF escape", "TP2_SCALE_OUT": "TP2_SCALE_OUT",
+            "LIQUIDATION_CLIMAX_HIT": "🎯 TP3 Liquidation Climax", "TP3_LIQUIDATION_HIT": "🎯 TP3",
+            "VPIN_EMERGENCY_ESCAPE": "☠️ VPIN Emergency", "TP1_WALL_FRONTRUN": "🧱 TP1 Front-Run steny",
+            "TP2_WALL_FRONTRUN": "🧱 TP2 Front-Run steny", "SPOOF_COLLAPSE_ESCAPE": "👻 Spoofing únik",
+            "TIME_STOP_CHOP": "⏳ Time-Stop (Chop)", "TIME_STOP_STAGNANT": "⏳ Time-Stop (Stagnácia)",
+            "MFE_PROFIT_LOCK": "🛡️ MFE Zámok zisku", "THETA_DECAY_PROFIT_EXIT": "⏱️ Theta Decay (zisk)",
+            "MM_EXHAUSTION_UNWIND": "🐋 MM Exhaustion Unwind (zisk)", "WALL_STEPPING_SL": "🧱 Wall-Stepping SL",
+            "TP1_ICEBERG_FRONTRUN": "🧊 TP1 Iceberg Front-Run", "DCA_RESCUE_ABSORPTION_EXIT": "🚑 DCA Rescue Absorpcia (zisk)",
+            "TIME_STOP_DOA": "⏱️ Time-Stop DOA (50% času)", "TIME_STOP_DCA_RESCUE": "🚑 Time-Stop DCA Rescue (75% času)",
         }
         reason_counts = reasons_all.replace("", "UNKNOWN").value_counts()
         reason_rows = []
@@ -392,11 +361,11 @@ def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
         mid = (len(summary_df) + 1) // 2
         left_df = summary_df.iloc[:mid]
         right_df = summary_df.iloc[mid:]
-        col_left, col_right = st.columns(2)
-        with col_left:
-            st.dataframe(left_df, hide_index=True, use_container_width=True)
-        with col_right:
-            st.dataframe(right_df, hide_index=True, use_container_width=True)
+        tbl_c1, tbl_c2 = st.columns(2, gap="small")
+        with tbl_c1:
+            st.dataframe(left_df, use_container_width=True, hide_index=True)
+        with tbl_c2:
+            st.dataframe(right_df, use_container_width=True, hide_index=True)
 
 
 # =========================================================================
@@ -409,10 +378,6 @@ st.title("🦈 Shark Alpha Institutional Cockpit (Cloud 2)")
 # -------------------------------------------------------------------------
 st.sidebar.header("🎛️ Ovládanie & Živé Pozície")
 timeframe = st.sidebar.radio("Časový rámec grafov:", ["15m", "1m"], horizontal=True)
-if st.sidebar.button("🔄 Reset zoom", key="reset_chart_zoom"):
-    st.session_state["_chart_yrange_cache"] = {}
-    st.session_state["_chart_zoom_reset_revision"] = int(st.session_state.get("_chart_zoom_reset_revision", 0)) + 1
-    st.rerun()
 live_mode = st.sidebar.toggle("⚡ Živý režim (Auto)", value=True)
 if st.sidebar.button("🔄 Obnoviť dáta Kokpitu"):
     st.cache_data.clear()
@@ -592,413 +557,389 @@ def render_dashboard_and_telemetry():
     # -------------------------------------------------------------------------
     # 1. HORNÁ ČASŤ OBRAZOVKY: DYNAMICKÝ EQUITY DASHBOARD & AI MATICA VÝKONU
     # -------------------------------------------------------------------------
-    top_col1, top_col2 = st.columns([1.2, 1.0])
+    st.subheader("📈 Dynamický Equity Dashboard")
+    # --- Kapitál: po SQL wipe nespoliehať sa len na vault.balance (býva starý/seknutý) ---
+    # Hlavná metrika = autoritatívny vault balance z workera; ledger (baseline + realized + unrealized) je v caption.
 
-    with top_col1:
-        st.subheader("📈 Dynamický Equity Dashboard")
-        # --- Kapitál: po SQL wipe nespoliehať sa len na vault.balance (býva starý/seknutý) ---
-        # Hlavná metrika = autoritatívny vault balance z workera; ledger (baseline + realized + unrealized) je v caption.
+    realized_pnl = 0.0
+    if not history_df.empty and "pnl_usd" in history_df.columns:
+        realized_pnl = float(pd.to_numeric(history_df["pnl_usd"], errors="coerce").fillna(0.0).sum())
 
-        realized_pnl = 0.0
-        if not history_df.empty and "pnl_usd" in history_df.columns:
-            realized_pnl = float(pd.to_numeric(history_df["pnl_usd"], errors="coerce").fillna(0.0).sum())
+    unrealized = sum(
+        safe_float(w.get("pnl_usd"), 0.0)
+        for w in active_windows.values()
+        if w.get("status") == "ACTIVE"
+    )
 
-        unrealized = sum(
-            safe_float(w.get("pnl_usd"), 0.0)
-            for w in active_windows.values()
-            if w.get("status") == "ACTIVE"
-        )
+    # Autoritatívny zatvorený zostatok z workera (core1 ledger) – už obsahuje vstupné, DCA aj funding poplatky
+    vault_bal = safe_float(vault_state.get("balance"), EQUITY_BASELINE)
+    # Reálna equity účtu v reálnom čase = zatvorený vault + nerealizované PnL otvorených pozícií
+    live_equity = vault_bal + unrealized
+    # Čistý PnL účtu (realized + unrealized po všetkých poplatkoch) voči baseline
+    net_vault_pnl = live_equity - EQUITY_BASELINE
+    # Rozdiel medzi hrubým súčtom exit pnl_usd a skutočným vault balance = vstupné/DCA/funding poplatky
+    total_fees_drag = (EQUITY_BASELINE + realized_pnl) - vault_bal
+    # Aliasy pre vetvu bez histórie obchodov
+    curr_bal = live_equity
+    total_pnl = net_vault_pnl
 
-        # Autoritatívny zatvorený zostatok z workera (core1 ledger) – už obsahuje vstupné, DCA aj funding poplatky
-        vault_bal = safe_float(vault_state.get("balance"), EQUITY_BASELINE)
-        # Reálna equity účtu v reálnom čase = zatvorený vault + nerealizované PnL otvorených pozícií
-        live_equity = vault_bal + unrealized
-        # Čistý PnL účtu (realized + unrealized po všetkých poplatkoch) voči baseline
-        net_vault_pnl = live_equity - EQUITY_BASELINE
-        # Rozdiel medzi hrubým súčtom exit pnl_usd a skutočným vault balance = vstupné/DCA/funding poplatky
-        total_fees_drag = (EQUITY_BASELINE + realized_pnl) - vault_bal
-        # Aliasy pre vetvu bez histórie obchodov
-        curr_bal = live_equity
-        total_pnl = net_vault_pnl
+    if not history_df.empty:
+        # Win/Fail: 1 obchod = 1 finálny close (bez TP1/TP2 scale-out ledger riadkov).
+        # WIN = dosiahnutý TP1/TP2/TP3 alebo TSL/BE po TP, alebo kladný pnl na finálnom close.
+        WIN_REASONS = {
+            "TRAILING_SL_PROFIT",
+            "BE_STOP_AFTER_TP1",
+            "LIQUIDATION_CLIMAX_HIT",
+            "TP3_LIQUIDATION_HIT",
+            "TP2_SCALE_OUT",  # ak by finálny close omylom niesol tento reason
+            "TP1_WALL_FRONTRUN",
+            "TP2_WALL_FRONTRUN",
+            "MFE_PROFIT_LOCK",
+            "THETA_DECAY_PROFIT_EXIT",
+            "MM_EXHAUSTION_UNWIND",
+            "WALL_STEPPING_SL",
+            "TP1_ICEBERG_FRONTRUN",
+            "DCA_RESCUE_ABSORPTION_EXIT",
+        }
+        FAIL_REASONS = {
+            "HARD_SL_HIT",
+            "EARLY_ORDERFLOW_ESCAPE",
+            "VPIN_EMERGENCY_ESCAPE",
+            "LIQUIDATION_HIT",
+            "SPOOF_COLLAPSE_ESCAPE",
+            "TIME_STOP_CHOP",
+            "TIME_STOP_DOA",
+            "TIME_STOP_DCA_RESCUE",
+        }
+        SCALE_OUT = {"TP1_SCALE_OUT", "TP2_SCALE_OUT"}
 
-        if not history_df.empty:
-            # Win/Fail: 1 obchod = 1 finálny close (bez TP1/TP2 scale-out ledger riadkov).
-            # WIN = dosiahnutý TP1/TP2/TP3 alebo TSL/BE po TP, alebo kladný pnl na finálnom close.
-            WIN_REASONS = {
-                "TRAILING_SL_PROFIT",
-                "BE_STOP_AFTER_TP1",
-                "LIQUIDATION_CLIMAX_HIT",
-                "TP3_LIQUIDATION_HIT",
-                "TP2_SCALE_OUT",  # ak by finálny close omylom niesol tento reason
-                "TP1_WALL_FRONTRUN",
-                "TP2_WALL_FRONTRUN",
-                "MFE_PROFIT_LOCK",
-                "THETA_DECAY_PROFIT_EXIT",
-                "MM_EXHAUSTION_UNWIND",
-                "WALL_STEPPING_SL",
-                "TP1_ICEBERG_FRONTRUN",
-                "DCA_RESCUE_ABSORPTION_EXIT",
-            }
-            FAIL_REASONS = {
-                "HARD_SL_HIT",
-                "EARLY_ORDERFLOW_ESCAPE",
-                "VPIN_EMERGENCY_ESCAPE",
-                "LIQUIDATION_HIT",
-                "SPOOF_COLLAPSE_ESCAPE",
-                "TIME_STOP_CHOP",
-                "TIME_STOP_DOA",
-                "TIME_STOP_DCA_RESCUE",
-            }
-            SCALE_OUT = {"TP1_SCALE_OUT", "TP2_SCALE_OUT"}
+        def _row_is_win(row, columns) -> bool:
+            """Single source of truth for Win/Fail classification (top summary + tab stats)."""
+            reason = str(row.get("exit_reason") or "")
+            tp1 = bool(row.get("tp1_hit", False)) if "tp1_hit" in columns else False
+            tp2 = bool(row.get("tp2_hit", False)) if "tp2_hit" in columns else False
+            try:
+                pnl = float(row.get("pnl_usd") or 0.0)
+            except (TypeError, ValueError):
+                pnl = 0.0
 
-            def _row_is_win(row, columns) -> bool:
-                """Single source of truth for Win/Fail classification (top summary + tab stats)."""
-                reason = str(row.get("exit_reason") or "")
-                tp1 = bool(row.get("tp1_hit", False)) if "tp1_hit" in columns else False
-                tp2 = bool(row.get("tp2_hit", False)) if "tp2_hit" in columns else False
-                try:
-                    pnl = float(row.get("pnl_usd") or 0.0)
-                except (TypeError, ValueError):
-                    pnl = 0.0
-
-                if reason in WIN_REASONS:
-                    return True
-                elif tp1 or tp2:
-                    # dosiahnutý TP → počítame ako WIN (aj keď zvyšok dotrailoval na BE)
-                    return True
-                elif reason == "HARD_SL_HIT":
-                    # Legacy MFE-ratcheted profitable stops (pre-V5.8) are wins; only pnl <= 0 is a fail.
-                    return pnl > 0
-                elif reason in FAIL_REASONS:
-                    return False
+            if reason in WIN_REASONS:
+                return True
+            elif tp1 or tp2:
+                # dosiahnutý TP → počítame ako WIN (aj keď zvyšok dotrailoval na BE)
+                return True
+            elif reason == "HARD_SL_HIT":
+                # Legacy MFE-ratcheted profitable stops (pre-V5.8) are wins; only pnl <= 0 is a fail.
                 return pnl > 0
+            elif reason in FAIL_REASONS:
+                return False
+            return pnl > 0
 
-            def _compute_tab_trade_stats(df_sub: pd.DataFrame) -> dict:
-                """Per-tab stats: 1 closed trade = 1 row (partial scale-outs excluded from Win Rate / counts)."""
-                if "exit_reason" in df_sub.columns:
-                    _r = df_sub["exit_reason"].fillna("").astype(str)
-                    df_closed = df_sub.loc[~_r.isin(SCALE_OUT)].copy()
+        def _compute_tab_trade_stats(df_sub: pd.DataFrame) -> dict:
+            """Per-tab stats: 1 closed trade = 1 row (partial scale-outs excluded from Win Rate / counts)."""
+            if "exit_reason" in df_sub.columns:
+                _r = df_sub["exit_reason"].fillna("").astype(str)
+                df_closed = df_sub.loc[~_r.isin(SCALE_OUT)].copy()
+            else:
+                df_closed = df_sub.copy()
+
+            wins = 0
+            losses = 0
+            for _, _row in df_closed.iterrows():
+                if _row_is_win(_row, df_closed.columns):
+                    wins += 1
                 else:
-                    df_closed = df_sub.copy()
+                    losses += 1
+            closed_count = wins + losses
+            win_rate = (wins / closed_count) * 100.0 if closed_count > 0 else 0.0
 
-                wins = 0
-                losses = 0
-                for _, _row in df_closed.iterrows():
-                    if _row_is_win(_row, df_closed.columns):
-                        wins += 1
-                    else:
-                        losses += 1
-                closed_count = wins + losses
-                win_rate = (wins / closed_count) * 100.0 if closed_count > 0 else 0.0
+            if "pnl_usd" in df_sub.columns:
+                pnl_all = pd.to_numeric(df_sub["pnl_usd"], errors="coerce").fillna(0.0)
+            else:
+                pnl_all = pd.Series(0.0, index=df_sub.index)
+            raw_pnl_sum = float(pnl_all.sum())
+            gross_profit = float(pnl_all.loc[pnl_all > 0].sum())
+            gross_loss = float(abs(pnl_all.loc[pnl_all < 0].sum()))
+            profit_factor = (gross_profit / gross_loss) if gross_loss > 1e-9 else (99.99 if gross_profit > 0 else 0.0)
 
-                if "pnl_usd" in df_sub.columns:
-                    pnl_all = pd.to_numeric(df_sub["pnl_usd"], errors="coerce").fillna(0.0)
-                else:
-                    pnl_all = pd.Series(0.0, index=df_sub.index)
-                raw_pnl_sum = float(pnl_all.sum())
-                gross_profit = float(pnl_all.loc[pnl_all > 0].sum())
-                gross_loss = float(abs(pnl_all.loc[pnl_all < 0].sum()))
-                profit_factor = (gross_profit / gross_loss) if gross_loss > 1e-9 else (99.99 if gross_profit > 0 else 0.0)
-
-                est_entry_fees = 0.0
-                if "margin_usd" in df_closed.columns and "leverage" in df_closed.columns:
-                    est_entry_fees = float(
-                        (
-                            pd.to_numeric(df_closed["margin_usd"], errors="coerce").fillna(0.0)
-                            * pd.to_numeric(df_closed["leverage"], errors="coerce").fillna(1.0)
-                            * 0.0005
-                        ).sum()
-                    )
-                net_pnl_after_entry_fee = raw_pnl_sum - est_entry_fees
-
-                return {
-                    "wins": wins,
-                    "losses": losses,
-                    "closed_count": closed_count,
-                    "win_rate": win_rate,
-                    "raw_pnl_sum": raw_pnl_sum,
-                    "gross_profit": gross_profit,
-                    "gross_loss": gross_loss,
-                    "profit_factor": profit_factor,
-                    "est_entry_fees": est_entry_fees,
-                    "net_pnl_after_entry_fee": net_pnl_after_entry_fee,
-                    "ledger_count": int(len(df_sub)),
-                }
-
-            def _render_tab_stats_row(df_sub: pd.DataFrame):
-                st_ = _compute_tab_trade_stats(df_sub)
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Čistý PnL ($)", f"${st_['raw_pnl_sum']:+.2f}")
-                c1.caption(
-                    f"Po odpočte vstup. poplatkov (~${st_['est_entry_fees']:.2f}): ${st_['net_pnl_after_entry_fee']:+.2f}"
+            est_entry_fees = 0.0
+            if "margin_usd" in df_closed.columns and "leverage" in df_closed.columns:
+                est_entry_fees = float(
+                    (
+                        pd.to_numeric(df_closed["margin_usd"], errors="coerce").fillna(0.0)
+                        * pd.to_numeric(df_closed["leverage"], errors="coerce").fillna(1.0)
+                        * 0.0005
+                    ).sum()
                 )
-                c2.metric("Reálny Win Rate", f"{st_['win_rate']:.1f} %", f"{st_['wins']} Win / {st_['losses']} Fail")
-                c3.metric("Profit Factor", f"{st_['profit_factor']:.2f}" if st_["profit_factor"] < 99.0 else "∞")
-                c4.metric("Uzavreté obchody", f"{st_['closed_count']}", f"{st_['ledger_count']} ledger záznamov")
+            net_pnl_after_entry_fee = raw_pnl_sum - est_entry_fees
 
-            if "exit_reason" in history_df.columns:
-                _reasons = history_df["exit_reason"].fillna("").astype(str)
-                _pdf = history_df.loc[~_reasons.isin(SCALE_OUT)].copy()
-            else:
-                _pdf = history_df.copy()
+            return {
+                "wins": wins,
+                "losses": losses,
+                "closed_count": closed_count,
+                "win_rate": win_rate,
+                "raw_pnl_sum": raw_pnl_sum,
+                "gross_profit": gross_profit,
+                "gross_loss": gross_loss,
+                "profit_factor": profit_factor,
+                "est_entry_fees": est_entry_fees,
+                "net_pnl_after_entry_fee": net_pnl_after_entry_fee,
+                "ledger_count": int(len(df_sub)),
+            }
 
-            win_trades = 0
-            fail_trades = 0
-            if len(_pdf) > 0:
-                for _, row in _pdf.iterrows():
-                    is_win = _row_is_win(row, _pdf.columns)
-
-                    if is_win:
-                        win_trades += 1
-                    else:
-                        fail_trades += 1
-
-            total_trades = win_trades + fail_trades
-            wr_total = (win_trades / total_trades) * 100.0 if total_trades > 0 else 0.0
-            n_scale = 0
-            if "exit_reason" in history_df.columns:
-                n_scale = int(history_df["exit_reason"].fillna("").astype(str).isin(list(SCALE_OUT)).sum())
-
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Aktuálny Kapitál (OKX Vault)", f"${vault_bal:.2f}", f"{vault_bal - EQUITY_BASELINE:+.2f} USD")
-            m1.caption(
-                f"Živá Equity (vrátane open PnL): **${live_equity:.2f}** | "
-                f"Vstupné/DCA/Funding poplatky spolu: **-${max(0.0, total_fees_drag):.2f}**"
+        def _render_tab_stats_row(df_sub: pd.DataFrame):
+            st_ = _compute_tab_trade_stats(df_sub)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Čistý PnL ($)", f"${st_['raw_pnl_sum']:+.2f}")
+            c1.caption(
+                f"Po odpočte vstup. poplatkov (~${st_['est_entry_fees']:.2f}): ${st_['net_pnl_after_entry_fee']:+.2f}"
             )
-            m1.caption(
-                f"Čistý PnL účtu (realized + unrealized po poplatkoch): {net_vault_pnl:+.2f} USD | "
-                f"Σ gross exit pnl_usd: {realized_pnl:+.2f} | baseline {EQUITY_BASELINE:.0f}"
-            )
-            m2.metric("Celková Úspešnosť", f"{wr_total:.1f} %", f"{total_trades} obchodov")
-            m2.caption(
-                f"✅ Win: **{win_trades}**  |  ❌ Fail: **{fail_trades}**"
-                + (f"  |  scale-out eventy: {n_scale} (nezapočítané do WR)" if n_scale else "")
-            )
-            m3.metric("Nerealizované PnL", f"${unrealized:+.2f}")
+            c2.metric("Reálny Win Rate", f"{st_['win_rate']:.1f} %", f"{st_['wins']} Win / {st_['losses']} Fail")
+            c3.metric("Profit Factor", f"{st_['profit_factor']:.2f}" if st_["profit_factor"] < 99.0 else "∞")
+            c4.metric("Uzavreté obchody", f"{st_['closed_count']}", f"{st_['ledger_count']} ledger záznamov")
 
-            # ----- ROZDELENÉ ŠTATISTIKY: Okná 1–5 vs AI Okno 6 -----
-            if "window_id" in history_df.columns:
-                w_ids = pd.to_numeric(history_df["window_id"], errors="coerce").fillna(0).astype(int)
-                df_w15 = history_df[w_ids != 6].copy()
-                df_w6 = history_df[w_ids == 6].copy()
-            else:
-                df_w15 = history_df.copy()
-                df_w6 = history_df.iloc[0:0].copy()
-
-            # ----- Celková Equity Krivka účtu (current_balance = pravda z core1 ledgeru) -----
-            if "current_balance" in history_df.columns:
-                d_bal = history_df.copy()
-                d_bal["current_balance"] = pd.to_numeric(d_bal["current_balance"], errors="coerce")
-                d_bal = d_bal.dropna(subset=["current_balance"])
-                bal_time_axis = False
-                if not d_bal.empty:
-                    if "closed_at" in d_bal.columns and d_bal["closed_at"].notna().any():
-                        d_bal["_t"] = pd.to_datetime(d_bal["closed_at"], utc=True, errors="coerce")
-                        bal_time_axis = True
-                    elif "id" in d_bal.columns:
-                        d_bal["_t"] = pd.to_numeric(d_bal["id"], errors="coerce")
-                    else:
-                        d_bal["_t"] = np.arange(len(d_bal))
-                    d_bal = d_bal.dropna(subset=["_t"])
-                    if "id" in d_bal.columns:
-                        d_bal = d_bal.sort_values(["_t", "id"], kind="stable")
-                    else:
-                        d_bal = d_bal.sort_values("_t", kind="stable")
-                    d_bal = d_bal.reset_index(drop=True)
-
-                if not d_bal.empty:
-                    st.markdown("##### 📈 Celková Equity Krivka účtu (`current_balance`)")
-                    last_bal = float(d_bal["current_balance"].iloc[-1])
-                    last_t = d_bal["_t"].iloc[-1]
-
-                    fig_acc = go.Figure()
-                    fig_acc.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray")
-                    fig_acc.add_trace(go.Scatter(
-                        x=d_bal["_t"], y=d_bal["current_balance"],
-                        mode="lines+markers", name="Equity účtu – current_balance ($)",
-                        line=dict(color="#4da3ff", width=3),
-                    ))
-                    if abs(unrealized) > 1e-9:
-                        if bal_time_axis:
-                            x_live = max(pd.Timestamp.now(tz="UTC"), last_t)
-                        else:
-                            x_live = last_t + 1
-                        fig_acc.add_trace(go.Scatter(
-                            x=[last_t, x_live], y=[last_bal, live_equity],
-                            mode="lines+markers", name="Živá equity (vrátane open PnL)",
-                            line=dict(color="#ffaa00", width=3, dash="dash"),
-                        ))
-                    fig_acc.update_layout(
-                        height=300, margin=dict(l=10, r=10, t=12, b=10),
-                        template="plotly_dark",
-                        showlegend=False,
-                        yaxis_title="Equity ($)",
-                        uirevision="account_equity_curve",
-                    )
-                    st.plotly_chart(fig_acc, use_container_width=True, key="equity_chart_account")
-                    st.caption("🔵 **Modrá krivka:** Skutočný zostatok účtu (`current_balance` po všetkých poplatkoch)  |  🟠 **Oranžová bodka:** Živá equity vrátane otvorených pozícií  |  ⚪ **Bodkovaná čiara:** Počiatočný kapitál `1 000,00 $`")
-
-                    acc_caption = (
-                        f"Posledný current_balance: **${last_bal:.2f}** | Vault balance: **${vault_bal:.2f}** "
-                        f"| Živá equity: **${live_equity:.2f}**"
-                    )
-                    if abs(last_bal - vault_bal) > 0.005:
-                        acc_caption += f" | ⚠ rozdiel ledger vs vault: {last_bal - vault_bal:+.2f} USD (možné oneskorenie cache)"
-                    st.caption(acc_caption)
-
-            tab_w15, tab_w6 = st.tabs([
-                "📊 Okná 1–5 (Adaptívne MMR)",
-                "🤖 AI Okno 6 (XGBoost V5)",
-            ])
-
-            def _equity_xcol(df_sub: pd.DataFrame) -> str:
-                if "closed_at" in df_sub.columns and df_sub["closed_at"].notna().any():
-                    return "closed_at"
-                if "updated_at" in df_sub.columns and df_sub["updated_at"].notna().any():
-                    return "updated_at"
-                return "id"
-
-            with tab_w15:
-                n15 = len(df_w15)
-                if n15 > 0:
-                    _render_tab_stats_row(df_w15)
-
-                    x15, eq15 = build_fresh_equity(df_w15)
-                    if len(eq15) > 0:
-                        fig15 = go.Figure()
-                        fig15.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray",
-                                        annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
-                        fig15.add_trace(go.Scatter(
-                            x=x15, y=eq15,
-                            mode="lines+markers", name="Equity W1–5 (po vstup. poplatkoch) ($)",
-                            line=dict(color="#00ffcc", width=3),
-                        ))
-                        fig15.update_layout(
-                            height=260, margin=dict(l=10, r=10, t=10, b=10),
-                            template="plotly_dark",
-                            yaxis_title="Equity ($)",
-                        )
-                        st.plotly_chart(fig15, use_container_width=True, key="equity_chart_w15")
-                        st.caption(
-                            f"Segmentová equity okien 1–5: baseline **{EQUITY_BASELINE:.0f} $** + Σ (pnl_usd − odhad vstupného poplatku "
-                            f"{ENTRY_FEE_RATE} × margin × leverage). Account-wide current_balance je v grafe nad záložkami."
-                        )
-                    else:
-                        st.info("Okná 1–5: žiadne platné pnl_usd na vykreslenie equity.")
-                else:
-                    st.info("Okná 1–5: Zatiaľ žiadne uzavreté obchody.")
-
-                st.markdown("##### 📊 Sumár štatistiky — Okná 1–5")
-                render_execution_breakdown(df_w15, "Okná 1–5")
-
-            with tab_w6:
-                # AI model status (id=1)
-                mrow = fetch_cached_ai_model_info()
-                if mrow:
-                    m_name = mrow.get("model_name") or "xgboost_us_champion_v5"
-                    m_acc = mrow.get("accuracy")
-                    m_trained = mrow.get("trained_at") or "—"
-                    acc_txt = f"{float(m_acc) * 100:.1f}%" if m_acc is not None else "—"
-                    st.caption(f"Model: **{m_name}**  |  Accuracy: **{acc_txt}**  |  Trained at: **{m_trained}**")
-                else:
-                    st.caption("AI model (id=1) zatiaľ nie je v `ai_models`.")
-
-                n6 = len(df_w6)
-                if n6 > 0:
-                    _render_tab_stats_row(df_w6)
-
-                    x6, eq6 = build_fresh_equity(df_w6)
-                    if len(eq6) > 0:
-                        fig6 = go.Figure()
-                        fig6.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray",
-                                       annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
-                        fig6.add_trace(go.Scatter(
-                            x=x6, y=eq6,
-                            mode="lines+markers", name="Equity AI W6 (po vstup. poplatkoch) ($)",
-                            line=dict(color="#00FFAA", width=3),
-                        ))
-                        fig6.update_layout(
-                            height=260, margin=dict(l=10, r=10, t=10, b=10),
-                            template="plotly_dark",
-                            yaxis_title="Equity ($)",
-                        )
-                        st.plotly_chart(fig6, use_container_width=True, key="equity_chart_w6")
-                        st.caption(
-                            f"Segmentová AI equity: baseline **{EQUITY_BASELINE:.0f} $** + Σ (pnl_usd − odhad vstupného poplatku "
-                            f"{ENTRY_FEE_RATE} × margin × leverage). Account-wide current_balance je v grafe nad záložkami."
-                        )
-                    else:
-                        st.info("AI Okno 6: žiadne platné pnl_usd na vykreslenie equity.")
-                else:
-                    st.info("AI Okno 6: Zatiaľ žiadne uzavreté obchody.")
-
-                st.markdown("##### 📊 Sumár štatistiky — AI Okno 6")
-                render_execution_breakdown(df_w6, "AI Okno 6")
-
-                # ----- V8.2: Live AI V5.1 Feedback Buffer (vault_state["ai_w6_feedback"]) -----
-                st.markdown("##### 🧬 Live AI V5.1 Feedback Buffer (ai_w6_feedback)")
-                fb_raw = vault_state.get("ai_w6_feedback") or []
-                fb_entries = [e for e in fb_raw if isinstance(e, dict)] if isinstance(fb_raw, list) else []
-
-                if fb_entries:
-                    def _fb_is_win(e: dict) -> bool:
-                        oc_raw = e.get("outcome")
-                        oc = str(oc_raw).strip().upper() if oc_raw is not None else ""
-                        if oc in {"WIN", "W", "1", "TRUE", "PROFIT", "TP"}:
-                            return True
-                        if oc in {"LOSS", "L", "0", "FALSE", "FAIL", "SL"}:
-                            return False
-                        return safe_float(e.get("r_multiple")) > 0
-
-                    fb_total = len(fb_entries)
-                    fb_wins = sum(1 for e in fb_entries if _fb_is_win(e))
-                    fb_r_vals = [safe_float(e.get("r_multiple")) for e in fb_entries if e.get("r_multiple") is not None]
-                    fb_mean_r = (sum(fb_r_vals) / len(fb_r_vals)) if fb_r_vals else 0.0
-
-                    fc1, fc2, fc3 = st.columns(3)
-                    fc1.metric("Buffer (počet)", f"{fb_total}")
-                    fc2.metric("Wins", f"{fb_wins}", f"{(fb_wins / fb_total) * 100.0:.1f} %")
-                    fc3.metric("Priemerné R-multiple", f"{fb_mean_r:+.2f} R")
-
-                    fb_cols = ["symbol", "direction", "source", "outcome", "r_multiple",
-                               "ai_confidence", "exit_reason", "mae_pct", "mfe_pct"]
-                    fb_last20 = list(reversed(fb_entries[-20:]))  # najnovšie navrchu
-                    fb_df = pd.DataFrame(fb_last20).reindex(columns=fb_cols)
-                    st.dataframe(fb_df, hide_index=True, use_container_width=True)
-                else:
-                    st.info("ai_w6_feedback buffer je zatiaľ prázdny (core1 ho naplní po uzavretí AI obchodov).")
+        if "exit_reason" in history_df.columns:
+            _reasons = history_df["exit_reason"].fillna("").astype(str)
+            _pdf = history_df.loc[~_reasons.isin(SCALE_OUT)].copy()
         else:
-            st.metric("Aktuálny Kapitál", f"${curr_bal:.2f}", f"{total_pnl:+.2f} USD")
-            st.info("Zatiaľ neboli uzavreté žiadne obchody. Equity krivka sa vykreslí automaticky po prvom trejde.")
+            _pdf = history_df.copy()
 
-    with top_col2:
-        st.subheader("🧠 Živý Stav Mozgu & DNA Banky (V9.1)")
-        dna_bank = vault_state.get("pattern_dna_bank") or {}
-        mega_wins = dna_bank.get("MEGA_WINS") or []
-        toxic_fails = dna_bank.get("TOXIC_FAILS") or []
+        win_trades = 0
+        fail_trades = 0
+        if len(_pdf) > 0:
+            for _, row in _pdf.iterrows():
+                is_win = _row_is_win(row, _pdf.columns)
+
+                if is_win:
+                    win_trades += 1
+                else:
+                    fail_trades += 1
+
+        total_trades = win_trades + fail_trades
+        wr_total = (win_trades / total_trades) * 100.0 if total_trades > 0 else 0.0
+        n_scale = 0
+        if "exit_reason" in history_df.columns:
+            n_scale = int(history_df["exit_reason"].fillna("").astype(str).isin(list(SCALE_OUT)).sum())
+
         m1, m2, m3 = st.columns(3)
-        m1.metric("Aktívny Režim (X / Y)",
-                  f"X={vault_state.get('last_active_rx', 2)} · Y={vault_state.get('last_active_ry', 2)}",
-                  f"BTC NATR {safe_float(vault_state.get('last_btc_natr'), 0.0):.2f}%")
-        m2.metric("DNA Mega-Wins", len(mega_wins))
-        m3.metric("DNA Toxic-Fails", len(toxic_fails))
-        recent_patterns = []
-        for typ, rows in (("MEGA-WIN", mega_wins), ("TOXIC-FAIL", toxic_fails)):
-            for rec in rows:
-                if isinstance(rec, dict):
-                    recent_patterns.append({
-                        "Typ": typ, "Symbol": rec.get("symbol", "—"),
-                        "Smer": rec.get("direction", "—"), "Stratégia": rec.get("strategy", rec.get("trigger_style", "—")),
-                        "R": rec.get("r_multiple", rec.get("r", "—")), "PnL ($)": rec.get("pnl_usd", "—"),
-                        "ts": safe_float(rec.get("ts"), 0.0),
-                    })
-        recent_patterns.sort(key=lambda x: x.get("ts", 0.0), reverse=True)
-        if recent_patterns:
-            dna_df = pd.DataFrame(recent_patterns[:5]).drop(columns=["ts"]).reindex(columns=["Typ", "Symbol", "Smer", "Stratégia", "R", "PnL ($)"])
-            st.dataframe(dna_df, hide_index=True, use_container_width=True, height=210)
-        else:
-            st.info("DNA Banka zatiaľ zbiera vzorky pre ďalšie patterny.")
+        m1.metric("Aktuálny Kapitál (OKX Vault)", f"${vault_bal:.2f}", f"{vault_bal - EQUITY_BASELINE:+.2f} USD")
+        m1.caption(
+            f"Živá Equity (vrátane open PnL): **${live_equity:.2f}** | "
+            f"Vstupné/DCA/Funding poplatky spolu: **-${max(0.0, total_fees_drag):.2f}**"
+        )
+        m1.caption(
+            f"Čistý PnL účtu (realized + unrealized po poplatkoch): {net_vault_pnl:+.2f} USD | "
+            f"Σ gross exit pnl_usd: {realized_pnl:+.2f} | baseline {EQUITY_BASELINE:.0f}"
+        )
+        m2.metric("Celková Úspešnosť", f"{wr_total:.1f} %", f"{total_trades} obchodov")
+        m2.caption(
+            f"✅ Win: **{win_trades}**  |  ❌ Fail: **{fail_trades}**"
+            + (f"  |  scale-out eventy: {n_scale} (nezapočítané do WR)" if n_scale else "")
+        )
+        m3.metric("Nerealizované PnL", f"${unrealized:+.2f}")
 
+        # ----- ROZDELENÉ ŠTATISTIKY: Okná 1–5 vs AI Okno 6 -----
+        if "window_id" in history_df.columns:
+            w_ids = pd.to_numeric(history_df["window_id"], errors="coerce").fillna(0).astype(int)
+            df_w15 = history_df[w_ids != 6].copy()
+            df_w6 = history_df[w_ids == 6].copy()
+        else:
+            df_w15 = history_df.copy()
+            df_w6 = history_df.iloc[0:0].copy()
+
+        # ----- Celková Equity Krivka účtu (current_balance = pravda z core1 ledgeru) -----
+        if "current_balance" in history_df.columns:
+            d_bal = history_df.copy()
+            d_bal["current_balance"] = pd.to_numeric(d_bal["current_balance"], errors="coerce")
+            d_bal = d_bal.dropna(subset=["current_balance"])
+            bal_time_axis = False
+            if not d_bal.empty:
+                if "closed_at" in d_bal.columns and d_bal["closed_at"].notna().any():
+                    d_bal["_t"] = pd.to_datetime(d_bal["closed_at"], utc=True, errors="coerce")
+                    bal_time_axis = True
+                elif "id" in d_bal.columns:
+                    d_bal["_t"] = pd.to_numeric(d_bal["id"], errors="coerce")
+                else:
+                    d_bal["_t"] = np.arange(len(d_bal))
+                d_bal = d_bal.dropna(subset=["_t"])
+                if "id" in d_bal.columns:
+                    d_bal = d_bal.sort_values(["_t", "id"], kind="stable")
+                else:
+                    d_bal = d_bal.sort_values("_t", kind="stable")
+                d_bal = d_bal.reset_index(drop=True)
+
+            if not d_bal.empty:
+                st.markdown("##### 📈 Celková Equity Krivka účtu (`current_balance`)")
+                last_bal = float(d_bal["current_balance"].iloc[-1])
+                last_t = d_bal["_t"].iloc[-1]
+
+                fig_acc = go.Figure()
+                fig_acc.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray",
+                                  annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
+                fig_acc.add_trace(go.Scatter(
+                    x=d_bal["_t"], y=d_bal["current_balance"],
+                    mode="lines+markers", name="Equity účtu – current_balance ($)",
+                    line=dict(color="#4da3ff", width=3),
+                ))
+                if abs(unrealized) > 1e-9:
+                    if bal_time_axis:
+                        x_live = max(pd.Timestamp.now(tz="UTC"), last_t)
+                    else:
+                        x_live = last_t + 1
+                    fig_acc.add_trace(go.Scatter(
+                        x=[last_t, x_live], y=[last_bal, live_equity],
+                        mode="lines+markers", name="Živá equity (vrátane open PnL)",
+                        line=dict(color="#ffaa00", width=3, dash="dash"),
+                    ))
+                fig_acc.update_layout(
+                    height=300, margin=dict(l=10, r=10, t=10, b=10),
+                    template="plotly_dark",
+                    yaxis_title="Equity ($)",
+                    uirevision="account_equity_curve",
+                )
+                st.plotly_chart(fig_acc, use_container_width=True, key="equity_chart_account")
+
+                acc_caption = (
+                    f"Posledný current_balance: **${last_bal:.2f}** | Vault balance: **${vault_bal:.2f}** "
+                    f"| Živá equity: **${live_equity:.2f}**"
+                )
+                if abs(last_bal - vault_bal) > 0.005:
+                    acc_caption += f" | ⚠ rozdiel ledger vs vault: {last_bal - vault_bal:+.2f} USD (možné oneskorenie cache)"
+                st.caption(acc_caption)
+
+        tab_w15, tab_w6 = st.tabs([
+            "📊 Okná 1–5 (Adaptívne MMR)",
+            "🤖 AI Okno 6 (XGBoost V5)",
+        ])
+
+        def _equity_xcol(df_sub: pd.DataFrame) -> str:
+            if "closed_at" in df_sub.columns and df_sub["closed_at"].notna().any():
+                return "closed_at"
+            if "updated_at" in df_sub.columns and df_sub["updated_at"].notna().any():
+                return "updated_at"
+            return "id"
+
+        with tab_w15:
+            n15 = len(df_w15)
+            if n15 > 0:
+                _render_tab_stats_row(df_w15)
+
+                x15, eq15 = build_fresh_equity(df_w15)
+                if len(eq15) > 0:
+                    fig15 = go.Figure()
+                    fig15.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray",
+                                    annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
+                    fig15.add_trace(go.Scatter(
+                        x=x15, y=eq15,
+                        mode="lines+markers", name="Equity W1–5 (po vstup. poplatkoch) ($)",
+                        line=dict(color="#00ffcc", width=3),
+                    ))
+                    fig15.update_layout(
+                        height=260, margin=dict(l=10, r=10, t=10, b=10),
+                        template="plotly_dark",
+                        yaxis_title="Equity ($)",
+                    )
+                    st.plotly_chart(fig15, use_container_width=True, key="equity_chart_w15")
+                    st.caption(
+                        f"Segmentová equity okien 1–5: baseline **{EQUITY_BASELINE:.0f} $** + Σ (pnl_usd − odhad vstupného poplatku "
+                        f"{ENTRY_FEE_RATE} × margin × leverage). Account-wide current_balance je v grafe nad záložkami."
+                    )
+                else:
+                    st.info("Okná 1–5: žiadne platné pnl_usd na vykreslenie equity.")
+            else:
+                st.info("Okná 1–5: Zatiaľ žiadne uzavreté obchody.")
+
+            st.markdown("##### 📊 Sumár štatistiky — Okná 1–5")
+            render_execution_breakdown(df_w15, "Okná 1–5")
+
+        with tab_w6:
+            # AI model status (id=1)
+            mrow = fetch_cached_ai_model_info()
+            if mrow:
+                m_name = mrow.get("model_name") or "xgboost_us_champion_v5"
+                m_acc = mrow.get("accuracy")
+                m_trained = mrow.get("trained_at") or "—"
+                acc_txt = f"{float(m_acc) * 100:.1f}%" if m_acc is not None else "—"
+                st.caption(f"Model: **{m_name}**  |  Accuracy: **{acc_txt}**  |  Trained at: **{m_trained}**")
+            else:
+                st.caption("AI model (id=1) zatiaľ nie je v `ai_models`.")
+
+            n6 = len(df_w6)
+            if n6 > 0:
+                _render_tab_stats_row(df_w6)
+
+                x6, eq6 = build_fresh_equity(df_w6)
+                if len(eq6) > 0:
+                    fig6 = go.Figure()
+                    fig6.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray",
+                                   annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
+                    fig6.add_trace(go.Scatter(
+                        x=x6, y=eq6,
+                        mode="lines+markers", name="Equity AI W6 (po vstup. poplatkoch) ($)",
+                        line=dict(color="#00FFAA", width=3),
+                    ))
+                    fig6.update_layout(
+                        height=260, margin=dict(l=10, r=10, t=10, b=10),
+                        template="plotly_dark",
+                        yaxis_title="Equity ($)",
+                    )
+                    st.plotly_chart(fig6, use_container_width=True, key="equity_chart_w6")
+                    st.caption(
+                        f"Segmentová AI equity: baseline **{EQUITY_BASELINE:.0f} $** + Σ (pnl_usd − odhad vstupného poplatku "
+                        f"{ENTRY_FEE_RATE} × margin × leverage). Account-wide current_balance je v grafe nad záložkami."
+                    )
+                else:
+                    st.info("AI Okno 6: žiadne platné pnl_usd na vykreslenie equity.")
+            else:
+                st.info("AI Okno 6: Zatiaľ žiadne uzavreté obchody.")
+
+            st.markdown("##### 📊 Sumár štatistiky — AI Okno 6")
+            render_execution_breakdown(df_w6, "AI Okno 6")
+
+            # ----- V8.2: Live AI V5.1 Feedback Buffer (vault_state["ai_w6_feedback"]) -----
+            st.markdown("##### 🧬 Live AI V5.1 Feedback Buffer (ai_w6_feedback)")
+            fb_raw = vault_state.get("ai_w6_feedback") or []
+            fb_entries = [e for e in fb_raw if isinstance(e, dict)] if isinstance(fb_raw, list) else []
+
+            if fb_entries:
+                def _fb_is_win(e: dict) -> bool:
+                    oc_raw = e.get("outcome")
+                    oc = str(oc_raw).strip().upper() if oc_raw is not None else ""
+                    if oc in {"WIN", "W", "1", "TRUE", "PROFIT", "TP"}:
+                        return True
+                    if oc in {"LOSS", "L", "0", "FALSE", "FAIL", "SL"}:
+                        return False
+                    return safe_float(e.get("r_multiple")) > 0
+
+                fb_total = len(fb_entries)
+                fb_wins = sum(1 for e in fb_entries if _fb_is_win(e))
+                fb_r_vals = [safe_float(e.get("r_multiple")) for e in fb_entries if e.get("r_multiple") is not None]
+                fb_mean_r = (sum(fb_r_vals) / len(fb_r_vals)) if fb_r_vals else 0.0
+
+                fb_m1, fb_m2, fb_m3 = st.columns(3)
+                fb_m1.metric("Buffer (počet)", f"{fb_total}")
+                fb_m2.metric("Wins", f"{fb_wins}", f"{(fb_wins / fb_total) * 100.0:.1f} %")
+                fb_m3.metric("Priemerné R-multiple", f"{fb_mean_r:+.2f} R")
+
+                fb_cols = ["symbol", "direction", "source", "outcome", "r_multiple",
+                           "ai_confidence", "exit_reason", "mae_pct", "mfe_pct"]
+                fb_last20 = list(reversed(fb_entries[-20:]))  # najnovšie navrchu
+                fb_df = pd.DataFrame(fb_last20).reindex(columns=fb_cols)
+                st.dataframe(fb_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("ai_w6_feedback buffer je zatiaľ prázdny (core1 ho naplní po uzavretí AI obchodov).")
+    else:
+        st.metric("Aktuálny Kapitál", f"${curr_bal:.2f}", f"{total_pnl:+.2f} USD")
+        st.info("Zatiaľ neboli uzavreté žiadne obchody. Equity krivka sa vykreslí automaticky po prvom trejde.")
+
+    st.subheader("🧠 Matrica Výkonu a Učenia AI")
+    if not ai_df.empty:
+        display_cols = ["regime_x", "regime_y", "win_rate", "avg_win_r", "avg_loss_r",
+                        "sl_modifier", "tp_modifier", "total_trades"]
+        available_cols = [c for c in display_cols if c in ai_df.columns]
+        st.dataframe(ai_df[available_cols], height=310, use_container_width=True, hide_index=True)
+    else:
+        st.info("AI Matica (`ai_mmr_matrix`) je pripravená a čaká na prvé dáta z Cloudu 1.")
 
     # -------------------------------------------------------------------------
     # SYSTEM F: Adaptívna Telemetria & Audit Log
@@ -1497,15 +1438,10 @@ def render_live_charts_section(tf: str):
         pad = max((price_high - price_low) * 0.08, price_high * 0.002)
         y_min = price_low - pad
         y_max = price_high + pad
-        cache = st.session_state.setdefault("_chart_yrange_cache", {})
-        range_key = (wid, sym, tf)
-        if range_key not in cache:
-            cache[range_key] = [y_min, y_max]
-        y_min, y_max = cache[range_key]
 
         fig.update_layout(
             height=520,
-            uirevision=f"{wid}_{sym}_{tf}_{st.session_state.get('_chart_zoom_reset_revision', 0)}",   # zachová manuálny zoom/pan pri live aktualizácii
+            uirevision=f"{wid}_{sym}_{tf}",   # zachová manuálny zoom/pan pri live aktualizácii
             xaxis_rangeslider_visible=False,
             template="plotly_dark",
             margin=dict(l=10, r=10, t=20, b=10),
@@ -1517,8 +1453,7 @@ def render_live_charts_section(tf: str):
                 tickfont=dict(size=12)
             )
         )
-        with st.container(height=600, border=False):
-            st.plotly_chart(fig, use_container_width=True, key=f"chart_w{wid}_{tf}")
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_w{wid}_{tf}")
 
 
 render_live_charts_section(timeframe)
