@@ -316,9 +316,9 @@ def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
         else reasons_all
     )
 
-    tp_col, dca_col = st.columns(2, gap="large")
+    c1, c2, c3 = st.columns(3)
 
-    with tp_col:
+    with c1:
         st.markdown("**Take Profit hits**")
         # Event-based: scale-out riadky + finálne TP3/climax
         tp1_cnt = int((reasons_all == "TP1_SCALE_OUT").sum())
@@ -333,7 +333,7 @@ def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
         st.write(f"TP2 executed: **{tp2_cnt}** / {n_trades}")
         st.write(f"TP3 / Climax hit: **{tp3_cnt}** / {n_trades}")
 
-    with dca_col:
+    with c2:
         st.markdown("**DCA fills**")
         # Trade-level: flags len na finálnych close riadkoch (core1 close_position)
         src = df_final if len(df_final) > 0 else df_subset
@@ -356,48 +356,47 @@ def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
         if "dca1_filled" not in df_subset.columns:
             st.caption("⚠ Stĺpce dca*_filled ešte nie sú v trade_history (deploy core1 fix).")
 
-    # Dôvod zatvorenia: samostatná sekcia pod TP/DCA, cez šírku dostupného panelu.
-    st.markdown("---")
-    st.markdown("#### 🧾 Dôvod zatvorenia")
-    reason_labels = {
-        "HARD_SL_HIT": "🔴 Hard SL / Wall SL",
-        "BE_STOP_AFTER_TP1": "🟡 BE stop po TP1",
-        "TP1_SCALE_OUT": "TP1_SCALE_OUT",
-        "TRAILING_SL_PROFIT": "🟢 Trailing SL (zisk)",
-        "EARLY_ORDERFLOW_ESCAPE": "⚠️ Early OF escape",
-        "TP2_SCALE_OUT": "TP2_SCALE_OUT",
-        "LIQUIDATION_CLIMAX_HIT": "🎯 TP3 Liquidation Climax",
-        "TP3_LIQUIDATION_HIT": "🎯 TP3",
-        "VPIN_EMERGENCY_ESCAPE": "☠️ VPIN Emergency",
-        "TP1_WALL_FRONTRUN": "🧱 TP1 Front-Run steny",
-        "TP2_WALL_FRONTRUN": "🧱 TP2 Front-Run steny",
-        "SPOOF_COLLAPSE_ESCAPE": "👻 Spoofing únik",
-        "TIME_STOP_CHOP": "⏳ Time-Stop (Chop)",
-        "TIME_STOP_STAGNANT": "⏳ Time-Stop (Stagnácia)",
-        "MFE_PROFIT_LOCK": "🛡️ MFE Zámok zisku",
-        "THETA_DECAY_PROFIT_EXIT": "⏱️ Theta Decay (zisk)",
-        "MM_EXHAUSTION_UNWIND": "🐋 MM Exhaustion Unwind (zisk)",
-        "WALL_STEPPING_SL": "🧱 Wall-Stepping SL",
-        "TP1_ICEBERG_FRONTRUN": "🧊 TP1 Iceberg Front-Run",
-        "DCA_RESCUE_ABSORPTION_EXIT": "🚑 DCA Rescue Absorpcia (zisk)",
-        "TIME_STOP_DOA": "⏱️ Time-Stop DOA (50% času)",
-        "TIME_STOP_DCA_RESCUE": "🚑 Time-Stop DCA Rescue (75% času)",
-    }
-    reason_counts = reasons_all.replace("", "UNKNOWN").value_counts()
-    reason_rows = []
-    for reason, cnt in reason_counts.items():
-        label = reason_labels.get(str(reason), str(reason))
-        pct = (cnt / n_all) * 100.0
-        reason_rows.append({"Dôvod zatvorenia": label, "Počet": int(cnt), "Podiel": f"{pct:.0f}%"})
-    summary_df = pd.DataFrame(reason_rows)
-    mid = (len(summary_df) + 1) // 2
-    left_df = summary_df.iloc[:mid]
-    right_df = summary_df.iloc[mid:]
-    col_left, col_right = st.columns(2, gap="large")
-    with col_left:
-        st.dataframe(left_df, hide_index=True, use_container_width=True)
-    with col_right:
-        st.dataframe(right_df, hide_index=True, use_container_width=True)
+    with c3:
+        st.markdown("**Dôvod zatvorenia**")
+        reason_labels = {
+            "HARD_SL_HIT": "🔴 Hard SL / Wall SL",
+            "BE_STOP_AFTER_TP1": "🟡 BE stop po TP1",
+            "TP1_SCALE_OUT": "TP1_SCALE_OUT",
+            "TRAILING_SL_PROFIT": "🟢 Trailing SL (zisk)",
+            "EARLY_ORDERFLOW_ESCAPE": "⚠️ Early OF escape",
+            "TP2_SCALE_OUT": "TP2_SCALE_OUT",
+            "LIQUIDATION_CLIMAX_HIT": "🎯 TP3 Liquidation Climax",
+            "TP3_LIQUIDATION_HIT": "🎯 TP3",
+            "VPIN_EMERGENCY_ESCAPE": "☠️ VPIN Emergency",
+            "TP1_WALL_FRONTRUN": "🧱 TP1 Front-Run steny",
+            "TP2_WALL_FRONTRUN": "🧱 TP2 Front-Run steny",
+            "SPOOF_COLLAPSE_ESCAPE": "👻 Spoofing únik",
+            "TIME_STOP_CHOP": "⏳ Time-Stop (Chop)",
+            "TIME_STOP_STAGNANT": "⏳ Time-Stop (Stagnácia)",
+            "MFE_PROFIT_LOCK": "🛡️ MFE Zámok zisku",
+            "THETA_DECAY_PROFIT_EXIT": "⏱️ Theta Decay (zisk)",
+            "MM_EXHAUSTION_UNWIND": "🐋 MM Exhaustion Unwind (zisk)",
+            "WALL_STEPPING_SL": "🧱 Wall-Stepping SL",
+            "TP1_ICEBERG_FRONTRUN": "🧊 TP1 Iceberg Front-Run",
+            "DCA_RESCUE_ABSORPTION_EXIT": "🚑 DCA Rescue Absorpcia (zisk)",
+            "TIME_STOP_DOA": "⏱️ Time-Stop DOA (50% času)",
+            "TIME_STOP_DCA_RESCUE": "🚑 Time-Stop DCA Rescue (75% času)",
+        }
+        reason_counts = reasons_all.replace("", "UNKNOWN").value_counts()
+        reason_rows = []
+        for reason, cnt in reason_counts.items():
+            label = reason_labels.get(str(reason), str(reason))
+            pct = (cnt / n_all) * 100.0
+            reason_rows.append({"Dôvod zatvorenia": label, "Počet": int(cnt), "Podiel": f"{pct:.0f}%"})
+        summary_df = pd.DataFrame(reason_rows)
+        mid = (len(summary_df) + 1) // 2
+        left_df = summary_df.iloc[:mid]
+        right_df = summary_df.iloc[mid:]
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.dataframe(left_df, hide_index=True, use_container_width=True)
+        with col_right:
+            st.dataframe(right_df, hide_index=True, use_container_width=True)
 
 
 # =========================================================================
@@ -956,16 +955,16 @@ def render_dashboard_and_telemetry():
                     fb_r_vals = [safe_float(e.get("r_multiple")) for e in fb_entries if e.get("r_multiple") is not None]
                     fb_mean_r = (sum(fb_r_vals) / len(fb_r_vals)) if fb_r_vals else 0.0
 
-                    fb_m1, fb_m2, fb_m3 = st.columns(3)
-                    fb_m1.metric("Buffer (počet)", f"{fb_total}")
-                    fb_m2.metric("Wins", f"{fb_wins}", f"{(fb_wins / fb_total) * 100.0:.1f} %")
-                    fb_m3.metric("Priemerné R-multiple", f"{fb_mean_r:+.2f} R")
+                    fc1, fc2, fc3 = st.columns(3)
+                    fc1.metric("Buffer (počet)", f"{fb_total}")
+                    fc2.metric("Wins", f"{fb_wins}", f"{(fb_wins / fb_total) * 100.0:.1f} %")
+                    fc3.metric("Priemerné R-multiple", f"{fb_mean_r:+.2f} R")
 
                     fb_cols = ["symbol", "direction", "source", "outcome", "r_multiple",
                                "ai_confidence", "exit_reason", "mae_pct", "mfe_pct"]
                     fb_last20 = list(reversed(fb_entries[-20:]))  # najnovšie navrchu
                     fb_df = pd.DataFrame(fb_last20).reindex(columns=fb_cols)
-                    st.dataframe(fb_df, use_container_width=True, hide_index=True)
+                    st.dataframe(fb_df, hide_index=True, use_container_width=True)
                 else:
                     st.info("ai_w6_feedback buffer je zatiaľ prázdny (core1 ho naplní po uzavretí AI obchodov).")
         else:
