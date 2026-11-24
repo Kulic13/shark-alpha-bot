@@ -957,14 +957,42 @@ def render_dashboard_and_telemetry():
             st.info("Zatiaľ neboli uzavreté žiadne obchody. Equity krivka sa vykreslí automaticky po prvom trejde.")
 
     with top_col2:
-        st.subheader("🧠 Matrica Výkonu a Učenia AI")
-        if not ai_df.empty:
-            display_cols = ["regime_x", "regime_y", "win_rate", "avg_win_r", "avg_loss_r",
-                            "sl_modifier", "tp_modifier", "total_trades"]
-            available_cols = [c for c in display_cols if c in ai_df.columns]
-            st.dataframe(ai_df[available_cols], height=310, use_container_width=True, hide_index=True)
+        st.subheader("🧠 Živý Stav Mozgu & DNA Banky (V9.1)")
+
+        # V9.1 live telemetry is read-only and sourced exclusively from vault_state.
+        active_rx = vault_state.get("last_active_rx")
+        active_ry = vault_state.get("last_active_ry")
+        btc_natr = vault_state.get("last_btc_natr")
+        dna_bank = vault_state.get("pattern_dna_bank")
+
+        brain_c1, brain_c2, brain_c3 = st.columns(3)
+        brain_c1.metric("Aktívne RX", "—" if active_rx is None else str(active_rx))
+        brain_c2.metric("Aktívne RY", "—" if active_ry is None else str(active_ry))
+        brain_c3.metric("BTC NATR", "—" if btc_natr is None else f"{safe_float(btc_natr):.5f}")
+
+        st.markdown("#### 🧬 Pattern DNA Bank")
+        if isinstance(dna_bank, dict):
+            if dna_bank:
+                dna_rows = []
+                for dna_key, dna_value in dna_bank.items():
+                    if isinstance(dna_value, dict):
+                        dna_row = {"DNA / Pattern": str(dna_key)}
+                        dna_row.update(dna_value)
+                        dna_rows.append(dna_row)
+                    else:
+                        dna_rows.append({"DNA / Pattern": str(dna_key), "Value": dna_value})
+                st.dataframe(pd.DataFrame(dna_rows), height=310, use_container_width=True, hide_index=True)
+            else:
+                st.info("pattern_dna_bank je zatiaľ prázdna.")
+        elif isinstance(dna_bank, list):
+            if dna_bank:
+                st.dataframe(pd.DataFrame(dna_bank), height=310, use_container_width=True, hide_index=True)
+            else:
+                st.info("pattern_dna_bank je zatiaľ prázdna.")
+        elif dna_bank is not None:
+            st.json(dna_bank)
         else:
-            st.info("AI Matica (`ai_mmr_matrix`) je pripravená a čaká na prvé dáta z Cloudu 1.")
+            st.info("Vault zatiaľ neobsahuje pole pattern_dna_bank.")
 
     # -------------------------------------------------------------------------
     # SYSTEM F: Adaptívna Telemetria & Audit Log
@@ -1484,4 +1512,4 @@ def render_live_charts_section(tf: str):
 render_live_charts_section(timeframe)
 
 st.divider()
-st.caption("Shark Alpha Cockpit Cloud 2 • core1_version3 V8.8 MM Engine • System F telemetry • true ledger equity")
+st.caption("Shark Alpha Cockpit Cloud 2 • core1_version3 V9.1 MM Engine • System F telemetry • true ledger equity")
