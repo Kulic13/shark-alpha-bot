@@ -383,10 +383,20 @@ def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
             "TIME_STOP_DCA_RESCUE": "🚑 Time-Stop DCA Rescue (75% času)",
         }
         reason_counts = reasons_all.replace("", "UNKNOWN").value_counts()
+        reason_rows = []
         for reason, cnt in reason_counts.items():
             label = reason_labels.get(str(reason), str(reason))
             pct = (cnt / n_all) * 100.0
-            st.write(f"{label}: **{cnt}** ({pct:.0f}%)")
+            reason_rows.append({"Dôvod zatvorenia": label, "Počet": int(cnt), "Podiel": f"{pct:.0f}%"})
+        summary_df = pd.DataFrame(reason_rows)
+        mid = (len(summary_df) + 1) // 2
+        left_df = summary_df.iloc[:mid]
+        right_df = summary_df.iloc[mid:]
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.dataframe(left_df, hide_index=True, use_container_width=True)
+        with col_right:
+            st.dataframe(right_df, hide_index=True, use_container_width=True)
 
 
 # =========================================================================
