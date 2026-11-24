@@ -810,130 +810,6 @@ def render_dashboard_and_telemetry():
                         acc_caption += f" | ⚠ rozdiel ledger vs vault: {last_bal - vault_bal:+.2f} USD (možné oneskorenie cache)"
                     st.caption(acc_caption)
 
-            tab_w15, tab_w6 = st.tabs([
-                "📊 Okná 1–5 (Adaptívne MMR)",
-                "🤖 AI Okno 6 (XGBoost V5)",
-            ])
-
-            def _equity_xcol(df_sub: pd.DataFrame) -> str:
-                if "closed_at" in df_sub.columns and df_sub["closed_at"].notna().any():
-                    return "closed_at"
-                if "updated_at" in df_sub.columns and df_sub["updated_at"].notna().any():
-                    return "updated_at"
-                return "id"
-
-            with tab_w15:
-                n15 = len(df_w15)
-                if n15 > 0:
-                    _render_tab_stats_row(df_w15)
-
-                    x15, eq15 = build_fresh_equity(df_w15)
-                    if len(eq15) > 0:
-                        fig15 = go.Figure()
-                        fig15.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray",
-                                        annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
-                        fig15.add_trace(go.Scatter(
-                            x=x15, y=eq15,
-                            mode="lines+markers", name="Equity W1–5 (po vstup. poplatkoch) ($)",
-                            line=dict(color="#00ffcc", width=3),
-                        ))
-                        fig15.update_layout(
-                            height=260, margin=dict(l=10, r=10, t=10, b=10),
-                            template="plotly_dark",
-                            yaxis_title="Equity ($)",
-                        )
-                        st.plotly_chart(fig15, use_container_width=True, key="equity_chart_w15")
-                        st.caption(
-                            f"Segmentová equity okien 1–5: baseline **{EQUITY_BASELINE:.0f} $** + Σ (pnl_usd − odhad vstupného poplatku "
-                            f"{ENTRY_FEE_RATE} × margin × leverage). Account-wide current_balance je v grafe nad záložkami."
-                        )
-                    else:
-                        st.info("Okná 1–5: žiadne platné pnl_usd na vykreslenie equity.")
-                else:
-                    st.info("Okná 1–5: Zatiaľ žiadne uzavreté obchody.")
-
-                st.markdown("##### 📊 Sumár štatistiky — Okná 1–5")
-                render_execution_breakdown(df_w15, "Okná 1–5")
-
-            with tab_w6:
-                # AI model status (id=1)
-                mrow = fetch_cached_ai_model_info()
-                if mrow:
-                    m_name = mrow.get("model_name") or "xgboost_us_champion_v5"
-                    m_acc = mrow.get("accuracy")
-                    m_trained = mrow.get("trained_at") or "—"
-                    acc_txt = f"{float(m_acc) * 100:.1f}%" if m_acc is not None else "—"
-                    st.caption(f"Model: **{m_name}**  |  Accuracy: **{acc_txt}**  |  Trained at: **{m_trained}**")
-                else:
-                    st.caption("AI model (id=1) zatiaľ nie je v `ai_models`.")
-
-                n6 = len(df_w6)
-                if n6 > 0:
-                    _render_tab_stats_row(df_w6)
-
-                    x6, eq6 = build_fresh_equity(df_w6)
-                    if len(eq6) > 0:
-                        fig6 = go.Figure()
-                        fig6.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray",
-                                       annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
-                        fig6.add_trace(go.Scatter(
-                            x=x6, y=eq6,
-                            mode="lines+markers", name="Equity AI W6 (po vstup. poplatkoch) ($)",
-                            line=dict(color="#00FFAA", width=3),
-                        ))
-                        fig6.update_layout(
-                            height=260, margin=dict(l=10, r=10, t=10, b=10),
-                            template="plotly_dark",
-                            yaxis_title="Equity ($)",
-                        )
-                        st.plotly_chart(fig6, use_container_width=True, key="equity_chart_w6")
-                        st.caption(
-                            f"Segmentová AI equity: baseline **{EQUITY_BASELINE:.0f} $** + Σ (pnl_usd − odhad vstupného poplatku "
-                            f"{ENTRY_FEE_RATE} × margin × leverage). Account-wide current_balance je v grafe nad záložkami."
-                        )
-                    else:
-                        st.info("AI Okno 6: žiadne platné pnl_usd na vykreslenie equity.")
-                else:
-                    st.info("AI Okno 6: Zatiaľ žiadne uzavreté obchody.")
-
-                st.markdown("##### 📊 Sumár štatistiky — AI Okno 6")
-                render_execution_breakdown(df_w6, "AI Okno 6")
-
-                # ----- V8.2: Live AI V5.1 Feedback Buffer (vault_state["ai_w6_feedback"]) -----
-                st.markdown("##### 🧬 Live AI V5.1 Feedback Buffer (ai_w6_feedback)")
-                fb_raw = vault_state.get("ai_w6_feedback") or []
-                fb_entries = [e for e in fb_raw if isinstance(e, dict)] if isinstance(fb_raw, list) else []
-
-                if fb_entries:
-                    def _fb_is_win(e: dict) -> bool:
-                        oc_raw = e.get("outcome")
-                        oc = str(oc_raw).strip().upper() if oc_raw is not None else ""
-                        if oc in {"WIN", "W", "1", "TRUE", "PROFIT", "TP"}:
-                            return True
-                        if oc in {"LOSS", "L", "0", "FALSE", "FAIL", "SL"}:
-                            return False
-                        return safe_float(e.get("r_multiple")) > 0
-
-                    fb_total = len(fb_entries)
-                    fb_wins = sum(1 for e in fb_entries if _fb_is_win(e))
-                    fb_r_vals = [safe_float(e.get("r_multiple")) for e in fb_entries if e.get("r_multiple") is not None]
-                    fb_mean_r = (sum(fb_r_vals) / len(fb_r_vals)) if fb_r_vals else 0.0
-
-                    fc1, fc2, fc3 = st.columns(3)
-                    fc1.metric("Buffer (počet)", f"{fb_total}")
-                    fc2.metric("Wins", f"{fb_wins}", f"{(fb_wins / fb_total) * 100.0:.1f} %")
-                    fc3.metric("Priemerné R-multiple", f"{fb_mean_r:+.2f} R")
-
-                    fb_cols = ["symbol", "direction", "source", "outcome", "r_multiple",
-                               "ai_confidence", "exit_reason", "mae_pct", "mfe_pct"]
-                    fb_last20 = list(reversed(fb_entries[-20:]))  # najnovšie navrchu
-                    fb_df = pd.DataFrame(fb_last20).reindex(columns=fb_cols)
-                    st.dataframe(fb_df, hide_index=True, use_container_width=True)
-                else:
-                    st.info("ai_w6_feedback buffer je zatiaľ prázdny (core1 ho naplní po uzavretí AI obchodov).")
-        else:
-            st.metric("Aktuálny Kapitál", f"${curr_bal:.2f}", f"{total_pnl:+.2f} USD")
-            st.info("Zatiaľ neboli uzavreté žiadne obchody. Equity krivka sa vykreslí automaticky po prvom trejde.")
 
     with top_col2:
         st.subheader("🧠 Matrica Výkonu a Učenia AI")
@@ -944,6 +820,137 @@ def render_dashboard_and_telemetry():
             st.dataframe(ai_df[available_cols], height=310, use_container_width=True, hide_index=True)
         else:
             st.info("AI Matica (`ai_mmr_matrix`) je pripravená a čaká na prvé dáta z Cloudu 1.")
+
+
+    # -------------------------------------------------------------------------
+    # 2. FULL-WIDTH TRADE HISTORY TABS (below the Equity + MMR top row)
+    # -------------------------------------------------------------------------
+    if not history_df.empty:
+        tab_w15, tab_w6 = st.tabs([
+            "📊 Okná 1–5 (Adaptívne MMR)",
+            "🤖 AI Okno 6 (XGBoost V5)",
+        ])
+
+        def _equity_xcol(df_sub: pd.DataFrame) -> str:
+            if "closed_at" in df_sub.columns and df_sub["closed_at"].notna().any():
+                return "closed_at"
+            if "updated_at" in df_sub.columns and df_sub["updated_at"].notna().any():
+                return "updated_at"
+            return "id"
+
+        with tab_w15:
+            n15 = len(df_w15)
+            if n15 > 0:
+                _render_tab_stats_row(df_w15)
+
+                x15, eq15 = build_fresh_equity(df_w15)
+                if len(eq15) > 0:
+                    fig15 = go.Figure()
+                    fig15.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray",
+                                    annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
+                    fig15.add_trace(go.Scatter(
+                        x=x15, y=eq15,
+                        mode="lines+markers", name="Equity W1–5 (po vstup. poplatkoch) ($)",
+                        line=dict(color="#00ffcc", width=3),
+                    ))
+                    fig15.update_layout(
+                        height=260, margin=dict(l=10, r=10, t=10, b=10),
+                        template="plotly_dark",
+                        yaxis_title="Equity ($)",
+                    )
+                    st.plotly_chart(fig15, use_container_width=True, key="equity_chart_w15")
+                    st.caption(
+                        f"Segmentová equity okien 1–5: baseline **{EQUITY_BASELINE:.0f} $** + Σ (pnl_usd − odhad vstupného poplatku "
+                        f"{ENTRY_FEE_RATE} × margin × leverage). Account-wide current_balance je v grafe nad záložkami."
+                    )
+                else:
+                    st.info("Okná 1–5: žiadne platné pnl_usd na vykreslenie equity.")
+            else:
+                st.info("Okná 1–5: Zatiaľ žiadne uzavreté obchody.")
+
+            st.markdown("##### 📊 Sumár štatistiky — Okná 1–5")
+            render_execution_breakdown(df_w15, "Okná 1–5")
+
+        with tab_w6:
+            # AI model status (id=1)
+            mrow = fetch_cached_ai_model_info()
+            if mrow:
+                m_name = mrow.get("model_name") or "xgboost_us_champion_v5"
+                m_acc = mrow.get("accuracy")
+                m_trained = mrow.get("trained_at") or "—"
+                acc_txt = f"{float(m_acc) * 100:.1f}%" if m_acc is not None else "—"
+                st.caption(f"Model: **{m_name}**  |  Accuracy: **{acc_txt}**  |  Trained at: **{m_trained}**")
+            else:
+                st.caption("AI model (id=1) zatiaľ nie je v `ai_models`.")
+
+            n6 = len(df_w6)
+            if n6 > 0:
+                _render_tab_stats_row(df_w6)
+
+                x6, eq6 = build_fresh_equity(df_w6)
+                if len(eq6) > 0:
+                    fig6 = go.Figure()
+                    fig6.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray",
+                                   annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
+                    fig6.add_trace(go.Scatter(
+                        x=x6, y=eq6,
+                        mode="lines+markers", name="Equity AI W6 (po vstup. poplatkoch) ($)",
+                        line=dict(color="#00FFAA", width=3),
+                    ))
+                    fig6.update_layout(
+                        height=260, margin=dict(l=10, r=10, t=10, b=10),
+                        template="plotly_dark",
+                        yaxis_title="Equity ($)",
+                    )
+                    st.plotly_chart(fig6, use_container_width=True, key="equity_chart_w6")
+                    st.caption(
+                        f"Segmentová AI equity: baseline **{EQUITY_BASELINE:.0f} $** + Σ (pnl_usd − odhad vstupného poplatku "
+                        f"{ENTRY_FEE_RATE} × margin × leverage). Account-wide current_balance je v grafe nad záložkami."
+                    )
+                else:
+                    st.info("AI Okno 6: žiadne platné pnl_usd na vykreslenie equity.")
+            else:
+                st.info("AI Okno 6: Zatiaľ žiadne uzavreté obchody.")
+
+            st.markdown("##### 📊 Sumár štatistiky — AI Okno 6")
+            render_execution_breakdown(df_w6, "AI Okno 6")
+
+            # ----- V8.2: Live AI V5.1 Feedback Buffer (vault_state["ai_w6_feedback"]) -----
+            st.markdown("##### 🧬 Live AI V5.1 Feedback Buffer (ai_w6_feedback)")
+            fb_raw = vault_state.get("ai_w6_feedback") or []
+            fb_entries = [e for e in fb_raw if isinstance(e, dict)] if isinstance(fb_raw, list) else []
+
+            if fb_entries:
+                def _fb_is_win(e: dict) -> bool:
+                    oc_raw = e.get("outcome")
+                    oc = str(oc_raw).strip().upper() if oc_raw is not None else ""
+                    if oc in {"WIN", "W", "1", "TRUE", "PROFIT", "TP"}:
+                        return True
+                    if oc in {"LOSS", "L", "0", "FALSE", "FAIL", "SL"}:
+                        return False
+                    return safe_float(e.get("r_multiple")) > 0
+
+                fb_total = len(fb_entries)
+                fb_wins = sum(1 for e in fb_entries if _fb_is_win(e))
+                fb_r_vals = [safe_float(e.get("r_multiple")) for e in fb_entries if e.get("r_multiple") is not None]
+                fb_mean_r = (sum(fb_r_vals) / len(fb_r_vals)) if fb_r_vals else 0.0
+
+                fc1, fc2, fc3 = st.columns(3)
+                fc1.metric("Buffer (počet)", f"{fb_total}")
+                fc2.metric("Wins", f"{fb_wins}", f"{(fb_wins / fb_total) * 100.0:.1f} %")
+                fc3.metric("Priemerné R-multiple", f"{fb_mean_r:+.2f} R")
+
+                fb_cols = ["symbol", "direction", "source", "outcome", "r_multiple",
+                           "ai_confidence", "exit_reason", "mae_pct", "mfe_pct"]
+                fb_last20 = list(reversed(fb_entries[-20:]))  # najnovšie navrchu
+                fb_df = pd.DataFrame(fb_last20).reindex(columns=fb_cols)
+                st.dataframe(fb_df, hide_index=True, use_container_width=True)
+            else:
+                st.info("ai_w6_feedback buffer je zatiaľ prázdny (core1 ho naplní po uzavretí AI obchodov).")
+
+    else:
+        st.metric("Aktuálny Kapitál", f"${curr_bal:.2f}", f"{total_pnl:+.2f} USD")
+        st.info("Zatiaľ neboli uzavreté žiadne obchody. Equity krivka sa vykreslí automaticky po prvom trejde.")
 
     # -------------------------------------------------------------------------
     # SYSTEM F: Adaptívna Telemetria & Audit Log
