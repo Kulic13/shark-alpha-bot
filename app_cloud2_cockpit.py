@@ -958,41 +958,68 @@ def render_dashboard_and_telemetry():
 
     with top_col2:
         st.subheader("🧠 Živý Stav Mozgu & DNA Banky (V9.1)")
+        dna_bank = vault_state.get("pattern_dna_bank") if isinstance(vault_state, dict) else {}
+        if isinstance(dna_bank, str):
+            try:
+                dna_bank = json.loads(dna_bank)
+            except Exception:
+                dna_bank = {}
+        if not isinstance(dna_bank, dict):
+            dna_bank = {}
 
-        # V9.1 live telemetry is read-only and sourced exclusively from vault_state.
-        active_rx = vault_state.get("last_active_rx")
-        active_ry = vault_state.get("last_active_ry")
-        btc_natr = vault_state.get("last_btc_natr")
-        dna_bank = vault_state.get("pattern_dna_bank")
+        def _parse_dna_list(raw_list):
+            out = []
+            for item in (raw_list or []):
+                if isinstance(item, str):
+                    try:
+                        item = json.loads(item)
+                    except Exception:
+                        continue
+                if isinstance(item, dict):
+                    out.append(item)
+            return out
 
-        brain_c1, brain_c2, brain_c3 = st.columns(3)
-        brain_c1.metric("Aktívne RX", "—" if active_rx is None else str(active_rx))
-        brain_c2.metric("Aktívne RY", "—" if active_ry is None else str(active_ry))
-        brain_c3.metric("BTC NATR", "—" if btc_natr is None else f"{safe_float(btc_natr):.5f}")
+        mega_wins = _parse_dna_list(dna_bank.get("MEGA_WINS"))
+        toxic_fails = _parse_dna_list(dna_bank.get("TOXIC_FAILS"))
 
-        st.markdown("#### 🧬 Pattern DNA Bank")
-        if isinstance(dna_bank, dict):
-            if dna_bank:
-                dna_rows = []
-                for dna_key, dna_value in dna_bank.items():
-                    if isinstance(dna_value, dict):
-                        dna_row = {"DNA / Pattern": str(dna_key)}
-                        dna_row.update(dna_value)
-                        dna_rows.append(dna_row)
-                    else:
-                        dna_rows.append({"DNA / Pattern": str(dna_key), "Value": dna_value})
-                st.dataframe(pd.DataFrame(dna_rows), height=310, use_container_width=True, hide_index=True)
-            else:
-                st.info("pattern_dna_bank je zatiaľ prázdna.")
-        elif isinstance(dna_bank, list):
-            if dna_bank:
-                st.dataframe(pd.DataFrame(dna_bank), height=310, use_container_width=True, hide_index=True)
-            else:
-                st.info("pattern_dna_bank je zatiaľ prázdna.")
-        elif dna_bank is not None:
-            st.json(dna_bank)
+        rx_val = int(safe_float(vault_state.get("last_active_rx"), 2))
+        ry_val = int(safe_float(vault_state.get("last_active_ry"), 2))
+        btc_natr_val = safe_float(vault_state.get("last_btc_natr"), 0.0)
+        rx_names = {1: "BEAR", 2: "SIDE", 3: "BULL"}
+        ry_names = {1: "LOW", 2: "MID", 3: "HIGH"}
+
+        dm1, dm2, dm3 = st.columns(3)
+        dm1.metric(
+            "Aktívny Režim (X / Y)",
+            f"{rx_names.get(rx_val, rx_val)} · {ry_names.get(ry_val, ry_val)}",
+            f"BTC NATR {btc_natr_val:.2f}%" if btc_natr_val > 0 else None,
+        )
+        dm2.metric("🏆 DNA Mega-Wins", f"{len(mega_wins)}")
+        dm3.metric("⚠️ DNA Toxic-Fails", f"{len(toxic_fails)}")
+
+        combined_dna = []
+        for label, bucket in (("🏆 WIN", mega_wins), ("⚠️ FAIL", toxic_fails)):
+            for rec in bucket:
+                vec = rec.get("vector") if isinstance(rec.get("vector"), dict) else {}
+                combined_dna.append({
+                    "ts": safe_float(rec.get("ts"), 0.0),
+                    "Typ": label,
+                    "Symbol": str(rec.get("symbol") or "—"),
+                    "Smer": str(rec.get("direction") or "—"),
+                    "Stratégia": str(rec.get("trigger_style") or "—"),
+                    "Výstup": str(rec.get("exit_reason") or "—"),
+                    "R": f"{safe_float(rec.get('r_multiple') ):+.2f}R",
+                    "PnL ($)": f"{safe_float(rec.get('pnl_usd') ):+.2f}",
+                    "WOB": round(safe_float(vec.get("micro_wob")), 3),
+                    "Whale": round(safe_float(vec.get("whale_ratio")), 2),
+                })
+
+        if combined_dna:
+            combined_dna.sort(key=lambda item: item["ts"], reverse=True)
+            dna_df = pd.DataFrame(combined_dna[:8]).drop(columns=["ts"])
+            st.dataframe(dna_df, height=240, use_container_width=True, hide_index=True)
         else:
-            st.info("Vault zatiaľ neobsahuje pole pattern_dna_bank.")
+            st.info("DNA banka (`pattern_dna_bank`) čaká na prvé Mega-Win / Toxic-Fail vzory z V9.1.")
 
     # -------------------------------------------------------------------------
     # SYSTEM F: Adaptívna Telemetria & Audit Log
