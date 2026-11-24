@@ -383,20 +383,10 @@ def render_execution_breakdown(df_subset: pd.DataFrame, title_prefix: str):
             "TIME_STOP_DCA_RESCUE": "🚑 Time-Stop DCA Rescue (75% času)",
         }
         reason_counts = reasons_all.replace("", "UNKNOWN").value_counts()
-        reason_rows = []
         for reason, cnt in reason_counts.items():
             label = reason_labels.get(str(reason), str(reason))
             pct = (cnt / n_all) * 100.0
-            reason_rows.append({"Dôvod zatvorenia": label, "Počet": int(cnt), "Podiel": f"{pct:.0f}%"})
-        summary_df = pd.DataFrame(reason_rows)
-        mid = (len(summary_df) + 1) // 2
-        left_df = summary_df.iloc[:mid]
-        right_df = summary_df.iloc[mid:]
-        col_left, col_right = st.columns(2)
-        with col_left:
-            st.dataframe(left_df, hide_index=True, use_container_width=True)
-        with col_right:
-            st.dataframe(right_df, hide_index=True, use_container_width=True)
+            st.write(f"{label}: **{cnt}** ({pct:.0f}%)")
 
 
 # =========================================================================
@@ -409,10 +399,6 @@ st.title("🦈 Shark Alpha Institutional Cockpit (Cloud 2)")
 # -------------------------------------------------------------------------
 st.sidebar.header("🎛️ Ovládanie & Živé Pozície")
 timeframe = st.sidebar.radio("Časový rámec grafov:", ["15m", "1m"], horizontal=True)
-if st.sidebar.button("🔄 Reset zoom", key="reset_chart_zoom"):
-    st.session_state["_chart_yrange_cache"] = {}
-    st.session_state["_chart_zoom_reset_revision"] = int(st.session_state.get("_chart_zoom_reset_revision", 0)) + 1
-    st.rerun()
 live_mode = st.sidebar.toggle("⚡ Živý režim (Auto)", value=True)
 if st.sidebar.button("🔄 Obnoviť dáta Kokpitu"):
     st.cache_data.clear()
@@ -812,7 +798,8 @@ def render_dashboard_and_telemetry():
                     last_t = d_bal["_t"].iloc[-1]
 
                     fig_acc = go.Figure()
-                    fig_acc.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray")
+                    fig_acc.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray",
+                                      annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
                     fig_acc.add_trace(go.Scatter(
                         x=d_bal["_t"], y=d_bal["current_balance"],
                         mode="lines+markers", name="Equity účtu – current_balance ($)",
@@ -829,14 +816,12 @@ def render_dashboard_and_telemetry():
                             line=dict(color="#ffaa00", width=3, dash="dash"),
                         ))
                     fig_acc.update_layout(
-                        height=300, margin=dict(l=10, r=10, t=12, b=10),
+                        height=300, margin=dict(l=10, r=10, t=10, b=10),
                         template="plotly_dark",
-                        showlegend=False,
                         yaxis_title="Equity ($)",
                         uirevision="account_equity_curve",
                     )
                     st.plotly_chart(fig_acc, use_container_width=True, key="equity_chart_account")
-                    st.caption("🔵 **Modrá krivka:** Skutočný zostatok účtu (`current_balance` po všetkých poplatkoch)  |  🟠 **Oranžová bodka:** Živá equity vrátane otvorených pozícií  |  ⚪ **Bodkovaná čiara:** Počiatočný kapitál `1 000,00 $`")
 
                     acc_caption = (
                         f"Posledný current_balance: **${last_bal:.2f}** | Vault balance: **${vault_bal:.2f}** "
@@ -972,33 +957,14 @@ def render_dashboard_and_telemetry():
             st.info("Zatiaľ neboli uzavreté žiadne obchody. Equity krivka sa vykreslí automaticky po prvom trejde.")
 
     with top_col2:
-        st.subheader("🧠 Živý Stav Mozgu & DNA Banky (V9.1)")
-        dna_bank = vault_state.get("pattern_dna_bank") or {}
-        mega_wins = dna_bank.get("MEGA_WINS") or []
-        toxic_fails = dna_bank.get("TOXIC_FAILS") or []
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Aktívny Režim (X / Y)",
-                  f"X={vault_state.get('last_active_rx', 2)} · Y={vault_state.get('last_active_ry', 2)}",
-                  f"BTC NATR {safe_float(vault_state.get('last_btc_natr'), 0.0):.2f}%")
-        m2.metric("DNA Mega-Wins", len(mega_wins))
-        m3.metric("DNA Toxic-Fails", len(toxic_fails))
-        recent_patterns = []
-        for typ, rows in (("MEGA-WIN", mega_wins), ("TOXIC-FAIL", toxic_fails)):
-            for rec in rows:
-                if isinstance(rec, dict):
-                    recent_patterns.append({
-                        "Typ": typ, "Symbol": rec.get("symbol", "—"),
-                        "Smer": rec.get("direction", "—"), "Stratégia": rec.get("strategy", rec.get("trigger_style", "—")),
-                        "R": rec.get("r_multiple", rec.get("r", "—")), "PnL ($)": rec.get("pnl_usd", "—"),
-                        "ts": safe_float(rec.get("ts"), 0.0),
-                    })
-        recent_patterns.sort(key=lambda x: x.get("ts", 0.0), reverse=True)
-        if recent_patterns:
-            dna_df = pd.DataFrame(recent_patterns[:5]).drop(columns=["ts"]).reindex(columns=["Typ", "Symbol", "Smer", "Stratégia", "R", "PnL ($)"])
-            st.dataframe(dna_df, hide_index=True, use_container_width=True, height=210)
+        st.subheader("🧠 Matrica Výkonu a Učenia AI")
+        if not ai_df.empty:
+            display_cols = ["regime_x", "regime_y", "win_rate", "avg_win_r", "avg_loss_r",
+                            "sl_modifier", "tp_modifier", "total_trades"]
+            available_cols = [c for c in display_cols if c in ai_df.columns]
+            st.dataframe(ai_df[available_cols], height=310, use_container_width=True, hide_index=True)
         else:
-            st.info("DNA Banka zatiaľ zbiera vzorky pre ďalšie patterny.")
-
+            st.info("AI Matica (`ai_mmr_matrix`) je pripravená a čaká na prvé dáta z Cloudu 1.")
 
     # -------------------------------------------------------------------------
     # SYSTEM F: Adaptívna Telemetria & Audit Log
@@ -1497,15 +1463,10 @@ def render_live_charts_section(tf: str):
         pad = max((price_high - price_low) * 0.08, price_high * 0.002)
         y_min = price_low - pad
         y_max = price_high + pad
-        cache = st.session_state.setdefault("_chart_yrange_cache", {})
-        range_key = (wid, sym, tf)
-        if range_key not in cache:
-            cache[range_key] = [y_min, y_max]
-        y_min, y_max = cache[range_key]
 
         fig.update_layout(
             height=520,
-            uirevision=f"{wid}_{sym}_{tf}_{st.session_state.get('_chart_zoom_reset_revision', 0)}",   # zachová manuálny zoom/pan pri live aktualizácii
+            uirevision=f"{wid}_{sym}_{tf}",   # zachová manuálny zoom/pan pri live aktualizácii
             xaxis_rangeslider_visible=False,
             template="plotly_dark",
             margin=dict(l=10, r=10, t=20, b=10),
@@ -1517,8 +1478,7 @@ def render_live_charts_section(tf: str):
                 tickfont=dict(size=12)
             )
         )
-        with st.container(height=600, border=False):
-            st.plotly_chart(fig, use_container_width=True, key=f"chart_w{wid}_{tf}")
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_w{wid}_{tf}")
 
 
 render_live_charts_section(timeframe)
