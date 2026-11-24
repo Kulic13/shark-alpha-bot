@@ -810,6 +810,9 @@ def render_dashboard_and_telemetry():
                         acc_caption += f" | ⚠ rozdiel ledger vs vault: {last_bal - vault_bal:+.2f} USD (možné oneskorenie cache)"
                     st.caption(acc_caption)
 
+        else:
+            st.metric("Aktuálny Kapitál", f"${curr_bal:.2f}", f"{total_pnl:+.2f} USD")
+            st.info("Zatiaľ neboli uzavreté žiadne obchody. Equity krivka sa vykreslí automaticky po prvom trejde.")
 
     with top_col2:
         st.subheader("🧠 Matrica Výkonu a Učenia AI")
@@ -821,9 +824,6 @@ def render_dashboard_and_telemetry():
         else:
             st.info("AI Matica (`ai_mmr_matrix`) je pripravená a čaká na prvé dáta z Cloudu 1.")
 
-
-    # -------------------------------------------------------------------------
-    # 2. FULL-WIDTH TRADE HISTORY TABS (below the Equity + MMR top row)
     # -------------------------------------------------------------------------
     if not history_df.empty:
         tab_w15, tab_w6 = st.tabs([
@@ -948,11 +948,6 @@ def render_dashboard_and_telemetry():
             else:
                 st.info("ai_w6_feedback buffer je zatiaľ prázdny (core1 ho naplní po uzavretí AI obchodov).")
 
-    else:
-        st.metric("Aktuálny Kapitál", f"${curr_bal:.2f}", f"{total_pnl:+.2f} USD")
-        st.info("Zatiaľ neboli uzavreté žiadne obchody. Equity krivka sa vykreslí automaticky po prvom trejde.")
-
-    # -------------------------------------------------------------------------
     # SYSTEM F: Adaptívna Telemetria & Audit Log
     # -------------------------------------------------------------------------
     st.subheader("🔬 System F: Adaptívna Telemetria & Audit Log")
