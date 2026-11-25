@@ -798,8 +798,7 @@ def render_dashboard_and_telemetry():
                     last_t = d_bal["_t"].iloc[-1]
 
                     fig_acc = go.Figure()
-                    fig_acc.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray",
-                                      annotation_text=f"baseline {EQUITY_BASELINE:.0f}")
+                    fig_acc.add_hline(y=EQUITY_BASELINE, line_dash="dot", line_color="gray")
                     fig_acc.add_trace(go.Scatter(
                         x=d_bal["_t"], y=d_bal["current_balance"],
                         mode="lines+markers", name="Equity účtu – current_balance ($)",
@@ -820,8 +819,10 @@ def render_dashboard_and_telemetry():
                         template="plotly_dark",
                         yaxis_title="Equity ($)",
                         uirevision="account_equity_curve",
+                        showlegend=False,
                     )
                     st.plotly_chart(fig_acc, use_container_width=True, key="equity_chart_account")
+                    st.markdown("🔵 **Equity účtu (`current_balance`)** | 🟠 **Živá equity (vrátane open PnL)** | ⚪ **Baseline (`1000 $`)**")
 
                     acc_caption = (
                         f"Posledný current_balance: **${last_bal:.2f}** | Vault balance: **${vault_bal:.2f}** "
@@ -957,69 +958,14 @@ def render_dashboard_and_telemetry():
             st.info("Zatiaľ neboli uzavreté žiadne obchody. Equity krivka sa vykreslí automaticky po prvom trejde.")
 
     with top_col2:
-        st.subheader("🧠 Živý Stav Mozgu & DNA Banky (V9.1)")
-        dna_bank = vault_state.get("pattern_dna_bank") if isinstance(vault_state, dict) else {}
-        if isinstance(dna_bank, str):
-            try:
-                dna_bank = json.loads(dna_bank)
-            except Exception:
-                dna_bank = {}
-        if not isinstance(dna_bank, dict):
-            dna_bank = {}
-
-        def _parse_dna_list(raw_list):
-            out = []
-            for item in (raw_list or []):
-                if isinstance(item, str):
-                    try:
-                        item = json.loads(item)
-                    except Exception:
-                        continue
-                if isinstance(item, dict):
-                    out.append(item)
-            return out
-
-        mega_wins = _parse_dna_list(dna_bank.get("MEGA_WINS"))
-        toxic_fails = _parse_dna_list(dna_bank.get("TOXIC_FAILS"))
-
-        rx_val = int(safe_float(vault_state.get("last_active_rx"), 2))
-        ry_val = int(safe_float(vault_state.get("last_active_ry"), 2))
-        btc_natr_val = safe_float(vault_state.get("last_btc_natr"), 0.0)
-        rx_names = {1: "BEAR", 2: "SIDE", 3: "BULL"}
-        ry_names = {1: "LOW", 2: "MID", 3: "HIGH"}
-
-        dm1, dm2, dm3 = st.columns(3)
-        dm1.metric(
-            "Aktívny Režim (X / Y)",
-            f"{rx_names.get(rx_val, rx_val)} · {ry_names.get(ry_val, ry_val)}",
-            f"BTC NATR {btc_natr_val:.2f}%" if btc_natr_val > 0 else None,
-        )
-        dm2.metric("🏆 DNA Mega-Wins", f"{len(mega_wins)}")
-        dm3.metric("⚠️ DNA Toxic-Fails", f"{len(toxic_fails)}")
-
-        combined_dna = []
-        for label, bucket in (("🏆 WIN", mega_wins), ("⚠️ FAIL", toxic_fails)):
-            for rec in bucket:
-                vec = rec.get("vector") if isinstance(rec.get("vector"), dict) else {}
-                combined_dna.append({
-                    "ts": safe_float(rec.get("ts"), 0.0),
-                    "Typ": label,
-                    "Symbol": str(rec.get("symbol") or "—"),
-                    "Smer": str(rec.get("direction") or "—"),
-                    "Stratégia": str(rec.get("trigger_style") or "—"),
-                    "Výstup": str(rec.get("exit_reason") or "—"),
-                    "R": f"{safe_float(rec.get('r_multiple') ):+.2f}R",
-                    "PnL ($)": f"{safe_float(rec.get('pnl_usd') ):+.2f}",
-                    "WOB": round(safe_float(vec.get("micro_wob")), 3),
-                    "Whale": round(safe_float(vec.get("whale_ratio")), 2),
-                })
-
-        if combined_dna:
-            combined_dna.sort(key=lambda item: item["ts"], reverse=True)
-            dna_df = pd.DataFrame(combined_dna[:8]).drop(columns=["ts"])
-            st.dataframe(dna_df, height=240, use_container_width=True, hide_index=True)
+        st.subheader("🧠 Matrica Výkonu a Učenia AI")
+        if not ai_df.empty:
+            display_cols = ["regime_x", "regime_y", "win_rate", "avg_win_r", "avg_loss_r",
+                            "sl_modifier", "tp_modifier", "total_trades"]
+            available_cols = [c for c in display_cols if c in ai_df.columns]
+            st.dataframe(ai_df[available_cols], height=310, use_container_width=True, hide_index=True)
         else:
-            st.info("DNA banka (`pattern_dna_bank`) čaká na prvé Mega-Win / Toxic-Fail vzory z V9.1.")
+            st.info("AI Matica (`ai_mmr_matrix`) je pripravená a čaká na prvé dáta z Cloudu 1.")
 
     # -------------------------------------------------------------------------
     # SYSTEM F: Adaptívna Telemetria & Audit Log
@@ -1539,4 +1485,4 @@ def render_live_charts_section(tf: str):
 render_live_charts_section(timeframe)
 
 st.divider()
-st.caption("Shark Alpha Cockpit Cloud 2 • core1_version3 V9.1 MM Engine • System F telemetry • true ledger equity")
+st.caption("Shark Alpha Cockpit Cloud 2 • core1_version3 V8.8 MM Engine • System F telemetry • true ledger equity")
