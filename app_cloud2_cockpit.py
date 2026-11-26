@@ -13,6 +13,9 @@ st.set_page_config(page_title="Shark Alpha Cockpit (Cloud 2)", layout="wide")
 OKX_API = "https://www.okx.com"
 TRADING_WINDOW_IDS = (1, 2, 3, 4, 5, 6, 7)
 AI_WINDOW_IDS = (6, 7)
+MM_PRETRAIN_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "ARBUSDT", "DOGEUSDT", "AAVEUSDT",
+                      "LINKUSDT", "RENDERUSDT", "ONDOUSDT", "XRPUSDT", "IMXUSDT")
+MM_PRETRAIN_BARS = 30
 
 @st.cache_resource
 def init_supabase() -> Client:
@@ -81,11 +84,37 @@ def fetch_cached_ai_model_info() -> dict:
         return {}
 
 
+def mm_pretrain_block_reason(state: dict) -> str:
+    """Fail closed on missing vault data; CORE repeats the flat-state check under its lock."""
+    if not isinstance(state, dict) or "balance" not in state:
+        return "Vault je nedostupný."
+    windows = state.get("windows")
+    if not isinstance(windows, dict) or any(not isinstance(windows.get(str(wid)), dict)
+                                           for wid in TRADING_WINDOW_IDS):
+        return "Chýba stav niektorého zo siedmich okien."
+    if state.get("pretrain_running") or state.get("run_pretrain_requested"):
+        return "LEARNING už prebieha alebo čaká na potvrdenie CORE."
+    if any(not isinstance(w, dict) or w.get("status") != "WAITING" for w in windows.values()):
+        return "Nie všetky okná sú voľné."
+    if state.get("pending_setups"):
+        return "Existuje čakajúci obchodný setup."
+    if state.get("paper_pending_funding_closes"):
+        return "Čaká sa na vyrovnanie fundingu."
+    if state.get("_cloud_write_conflict") or state.get("_state_write_failed"):
+        return "CORE hlási nebezpečný stav synchronizácie."
+    if state.get("force_clear_window_id") is not None:
+        return "Čaká sa na potvrdenie Force Clear."
+    return ""
+
+
 def write_remote_control_flag(updates: dict) -> bool:
-    # CORE V11.3j owns the financial state; only modify its remote control keys.
-    allowed = {"auto_refresh_enabled", "force_clear_window_id"}
+    # CORE V11.4 owns the financial state; only modify its remote control keys.
+    allowed = {"auto_refresh_enabled", "force_clear_window_id", "run_pretrain_requested"}
     if not isinstance(updates, dict) or not updates or not set(updates).issubset(allowed):
         return False
+    if "run_pretrain_requested" in updates and (set(updates) != {"run_pretrain_requested"}
+                                                  or updates["run_pretrain_requested"] is not True):
+        return False  # The CORE alone acknowledges and clears the one-shot command.
     if "force_clear_window_id" in updates and updates["force_clear_window_id"] not in TRADING_WINDOW_IDS:
         return False
     try:
@@ -100,6 +129,9 @@ def write_remote_control_flag(updates: dict) -> bool:
                 return False
             # Do not overwrite a different unacknowledged clear command.
             if "force_clear_window_id" in updates and state.get("force_clear_window_id") not in (None, updates["force_clear_window_id"]):
+                return False
+            # Recheck the freshly read vault at every CAS attempt, not the UI cache.
+            if "run_pretrain_requested" in updates and mm_pretrain_block_reason(state):
                 return False
             state.update(updates)
             query = supabase.table("bot_vault_state").update({
@@ -454,7 +486,7 @@ if st.sidebar.button("⏻ " + ("Pozastaviť nové vstupy" if engine_on else "Pov
     else:
         st.sidebar.error("Zápis ovládania VPS zlyhal.")
 
-st.sidebar.caption("Historický Pre-Trainer bol v CORE odstránený. AI tréning prebieha externe.")
+st.sidebar.caption("MM LEARNING je manuálna inicializácia dát; XGBoost tréning prebieha externe.")
 
 selected_wid = st.sidebar.selectbox("Okno na vyčistenie", TRADING_WINDOW_IDS, key="force_clear_window")
 st.sidebar.caption("Aktívne okno: ochranné zatvorenie podľa dostupnej likvidity, nie vymazanie pozície.")
@@ -477,10 +509,74 @@ window_titles = {
 }
 
 
+def render_mm_pretrainer(vault_state: dict):
+    """Read-only status from the existing vault; no history requests or background jobs."""
+    st.markdown("### 🧠 MM LEARNING (V11.4)")
+    st.caption("Manuálne • 11 sektorových lídrov • 30 × 15m • cieľ do 5 min")
+    result = vault_state.get("mm_pretrain")
+    result = result if isinstance(result, dict) else {}
+    running = bool(vault_state.get("pretrain_running"))
+    requested = bool(vault_state.get("run_pretrain_requested"))
+    status = str(result.get("status") or "IDLE")
+    if running:
+        st.info("RUNNING – CORE pripravuje historické dáta. Nové vstupy sú pozastavené.")
+        st.caption("CORE neposiela priebežné počty profilov; výsledok sa zobrazí po ukončení.")
+    elif requested:
+        st.info("QUEUED – požiadavka čaká na potvrdenie CORE.")
+    elif status == "IDLE":
+        st.caption("Zatiaľ nie je zverejnený výsledok Pre-Trainera V11.4.")
+    elif status == "COMPLETE":
+        st.success("COMPLETE – historická inicializácia dokončená.")
+    elif status in ("PARTIAL", "TIME_BUDGET_EXHAUSTED"):
+        st.warning(f"{status} – niektoré profily nie sú kompletné.")
+    elif status in ("REJECTED_NOT_FLAT_OR_STATE_UNSAFE", "FAILED", "CONTROL_ACK_FAILED",
+                    "CANCELLED", "STOPPED", "INTERRUPTED_RESTART"):
+        st.warning(f"{status} – LEARNING nebol úspešne dokončený.")
+    else:
+        st.caption(f"Posledný stav CORE: {status}")
+
+    reason = mm_pretrain_block_reason(vault_state)
+    if st.button("▶ Spustiť MM LEARNING", key="mm_pretrain_manual_v114", disabled=bool(reason),
+                 use_container_width=True):
+        if write_remote_control_flag({"run_pretrain_requested": True}):
+            st.rerun()
+        else:
+            st.error("Požiadavka zamietnutá alebo zápis zlyhal. Obnov stav a skontroluj okná.")
+    if reason:
+        st.caption(reason)
+    else:
+        st.caption("Len pri voľných oknách. Bez automatického opakovania.")
+
+    # The CORE publishes final diagnostics only; never present old results as live readiness.
+    diagnostics = result.get("symbols")
+    if not running and not requested and isinstance(diagnostics, dict) and diagnostics:
+        rows = []
+        for symbol in MM_PRETRAIN_SYMBOLS:
+            diag = diagnostics.get(symbol)
+            diag = diag if isinstance(diag, dict) else {}
+            count = int(np.clip(safe_float(diag.get("verified_bars")), 0, MM_PRETRAIN_BARS)) if np.isfinite(safe_float(diag.get("verified_bars"))) else 0
+            rows.append({"Ticker": symbol, "Profily": f"{count}/{MM_PRETRAIN_BARS}",
+                         "Stav": str(diag.get("status") or "—"),
+                         "Dôvod": str(diag.get("reason") or "")})
+        ready = sum(row["Stav"] == "READY" and row["Profily"] == f"{MM_PRETRAIN_BARS}/{MM_PRETRAIN_BARS}" for row in rows)
+        st.caption(f"Posledný beh: {ready}/{len(MM_PRETRAIN_SYMBOLS)} READY pri ukončení (nie aktuálna pripravenosť).")
+        st.progress(ready / len(MM_PRETRAIN_SYMBOLS))
+        elapsed = safe_float(result.get("elapsed_sec"), float("nan"))
+        if np.isfinite(elapsed) and elapsed >= 0:
+            st.caption(f"Trvanie: {elapsed:.1f} s | Cache uložená: {'áno' if result.get('cache_saved') is True else 'nie'}")
+        finished = safe_float(result.get("finished_at"), float("nan"))
+        if np.isfinite(finished) and 0 < finished < 253402300799:
+            st.caption(f"Ukončené: {datetime.fromtimestamp(finished, timezone.utc):%Y-%m-%d %H:%M:%S} UTC")
+        with st.expander("Výsledky 11 tickerov", expanded=False):
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.divider()
+
+
 @st.fragment(run_every="3s" if live_mode else None)
 def render_live_sidebar_positions():
     active_windows = load_active_windows(quiet=True)
     vault_state = fetch_cached_vault_state()
+    render_mm_pretrainer(vault_state)
     pending_all = vault_state.get("pending_setups") or {}
 
     for wid in TRADING_WINDOW_IDS:
@@ -1395,4 +1491,4 @@ def render_live_charts_section(tf: str):
 render_live_charts_section(timeframe)
 
 st.divider()
-st.caption("Shark Alpha Cockpit Cloud 2 • core1_version3 V11.3j MM Engine • System F telemetry • true ledger equity")
+st.caption("Shark Alpha Cockpit Cloud 2 • core1_version3 V11.4 MM Engine • Manual MM LEARNING • System F telemetry • true ledger equity")
