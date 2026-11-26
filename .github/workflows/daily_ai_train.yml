@@ -2,28 +2,35 @@ name: Daily AI Brain Training (US Champion)
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # Spustí sa automaticky každý deň o 02:00 UTC
-  workflow_dispatch:     # Umožní spustiť tréning kedykoľvek ručne jedným kliknutím
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: shark-alpha-ai-training
+  cancel-in-progress: false
 
 jobs:
   train-model:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Stiahnutie kódu z repozitára
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Nastavenie Pythonu 3.11
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Inštalácia knižníc
+      - name: Install dependencies
         run: |
           pip install httpx pandas numpy scikit-learn xgboost supabase
 
-      - name: Spustenie denného AI trénera
+      - name: Python syntax validation
+        run: python -m py_compile daily_train.py
+
+      - name: Train verified AI model
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: |
-          python daily_train.py
+        run: python daily_train.py
