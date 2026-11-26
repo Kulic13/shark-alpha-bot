@@ -13,8 +13,7 @@ st.set_page_config(page_title="Shark Alpha Cockpit (Cloud 2)", layout="wide")
 OKX_API = "https://www.okx.com"
 TRADING_WINDOW_IDS = (1, 2, 3, 4, 5, 6, 7)
 AI_WINDOW_IDS = (6, 7)
-MM_PRETRAIN_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "ARBUSDT", "DOGEUSDT", "AAVEUSDT",
-                      "LINKUSDT", "RENDERUSDT", "ONDOUSDT", "XRPUSDT", "IMXUSDT")
+MM_PRETRAIN_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT")
 MM_PRETRAIN_BARS = 30
 
 @st.cache_resource
@@ -511,8 +510,8 @@ window_titles = {
 
 def render_mm_pretrainer(vault_state: dict):
     """Read-only status from the existing vault; no history requests or background jobs."""
-    st.markdown("### 🧠 MM LEARNING (V11.4)")
-    st.caption("Manuálne • 11 sektorových lídrov • 30 × 15m • cieľ do 5 min")
+    st.markdown("### 🧠 MM LEARNING (V11.4a)")
+    st.caption("Manuálne • TOP 5 • BTC/ETH priorita • 30 × 15m • cieľ do 5 min")
     result = vault_state.get("mm_pretrain")
     result = result if isinstance(result, dict) else {}
     running = bool(vault_state.get("pretrain_running"))
@@ -524,7 +523,7 @@ def render_mm_pretrainer(vault_state: dict):
     elif requested:
         st.info("QUEUED – požiadavka čaká na potvrdenie CORE.")
     elif status == "IDLE":
-        st.caption("Zatiaľ nie je zverejnený výsledok Pre-Trainera V11.4.")
+        st.caption("Zatiaľ nie je zverejnený výsledok Pre-Trainera.")
     elif status == "COMPLETE":
         st.success("COMPLETE – historická inicializácia dokončená.")
     elif status in ("PARTIAL", "TIME_BUDGET_EXHAUSTED"):
@@ -550,6 +549,8 @@ def render_mm_pretrainer(vault_state: dict):
     # The CORE publishes final diagnostics only; never present old results as live readiness.
     diagnostics = result.get("symbols")
     if not running and not requested and isinstance(diagnostics, dict) and diagnostics:
+        if set(diagnostics) != set(MM_PRETRAIN_SYMBOLS):
+            st.caption("Predchádzajúci beh mal inú konfiguráciu; zobrazená je iba podmnožina TOP 5.")
         rows = []
         for symbol in MM_PRETRAIN_SYMBOLS:
             diag = diagnostics.get(symbol)
@@ -567,7 +568,7 @@ def render_mm_pretrainer(vault_state: dict):
         finished = safe_float(result.get("finished_at"), float("nan"))
         if np.isfinite(finished) and 0 < finished < 253402300799:
             st.caption(f"Ukončené: {datetime.fromtimestamp(finished, timezone.utc):%Y-%m-%d %H:%M:%S} UTC")
-        with st.expander("Výsledky 11 tickerov", expanded=False):
+        with st.expander("Výsledky TOP 5 tickerov", expanded=False):
             st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
     st.divider()
 
@@ -1491,4 +1492,4 @@ def render_live_charts_section(tf: str):
 render_live_charts_section(timeframe)
 
 st.divider()
-st.caption("Shark Alpha Cockpit Cloud 2 • core1_version3 V11.4 MM Engine • Manual MM LEARNING • System F telemetry • true ledger equity")
+st.caption("Shark Alpha Cockpit Cloud 2 • core1_version3 V11.4a MM Engine • Manual MM LEARNING • System F telemetry • true ledger equity")
