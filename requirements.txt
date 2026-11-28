@@ -1,8 +1,6 @@
 streamlit
-httpx[http2]
+supabase>=2.10.0
+httpx[http2]>=0.27.0,<0.28.0
 numpy
 pandas
 plotly
-supabase>=2.10.0
-xgboost
-scikit-learn
