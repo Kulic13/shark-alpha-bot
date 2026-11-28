@@ -3,6 +3,6 @@ httpx[http2]
 numpy
 pandas
 plotly
-supabase
+supabase>=2.10.0
 xgboost
 scikit-learn
