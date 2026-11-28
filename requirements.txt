@@ -3,4 +3,4 @@ httpx[http2]
 numpy
 pandas
 plotly
-supabase
+supabase==2.34.1
